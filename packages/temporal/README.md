@@ -68,13 +68,48 @@ That is: the turn completed after the crash, Temporal re-drove the activity on a
 - The worker talks to the opencode server over unauthenticated HTTP by default. Run them together
   or set `OPENCODE_SERVER_PASSWORD` and pass the header.
 
-## Phase 2 (next): a durable `SessionExecution` on the v2 engine
+## Phase 2 (built): a durable `SessionExecution` on the v2 engine
 
-opencode's newer v2 engine (`packages/core` + `packages/server`) is already event-sourced per
-session and exposes a substitutable `SessionExecution` service (`active` / `resume` / `wake` /
-`interrupt`) whose local impl comments "Future remote placement belongs here." Phase 2 provides a
-Temporal-backed `SessionExecution`: a workflow per session (`resume` = start-or-signal, `wake` =
-signal, `interrupt` = cancel) with `SessionRunner.run` (one continuation from recorded history) as
-the activity. Because turn state lives in the event log, the workflow stays thin and the recovery
-is engine-level, not a re-attach. It is wired by changing one binding in
-`packages/server/src/routes.ts`.
+opencode's v2 engine (`packages/core` + `packages/server`) is already event-sourced per session and
+exposes a substitutable `SessionExecution` service (`active` / `resume` / `wake` / `interrupt`)
+whose local impl comments "Future remote placement belongs here." Phase 2 provides a Temporal-backed
+`SessionExecution` in `packages/core/src/session/execution/`:
+
+- `temporal-workflow.ts` — the pure per-session workflow (the Temporal equivalent of
+  `SessionRunCoordinator`: `wake`/`force` drive one drain, wakes coalesce, quiescent runs end).
+- `temporal-activities.ts` — the `runContinuation` activity (heartbeats; forwards cancellation).
+- `temporal.ts` — the `SessionExecution` layer + node: `wake` → `signalWithStart`, `resume` →
+  forced `signalWithStart`, `interrupt` → cancel signal; the drain is the local coordinator's body
+  (`SessionRunner.run`) run in the activity against the durable event log. The Temporal client and
+  an embedded worker are co-hosted in the server process (both run under bun).
+
+Wiring is one binding in `packages/server/src/routes.ts`, opt-in via
+`OPENCODE_SESSION_EXECUTION=temporal`. Because turn state lives in the event log, the workflow stays
+thin and recovery is engine-level: a run re-reads recorded history and continues, it does not
+re-attach.
+
+### Run it
+
+```bash
+temporal server start-dev --port 7237
+OPENAI_API_KEY=... OPENCODE_SESSION_EXECUTION=temporal TEMPORAL_ADDRESS=127.0.0.1:7237 \
+  bun run --cwd packages/cli src/index.ts serve --port 4601
+```
+
+Create a session and prompt it against `POST /api/session` and `POST /api/session/:id/prompt`; each
+session runs as a Temporal workflow `session-exec-<sessionID>`.
+
+### Verified
+
+- With Temporal execution on, prompting a v2 session drove a full turn to completion (`step.ended`,
+  `TEMPORAL_V2_OK`), recorded as a completed per-session workflow.
+- Engine-level crash recovery (`scripts/v2-crash-test.sh`): killing the whole server (with its
+  embedded worker) mid-turn, then restarting, still completes the turn. Temporal re-drives
+  `runContinuation` (attempt 2), the run continues from the event log, and the workflow completes.
+
+### Known limits
+
+- `resume` drives a forced run but does not yet carry the typed `RunError` back to the caller (a
+  follow-up: a Temporal update). `active` reports sessions this process started (process-local, like
+  the local coordinator), not a durable-visibility query. Layer construction connects to Temporal at
+  server startup, so the server needs Temporal reachable when `OPENCODE_SESSION_EXECUTION=temporal`.
