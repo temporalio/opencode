@@ -1,8 +1,9 @@
 export * as SessionExecutionTemporal from "./temporal"
 
 import { fileURLToPath } from "node:url"
-import { Effect, Layer } from "effect"
-import { Client, Connection } from "@temporalio/client"
+import { Cause, Effect, Exit, Layer } from "effect"
+import { Client, Connection, WithStartWorkflowOperation } from "@temporalio/client"
+import { ApplicationFailure } from "@temporalio/activity"
 import { NativeConnection, Worker } from "@temporalio/worker"
 
 import { LocationServiceMap } from "../../location-service-map"
@@ -11,6 +12,7 @@ import { SessionRunner } from "../runner"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { SessionExecution } from "../execution"
+import { ContextSnapshotDecodeError } from "../error"
 import { makeActivities, type DrainInput } from "./temporal-activities"
 import * as WF from "./temporal-workflow"
 
@@ -18,6 +20,15 @@ const ADDRESS = process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7237"
 const NAMESPACE = process.env.TEMPORAL_NAMESPACE ?? "default"
 const TASK_QUEUE = process.env.OPENCODE_TEMPORAL_TASK_QUEUE ?? "opencode-session-exec"
 const workflowId = (id: string) => `session-exec-${id}`
+
+// The v2 RunError union has no generic member, so a run failure surfaced across the durable
+// boundary is carried as a ContextSnapshotDecodeError with the original text in `details`. Faithful
+// per-member reconstruction (Schema round-trip of the exact tagged error) is a further follow-up.
+const toRunError = (sessionID: SessionSchema.ID, e: unknown): SessionRunner.RunError => {
+  const anyE = e as { cause?: { message?: string }; message?: string } | undefined
+  const message = anyE?.cause?.message ?? anyE?.message ?? String(e)
+  return new ContextSnapshotDecodeError({ sessionID, details: `session run failed: ${message}` })
+}
 
 /**
  * A Temporal-backed SessionExecution. It makes each session a durable workflow:
@@ -39,8 +50,8 @@ const layer = Layer.effect(
     // SessionRunner and all of its dependencies.
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
 
-    const drain = (input: DrainInput, signal: AbortSignal): Promise<void> =>
-      Effect.runPromise(
+    const drain = async (input: DrainInput, signal: AbortSignal): Promise<void> => {
+      const exit = await Effect.runPromiseExit(
         Effect.gen(function* () {
           const session = yield* store.get(SessionSchema.ID.make(input.sessionID))
           if (!session) return
@@ -50,6 +61,17 @@ const layer = Layer.effect(
         }).pipe(Effect.provide(ctx), Effect.scoped),
         { signal },
       )
+      if (Exit.isSuccess(exit)) return
+      const cause = exit.cause
+      if (Cause.hasInterruptsOnly(cause)) throw new Error("session run interrupted")
+      // A genuine run error is thrown non-retryable so Temporal surfaces it (to resume) rather than
+      // retrying; only crashes / task timeouts (never thrown here) go through the retry policy.
+      throw ApplicationFailure.create({
+        message: Cause.pretty(cause),
+        type: "SessionRunError",
+        nonRetryable: true,
+      })
+    }
 
     // Worker connection (native) hosts the runContinuation activity + the workflow.
     const nativeConn = yield* Effect.acquireRelease(
@@ -82,13 +104,13 @@ const layer = Layer.effect(
     const client = new Client({ connection: clientConn, namespace: NAMESPACE })
     const started = new Set<SessionSchema.ID>()
 
-    const drive = (id: SessionSchema.ID, forced: boolean) =>
+    const drive = (id: SessionSchema.ID) =>
       Effect.promise(async () => {
         await client.workflow.signalWithStart(WF.sessionExecution, {
           taskQueue: TASK_QUEUE,
           workflowId: workflowId(id),
           args: [id],
-          signal: forced ? WF.force : WF.wake,
+          signal: WF.wake,
           signalArgs: [],
         })
         started.add(id)
@@ -100,10 +122,26 @@ const layer = Layer.effect(
 
     return SessionExecution.Service.of({
       active: Effect.sync(() => new Set(started)),
-      wake: (id) => drive(id, false).pipe(Effect.asVoid),
-      // resume must return Effect<void, RunError>; we drive a forced run but do not surface the
-      // typed error here (a follow-up: carry it back via a Temporal update). never <: RunError.
-      resume: (id) => drive(id, true).pipe(Effect.asVoid),
+      wake: (id) => drive(id).pipe(Effect.asVoid),
+      // resume = coordinator.run: drive a forced run via an Update-with-Start and AWAIT its result,
+      // so a run error is surfaced to the caller (as a RunError) instead of being swallowed.
+      resume: (id) =>
+        Effect.tryPromise({
+          try: async () => {
+            const startOp = new WithStartWorkflowOperation(WF.sessionExecution, {
+              taskQueue: TASK_QUEUE,
+              workflowId: workflowId(id),
+              args: [id],
+              workflowIdConflictPolicy: "USE_EXISTING",
+            })
+            await client.workflow.executeUpdateWithStart(WF.resume, {
+              startWorkflowOperation: startOp,
+              args: [],
+            })
+            started.add(id)
+          },
+          catch: (e) => toRunError(id, e),
+        }),
       interrupt: (id) =>
         Effect.promise(async () => {
           await client.workflow

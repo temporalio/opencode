@@ -109,7 +109,13 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
 
 ### Known limits
 
-- `resume` drives a forced run but does not yet carry the typed `RunError` back to the caller (a
-  follow-up: a Temporal update). `active` reports sessions this process started (process-local, like
-  the local coordinator), not a durable-visibility query. Layer construction connects to Temporal at
-  server startup, so the server needs Temporal reachable when `OPENCODE_SESSION_EXECUTION=temporal`.
+- `resume` awaits the forced run (via Update-with-Start) and surfaces its failure to the caller as a
+  `RunError`, carried as a `ContextSnapshotDecodeError` with the original error text in `details`;
+  faithful per-member reconstruction of the exact tagged error across the durable boundary is a
+  further follow-up. The per-session workflow is long-lived and self-terminates after an idle period,
+  so `active` reports sessions this process started (process-local), not a durable-visibility query.
+  Layer construction connects to Temporal at server startup, so the server needs Temporal reachable
+  when `OPENCODE_SESSION_EXECUTION=temporal`.
+
+`scripts/resume-check.ts` verifies it: `resume` resolves on a healthy session and rejects on a
+failing one (the run error reaches the caller instead of being swallowed).

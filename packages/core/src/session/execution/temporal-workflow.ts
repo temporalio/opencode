@@ -4,13 +4,15 @@
 // `@opencode-ai/core`, no Node builtins. It only ever sees the sessionID string. All real work
 // (SessionRunner.run against the durable event log) happens in the runContinuation activity.
 //
-// Semantics mirror the coordinator (run-coordinator.ts): a wake (or force) drives exactly one
-// drain, repeated wakes coalesce into at most one follow-up, and the workflow ends when a drain
-// finishes with nothing pending. A later wake starts a fresh run via signalWithStart.
+// Semantics mirror the coordinator (run-coordinator.ts): drains are serialized (one at a time),
+// a `wake` drives a drain and is tolerant of errors, and `resume` (an Update) drives a forced
+// drain and returns its result to the caller (throwing the run's error). The workflow stays alive
+// to serve later wakes/resumes and terminates after an idle period.
 
 import {
   proxyActivities,
   defineSignal,
+  defineUpdate,
   setHandler,
   condition,
   CancellationScope,
@@ -21,46 +23,68 @@ import type { Activities } from "./temporal-activities"
 const { runContinuation } = proxyActivities<Activities>({
   startToCloseTimeout: "30 minutes",
   // Short heartbeat so a dead worker's in-flight drain is re-driven quickly; the run re-reads the
-  // durable log, so a retry is a safe re-attach.
+  // durable log, so a retry is a safe re-attach. A genuine run error is thrown non-retryable by the
+  // activity, so only crashes/timeouts actually retry.
   heartbeatTimeout: "10 seconds",
   retry: { maximumAttempts: 100 },
 })
 
 export const wake = defineSignal("wake")
-export const force = defineSignal("force")
 export const interrupt = defineSignal("interrupt")
+export const resume = defineUpdate<void>("resume")
+
+const IDLE_TIMEOUT = "5 minutes"
 
 export async function sessionExecution(sessionID: string): Promise<void> {
-  // Starting the workflow implies there is work to drain (it is started via signalWithStart).
-  let pendingWake = true
-  let forceNext = false
+  let pendingWake = true // started via signalWithStart -> there is work to drain
   let stopping = false
+  let draining = false
+  let handlers = 0
+
+  // Serialize drains, like the coordinator (one owner fiber per session at a time).
+  const drainOnce = async (force: boolean) => {
+    await condition(() => !draining || stopping)
+    if (stopping) return
+    draining = true
+    try {
+      await runContinuation({ sessionID, force })
+    } finally {
+      draining = false
+    }
+  }
 
   setHandler(wake, () => {
     pendingWake = true
-  })
-  setHandler(force, () => {
-    pendingWake = true
-    forceNext = true
   })
   setHandler(interrupt, () => {
     stopping = true
     CancellationScope.current().cancel()
   })
+  // resume = coordinator.run: force one drain and surface its result (a run error rejects the
+  // Update, so the caller observes it).
+  setHandler(resume, async () => {
+    handlers++
+    try {
+      await drainOnce(true)
+    } finally {
+      handlers--
+    }
+  })
 
   for (;;) {
-    await condition(() => pendingWake || stopping)
+    const gotWork = await condition(() => pendingWake || stopping, IDLE_TIMEOUT)
     if (stopping) return
-    const f = forceNext
-    pendingWake = false
-    forceNext = false
-    try {
-      await runContinuation({ sessionID, force: f })
-    } catch (e) {
-      if (isCancellation(e)) return
-      throw e
+    if (!gotWork) {
+      // Idle: terminate only when nothing is in flight. A later wake/resume starts a fresh run.
+      if (!draining && handlers === 0) return
+      continue
     }
-    // Quiescent: no wake arrived while draining. End; a future wake starts a new run.
-    if (!pendingWake) return
+    pendingWake = false
+    try {
+      await drainOnce(false)
+    } catch (e) {
+      // wake tolerates run errors (the coordinator logs and moves on); only cancellation stops us.
+      if (isCancellation(e)) return
+    }
   }
 }
