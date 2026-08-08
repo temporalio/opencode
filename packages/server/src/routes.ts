@@ -10,6 +10,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
+import { SessionExecutionTemporal } from "@opencode-ai/core/session/execution/temporal"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -49,7 +50,13 @@ export function createEmbeddedRoutes() {
 }
 
 function makeRoutes<AuthError, AuthServices>(auth: Layer.Layer<ServerAuth.Config, AuthError, AuthServices>) {
-  const serviceLayer = AppNodeBuilder.build(applicationServices, [[SessionExecution.node, SessionExecutionLocal.node]])
+  // Opt in to the Temporal-backed durable execution with OPENCODE_SESSION_EXECUTION=temporal;
+  // otherwise the stock in-process coordinator is used.
+  const executionNode =
+    process.env.OPENCODE_SESSION_EXECUTION === "temporal"
+      ? SessionExecutionTemporal.node
+      : SessionExecutionLocal.node
+  const serviceLayer = AppNodeBuilder.build(applicationServices, [[SessionExecution.node, executionNode]])
 
   return HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
     Layer.provide(handlers),
