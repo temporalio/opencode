@@ -80,7 +80,7 @@ const layer = Layer.effect(
       (conn) => Effect.promise(() => conn.close().catch(() => {})),
     )
     const client = new Client({ connection: clientConn, namespace: NAMESPACE })
-    const started = new Set<string>()
+    const started = new Set<SessionSchema.ID>()
 
     const drive = (id: SessionSchema.ID, forced: boolean) =>
       Effect.promise(async () => {
@@ -99,7 +99,7 @@ const layer = Layer.effect(
     )
 
     return SessionExecution.Service.of({
-      active: Effect.sync(() => new Set(started) as ReadonlySet<SessionSchema.ID>),
+      active: Effect.sync(() => new Set(started)),
       wake: (id) => drive(id, false).pipe(Effect.asVoid),
       // resume must return Effect<void, RunError>; we drive a forced run but do not surface the
       // typed error here (a follow-up: carry it back via a Temporal update). never <: RunError.
