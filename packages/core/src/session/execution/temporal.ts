@@ -102,26 +102,37 @@ const layer = Layer.effect(
       (conn) => Effect.promise(() => conn.close().catch(() => {})),
     )
     const client = new Client({ connection: clientConn, namespace: NAMESPACE })
-    const started = new Set<SessionSchema.ID>()
+    const SESSION_PREFIX = "session-exec-"
 
     const drive = (id: SessionSchema.ID) =>
-      Effect.promise(async () => {
-        await client.workflow.signalWithStart(WF.sessionExecution, {
+      Effect.promise(() =>
+        client.workflow.signalWithStart(WF.sessionExecution, {
           taskQueue: TASK_QUEUE,
           workflowId: workflowId(id),
           args: [id],
           signal: WF.wake,
           signalArgs: [],
-        })
-        started.add(id)
-      })
+        }),
+      )
 
     yield* Effect.logInfo("SessionExecutionTemporal ready").pipe(
       Effect.annotateLogs({ address: ADDRESS, taskQueue: TASK_QUEUE }),
     )
 
     return SessionExecution.Service.of({
-      active: Effect.sync(() => new Set(started)),
+      // Durable and restart-surviving: the open per-session workflows in Temporal ARE the active
+      // set (unlike a process-local Set, which is empty after a restart).
+      active: Effect.promise(async () => {
+        const ids = new Set<SessionSchema.ID>()
+        for await (const wf of client.workflow.list({
+          query: "WorkflowType = 'sessionExecution' AND ExecutionStatus = 'Running'",
+        })) {
+          if (wf.workflowId.startsWith(SESSION_PREFIX)) {
+            ids.add(SessionSchema.ID.make(wf.workflowId.slice(SESSION_PREFIX.length)))
+          }
+        }
+        return ids
+      }),
       wake: (id) => drive(id).pipe(Effect.asVoid),
       // resume = coordinator.run: drive a forced run via an Update-with-Start and AWAIT its result,
       // so a run error is surfaced to the caller (as a RunError) instead of being swallowed.
@@ -138,18 +149,16 @@ const layer = Layer.effect(
               startWorkflowOperation: startOp,
               args: [],
             })
-            started.add(id)
           },
           catch: (e) => toRunError(id, e),
         }),
       interrupt: (id) =>
-        Effect.promise(async () => {
-          await client.workflow
+        Effect.promise(() =>
+          client.workflow
             .getHandle(workflowId(id))
             .signal(WF.interrupt)
-            .catch(() => {})
-          started.delete(id)
-        }),
+            .catch(() => {}),
+        ),
     })
   }),
 )
