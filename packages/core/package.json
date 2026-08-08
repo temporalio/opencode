@@ -61,6 +61,10 @@
     "drizzle-kit": "catalog:"
   },
   "dependencies": {
+    "@temporalio/activity": "^1.21.0",
+    "@temporalio/client": "^1.21.0",
+    "@temporalio/worker": "^1.21.0",
+    "@temporalio/workflow": "^1.21.0",
     "@ai-sdk/alibaba": "1.0.17",
     "@ai-sdk/amazon-bedrock": "4.0.112",
     "@ai-sdk/anthropic": "3.0.82",
