@@ -107,15 +107,17 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
   embedded worker) mid-turn, then restarting, still completes the turn. Temporal re-drives
   `runContinuation` (attempt 2), the run continues from the event log, and the workflow completes.
 
-### Known limits
+### Notes
 
-- `resume` awaits the forced run (via Update-with-Start) and surfaces its failure to the caller as a
-  `RunError`, carried as a `ContextSnapshotDecodeError` with the original error text in `details`;
-  faithful per-member reconstruction of the exact tagged error across the durable boundary is a
-  further follow-up. The per-session workflow is long-lived and self-terminates after an idle period,
-  so `active` reports sessions this process started (process-local), not a durable-visibility query.
-  Layer construction connects to Temporal at server startup, so the server needs Temporal reachable
-  when `OPENCODE_SESSION_EXECUTION=temporal`.
+- `resume` awaits the forced run (via Update-with-Start) and surfaces its failure as the **exact
+  tagged `RunError`**: the activity encodes the error through a `Schema.Union` of every RunError
+  member (`run-error-codec.ts`) into the failure details, and the layer reconstructs it, falling
+  back to a `ContextSnapshotDecodeError` carrying the text only if decoding fails.
+- `active` queries Temporal for the open per-session workflows, so it reflects durable state and
+  survives a restart (not a process-local set).
+- The per-session workflow is long-lived and self-terminates after an idle period. Layer
+  construction connects to Temporal at startup, so the server needs Temporal reachable when
+  `OPENCODE_SESSION_EXECUTION=temporal`.
 
-`scripts/resume-check.ts` verifies it: `resume` resolves on a healthy session and rejects on a
-failing one (the run error reaches the caller instead of being swallowed).
+`scripts/resume-check.ts` verifies resume: it resolves on a healthy session and rejects on a failing
+one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
