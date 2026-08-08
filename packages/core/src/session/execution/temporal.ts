@@ -14,6 +14,7 @@ import { SessionStore } from "../store"
 import { SessionExecution } from "../execution"
 import { ContextSnapshotDecodeError } from "../error"
 import { makeActivities, type DrainInput } from "./temporal-activities"
+import { encodeRunError, decodeRunError } from "./run-error-codec"
 import * as WF from "./temporal-workflow"
 
 const ADDRESS = process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7237"
@@ -25,9 +26,18 @@ const workflowId = (id: string) => `session-exec-${id}`
 // boundary is carried as a ContextSnapshotDecodeError with the original text in `details`. Faithful
 // per-member reconstruction (Schema round-trip of the exact tagged error) is a further follow-up.
 const toRunError = (sessionID: SessionSchema.ID, e: unknown): SessionRunner.RunError => {
-  const anyE = e as { cause?: { message?: string }; message?: string } | undefined
-  const message = anyE?.cause?.message ?? anyE?.message ?? String(e)
-  return new ContextSnapshotDecodeError({ sessionID, details: `session run failed: ${message}` })
+  // Walk the failure chain (WorkflowUpdateFailedError -> ActivityFailure -> ApplicationFailure) to
+  // the encoded run error the activity attached, and reconstruct the exact tagged error.
+  let node: any = e
+  for (let depth = 0; node && depth < 6; depth++) {
+    if (Array.isArray(node.details) && node.details.length > 0) {
+      const decoded = decodeRunError(node.details[0])
+      if (decoded) return decoded
+      return new ContextSnapshotDecodeError({ sessionID, details: `session run failed: ${node.message}` })
+    }
+    node = node.cause
+  }
+  return new ContextSnapshotDecodeError({ sessionID, details: `session run failed: ${(e as any)?.message ?? String(e)}` })
 }
 
 /**
@@ -65,11 +75,15 @@ const layer = Layer.effect(
       const cause = exit.cause
       if (Cause.hasInterruptsOnly(cause)) throw new Error("session run interrupted")
       // A genuine run error is thrown non-retryable so Temporal surfaces it (to resume) rather than
-      // retrying; only crashes / task timeouts (never thrown here) go through the retry policy.
+      // retrying; only crashes / task timeouts (never thrown here) go through the retry policy. The
+      // error is encoded faithfully in `details` so the caller can reconstruct the exact RunError.
+      const squashed = Cause.squash(cause) as { _tag?: string; message?: string }
+      const encoded = encodeRunError(squashed)
       throw ApplicationFailure.create({
-        message: Cause.pretty(cause),
-        type: "SessionRunError",
+        message: squashed?.message ?? Cause.pretty(cause),
+        type: squashed?._tag ?? "SessionRunError",
         nonRetryable: true,
+        details: encoded === undefined ? undefined : [encoded],
       })
     }
 

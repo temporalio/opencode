@@ -57,15 +57,24 @@ async function main() {
   await prompt(bad, "Reply with exactly: HI")
   await wait(7000)
   let failing = "?"
+  let encodedTag: string | undefined
   try {
     await resume(client, bad)
     failing = "RESOLVED (unexpected)"
   } catch (e: any) {
-    failing = "REJECTED: " + String(e?.message ?? e).slice(0, 120)
+    for (let node = e, d = 0; node && d < 6; node = node.cause, d++) {
+      if (Array.isArray(node.details) && node.details[0]?._tag) {
+        encodedTag = node.details[0]._tag
+        break
+      }
+    }
+    failing = "REJECTED (encoded _tag=" + encodedTag + "): " + String(e?.message ?? e).slice(0, 90)
   }
   console.log("resume(bad-model)->", failing)
 
-  const pass = healthy === "RESOLVED" && failing.startsWith("REJECTED")
+  // The activity encodes the real RunError faithfully into the failure details, so the caller can
+  // reconstruct the exact tagged error (LLM.Error here) instead of a generic carrier.
+  const pass = healthy === "RESOLVED" && failing.startsWith("REJECTED") && encodedTag === "LLM.Error"
   console.log("RESUME-TYPED-ERROR:", pass ? "PASS" : "FAIL")
   process.exit(pass ? 0 : 1)
 }
