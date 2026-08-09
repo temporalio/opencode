@@ -405,8 +405,37 @@ const layer = Layer.effect(
       }
     })
 
+    // One iteration of `run`'s loop, exposed so a Temporal workflow can drive the turn one step at
+    // a time (each step = one runTurn = one provider attempt + its tools). Semantics match `run`.
+    const runStep = Effect.fn("SessionRunner.runStep")(function* (input: {
+      readonly sessionID: SessionSchema.ID
+      readonly step: number
+      readonly promotion: SessionInput.Delivery | undefined
+      readonly first: boolean
+      readonly force: boolean
+    }) {
+      let promotion = input.promotion
+      if (input.first) {
+        const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+        const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
+        if (!input.force && !hasSteer && !hasQueue)
+          return { ran: false, continue: false, step: input.step, promotion: undefined }
+        yield* failInterruptedTools(input.sessionID)
+        promotion = hasSteer ? "steer" : hasQueue ? "queue" : undefined
+      }
+      const result = yield* runTurn(input.sessionID, promotion, input.step)
+      let needsContinuation = result.needsContinuation
+      if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+      if (needsContinuation)
+        return { ran: true, continue: true, step: result.step + 1, promotion: "steer" as SessionInput.Delivery }
+      const moreQueue = yield* SessionInput.hasPending(db, input.sessionID, "queue")
+      if (moreQueue) return { ran: true, continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
+      return { ran: true, continue: false, step: result.step + 1, promotion: undefined }
+    })
+
     return Service.of({
       run,
+      runStep,
     })
   }),
 )

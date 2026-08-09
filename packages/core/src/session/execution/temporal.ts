@@ -13,7 +13,14 @@ import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { SessionExecution } from "../execution"
 import { ContextSnapshotDecodeError } from "../error"
-import { makeActivities, type DrainInput } from "./temporal-activities"
+import {
+  makeActivities,
+  makeStepActivities,
+  type DrainInput,
+  type StepDrainInput,
+  type StepDrainResult,
+} from "./temporal-activities"
+import type { SessionInput } from "../input"
 import { encodeRunError, decodeRunError } from "./run-error-codec"
 import * as WF from "./temporal-workflow"
 
@@ -21,6 +28,12 @@ const ADDRESS = process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7237"
 const NAMESPACE = process.env.TEMPORAL_NAMESPACE ?? "default"
 const TASK_QUEUE = process.env.OPENCODE_TEMPORAL_TASK_QUEUE ?? "opencode-session-exec"
 const workflowId = (id: string) => `session-exec-${id}`
+
+// temporal = one activity per turn; temporal-turn = one activity per step (the model call + its
+// tools), with the step loop as workflow control flow.
+const PER_STEP = process.env.OPENCODE_SESSION_EXECUTION === "temporal-turn"
+const WORKFLOW = PER_STEP ? WF.sessionTurn : WF.sessionExecution
+const WORKFLOW_TYPE = PER_STEP ? "sessionTurn" : "sessionExecution"
 
 // The v2 RunError union has no generic member, so a run failure surfaced across the durable
 // boundary is carried as a ContextSnapshotDecodeError with the original text in `details`. Faithful
@@ -87,6 +100,39 @@ const layer = Layer.effect(
       })
     }
 
+    // Per-step drain: run exactly one step of the turn (used by temporal-turn mode). Same context
+    // and error encoding as the whole-turn drain; returns the next loop state to the workflow.
+    const stepDrain = async (input: StepDrainInput, signal: AbortSignal): Promise<StepDrainResult> => {
+      const exit = await Effect.runPromiseExit(
+        Effect.gen(function* () {
+          const session = yield* store.get(SessionSchema.ID.make(input.sessionID))
+          if (!session) return { ran: false, continue: false, step: input.step, promotion: null }
+          const r = yield* SessionRunner.Service.use((runner) =>
+            runner.runStep({
+              sessionID: session.id,
+              step: input.step,
+              promotion: (input.promotion ?? undefined) as SessionInput.Delivery | undefined,
+              first: input.first,
+              force: input.force,
+            }),
+          ).pipe(Effect.provide(locations.get(session.location)))
+          return { ran: r.ran, continue: r.continue, step: r.step, promotion: r.promotion ?? null }
+        }).pipe(Effect.provide(ctx), Effect.scoped),
+        { signal },
+      )
+      if (Exit.isSuccess(exit)) return exit.value
+      const cause = exit.cause
+      if (Cause.hasInterruptsOnly(cause)) throw new Error("session run interrupted")
+      const squashed = Cause.squash(cause) as { _tag?: string; message?: string }
+      const encoded = encodeRunError(squashed)
+      throw ApplicationFailure.create({
+        message: squashed?.message ?? Cause.pretty(cause),
+        type: squashed?._tag ?? "SessionRunError",
+        nonRetryable: true,
+        details: encoded === undefined ? undefined : [encoded],
+      })
+    }
+
     // Worker connection (native) hosts the runContinuation activity + the workflow.
     const nativeConn = yield* Effect.acquireRelease(
       Effect.promise(() => NativeConnection.connect({ address: ADDRESS })),
@@ -98,7 +144,7 @@ const layer = Layer.effect(
         namespace: NAMESPACE,
         taskQueue: TASK_QUEUE,
         workflowsPath: fileURLToPath(new URL("./temporal-workflow.ts", import.meta.url)),
-        activities: makeActivities(drain),
+        activities: { ...makeActivities(drain), ...makeStepActivities(stepDrain) },
       }),
     )
     const runHandle = worker.run()
@@ -120,7 +166,7 @@ const layer = Layer.effect(
 
     const drive = (id: SessionSchema.ID) =>
       Effect.promise(() =>
-        client.workflow.signalWithStart(WF.sessionExecution, {
+        client.workflow.signalWithStart(WORKFLOW, {
           taskQueue: TASK_QUEUE,
           workflowId: workflowId(id),
           args: [id],
@@ -130,7 +176,7 @@ const layer = Layer.effect(
       )
 
     yield* Effect.logInfo("SessionExecutionTemporal ready").pipe(
-      Effect.annotateLogs({ address: ADDRESS, taskQueue: TASK_QUEUE }),
+      Effect.annotateLogs({ address: ADDRESS, taskQueue: TASK_QUEUE, workflow: WORKFLOW_TYPE }),
     )
 
     return SessionExecution.Service.of({
@@ -139,7 +185,7 @@ const layer = Layer.effect(
       active: Effect.promise(async () => {
         const ids = new Set<SessionSchema.ID>()
         for await (const wf of client.workflow.list({
-          query: "WorkflowType = 'sessionExecution' AND ExecutionStatus = 'Running'",
+          query: `WorkflowType = '${WORKFLOW_TYPE}' AND ExecutionStatus = 'Running'`,
         })) {
           if (wf.workflowId.startsWith(SESSION_PREFIX)) {
             ids.add(SessionSchema.ID.make(wf.workflowId.slice(SESSION_PREFIX.length)))
@@ -153,7 +199,7 @@ const layer = Layer.effect(
       resume: (id) =>
         Effect.tryPromise({
           try: async () => {
-            const startOp = new WithStartWorkflowOperation(WF.sessionExecution, {
+            const startOp = new WithStartWorkflowOperation(WORKFLOW, {
               taskQueue: TASK_QUEUE,
               workflowId: workflowId(id),
               args: [id],
