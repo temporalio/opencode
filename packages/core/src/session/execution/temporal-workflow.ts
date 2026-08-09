@@ -18,16 +18,19 @@ import {
   CancellationScope,
   isCancellation,
 } from "@temporalio/workflow"
-import type { Activities } from "./temporal-activities"
+import type { Activities, StepActivities, StepDrainResult } from "./temporal-activities"
 
-const { runContinuation } = proxyActivities<Activities>({
+const activityOptions = {
   startToCloseTimeout: "30 minutes",
   // Short heartbeat so a dead worker's in-flight drain is re-driven quickly; the run re-reads the
   // durable log, so a retry is a safe re-attach. A genuine run error is thrown non-retryable by the
   // activity, so only crashes/timeouts actually retry.
   heartbeatTimeout: "10 seconds",
   retry: { maximumAttempts: 100 },
-})
+} as const
+
+const { runContinuation } = proxyActivities<Activities>(activityOptions)
+const { runTurnStep } = proxyActivities<StepActivities>(activityOptions)
 
 export const wake = defineSignal("wake")
 export const interrupt = defineSignal("interrupt")
@@ -84,6 +87,68 @@ export async function sessionExecution(sessionID: string): Promise<void> {
       await drainOnce(false)
     } catch (e) {
       // wake tolerates run errors (the coordinator logs and moves on); only cancellation stops us.
+      if (isCancellation(e)) return
+    }
+  }
+}
+
+// Per-step variant (OPENCODE_SESSION_EXECUTION=temporal-turn): identical lifecycle, but a turn is
+// driven one step at a time -- each step (one provider attempt + its tools) is its own
+// runTurnStep activity, and the step loop is workflow control flow. The loop state (step /
+// promotion / first) mirrors SessionRunner.run's loop and lives in the (deterministic) workflow.
+export async function sessionTurn(sessionID: string): Promise<void> {
+  let pendingWake = true
+  let stopping = false
+  let draining = false
+  let handlers = 0
+
+  const drainTurn = async (force: boolean) => {
+    await condition(() => !draining || stopping)
+    if (stopping) return
+    draining = true
+    try {
+      let step = 1
+      let promotion: string | null = null
+      let first = true
+      for (;;) {
+        const r: StepDrainResult = await runTurnStep({ sessionID, step, promotion, first, force })
+        if (!r.continue) break
+        step = r.step
+        promotion = r.promotion
+        first = false
+      }
+    } finally {
+      draining = false
+    }
+  }
+
+  setHandler(wake, () => {
+    pendingWake = true
+  })
+  setHandler(interrupt, () => {
+    stopping = true
+    CancellationScope.current().cancel()
+  })
+  setHandler(resume, async () => {
+    handlers++
+    try {
+      await drainTurn(true)
+    } finally {
+      handlers--
+    }
+  })
+
+  for (;;) {
+    const gotWork = await condition(() => pendingWake || stopping, IDLE_TIMEOUT)
+    if (stopping) return
+    if (!gotWork) {
+      if (!draining && handlers === 0) return
+      continue
+    }
+    pendingWake = false
+    try {
+      await drainTurn(false)
+    } catch (e) {
       if (isCancellation(e)) return
     }
   }

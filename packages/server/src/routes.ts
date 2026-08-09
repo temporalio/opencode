@@ -50,12 +50,11 @@ export function createEmbeddedRoutes() {
 }
 
 function makeRoutes<AuthError, AuthServices>(auth: Layer.Layer<ServerAuth.Config, AuthError, AuthServices>) {
-  // Opt in to the Temporal-backed durable execution with OPENCODE_SESSION_EXECUTION=temporal;
-  // otherwise the stock in-process coordinator is used.
+  // Opt in to Temporal-backed durable execution: "temporal" runs one activity per turn,
+  // "temporal-turn" runs one activity per step. Otherwise the stock in-process coordinator is used.
+  const exec = process.env.OPENCODE_SESSION_EXECUTION
   const executionNode =
-    process.env.OPENCODE_SESSION_EXECUTION === "temporal"
-      ? SessionExecutionTemporal.node
-      : SessionExecutionLocal.node
+    exec === "temporal" || exec === "temporal-turn" ? SessionExecutionTemporal.node : SessionExecutionLocal.node
   const serviceLayer = AppNodeBuilder.build(applicationServices, [[SessionExecution.node, executionNode]])
 
   return HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(

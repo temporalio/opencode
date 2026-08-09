@@ -107,6 +107,17 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
   embedded worker) mid-turn, then restarting, still completes the turn. Temporal re-drives
   `runContinuation` (attempt 2), the run continues from the event log, and the workflow completes.
 
+### Per-step turns (`temporal-turn`)
+
+`OPENCODE_SESSION_EXECUTION=temporal` runs a whole turn in one `runContinuation` activity.
+`OPENCODE_SESSION_EXECUTION=temporal-turn` instead drives the turn one **step** at a time: the
+`sessionTurn` workflow loops a `runTurnStep` activity, so each step (one provider attempt + its
+tools) is its own activity with its own retry/timeout/visibility, and the step loop is workflow
+control flow. It reuses `SessionRunner.runStep` (one iteration of `run`'s loop), so the turn
+semantics are unchanged. Verified: a create-then-read-then-reply turn recorded three `runTurnStep`
+activities under a `sessionTurn` workflow and completed. Finer granularity (the model call and each
+tool as separate activities) is a larger rewrite left for later; this is the per-step increment.
+
 ### Notes
 
 - `resume` awaits the forced run (via Update-with-Start) and surfaces its failure as the **exact
