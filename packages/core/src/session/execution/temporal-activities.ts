@@ -34,3 +34,44 @@ export function makeActivities(
     },
   }
 }
+
+// Per-step variant (OPENCODE_SESSION_EXECUTION=temporal-turn): one runTurnStep activity = one step
+// (one provider attempt + its tools). The workflow loops it, so each step is its own activity with
+// its own retry/timeout/visibility. `promotion` is null (not undefined) so it serializes cleanly.
+export interface StepDrainInput {
+  sessionID: string
+  step: number
+  promotion: string | null
+  first: boolean
+  force: boolean
+}
+
+export interface StepDrainResult {
+  ran: boolean
+  continue: boolean
+  step: number
+  promotion: string | null
+}
+
+export type StepActivities = {
+  runTurnStep(input: StepDrainInput): Promise<StepDrainResult>
+}
+
+export function makeStepActivities(
+  stepDrain: (input: StepDrainInput, signal: AbortSignal) => Promise<StepDrainResult>,
+): StepActivities {
+  return {
+    async runTurnStep(input) {
+      const beat = setInterval(() => {
+        try {
+          heartbeat()
+        } catch {}
+      }, 3000)
+      try {
+        return await stepDrain(input, Context.current().cancellationSignal)
+      } finally {
+        clearInterval(beat)
+      }
+    },
+  }
+}
