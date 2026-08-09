@@ -121,3 +121,34 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
 
 `scripts/resume-check.ts` verifies resume: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
+
+## Shared, durable event store (any-worker resume)
+
+The v2 engine event-sources each session to a SQLite store. By default that is a local file, so a
+session can only be resumed on the host holding the file. Point every worker at one **shared** store
+and any worker resumes any session: Temporal load-balances `runContinuation` across the fleet,
+`active` is visibility-backed, and the resumed worker reads the session purely from the shared log.
+
+- **Same host**: set `OPENCODE_DB` to one absolute path on all workers (WAL + `busy_timeout` allow
+  multiple processes). No code change.
+- **Across hosts**: set `OPENCODE_DB_URL` to a libSQL URL (self-hosted `sqld` or Turso), with
+  `OPENCODE_DB_AUTH_TOKEN` if needed. `packages/core/src/database/sqlite.libsql.ts` provides a
+  `SqlClient` over `@libsql/client`; it speaks the same SQLite dialect, so the schema and all
+  migrations are unchanged. Selection is one env check in `database.ts`.
+
+`scripts/shared-store-failover.sh` verifies it: worker A handles turn 1 (a code word), A is killed,
+and a fresh worker B (same queue, same store, never saw the session) handles turn 2 and recalls the
+code word, which it can only do by loading turn 1 from the shared store. The two turns run on two
+distinct worker identities.
+
+### Caveats
+
+- Run migrations once as a deploy step before starting N workers; the first-open migration guard is
+  process-local, so N cold workers migrating at once can race.
+- The PRAGMAs (`journal_mode` / `synchronous` / `busy_timeout` / `cache_size` / `wal_checkpoint`)
+  are local-file semantics and are skipped for the shared/libSQL backend, which manages journaling
+  itself.
+- The libSQL client issues each statement as its own request, so a `BEGIN`/`COMMIT` transaction is
+  atomic against an embedded (`file:`) store but not against a remote URL without the libSQL
+  batch/transaction API; wiring that (or using Postgres) is the remaining step for a networked
+  writer. Verified here against an embedded `file:` store and against a shared local file.
