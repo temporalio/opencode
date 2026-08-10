@@ -143,6 +143,22 @@ const layer = Layer.effect(
     const awaitToolFibers = (fibers: FiberSet.FiberSet<void, ToolOutputStore.Error>) =>
       Effect.raceFirst(FiberSet.join(fibers), FiberSet.awaitEmpty(fibers))
 
+    // A crashed drain leaves durable evidence that the input tables no longer show: promotion
+    // consumed the pending row inside the turn's own transaction, so a re-driven activity that
+    // checks only hasPending would drop the crashed turn as a no-op. Recoverable work = the latest
+    // conversational message is a user prompt with no assistant reply, or the latest assistant is
+    // still in flight. An interrupted turn stays excluded because its cleanup completes the
+    // assistant via Step.Failed.
+    const hasRecoverableWork = Effect.fnUntraced(function* (sessionID: SessionSchema.ID) {
+      const context = yield* getContext(sessionID)
+      for (let index = context.length - 1; index >= 0; index--) {
+        const message = context[index]
+        if (message?.type === "assistant") return !message.time.completed
+        if (message?.type === "user") return true
+      }
+      return false
+    })
+
     // Match V1: declining a user prompt halts the loop instead of becoming model-facing tool output.
     const isUserDeclined = (cause: Cause.Cause<unknown>) =>
       cause.reasons.some(
@@ -396,10 +412,11 @@ const layer = Layer.effect(
     }) {
       const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
       const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
-      if (!input.force && !hasSteer && !hasQueue) return
+      const recover = !input.force && !hasSteer && !hasQueue && (yield* hasRecoverableWork(input.sessionID))
+      if (!input.force && !hasSteer && !hasQueue && !recover) return
       yield* failInterruptedTools(input.sessionID)
       let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
-      let shouldRun = input.force || hasSteer || hasQueue
+      let shouldRun = input.force || hasSteer || hasQueue || recover
       while (shouldRun) {
         let needsContinuation = true
         let step = 1
@@ -521,7 +538,15 @@ const layer = Layer.effect(
       if (input.first) {
         const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
         const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
-        if (!input.force && !hasSteer && !hasQueue)
+        // Same recovery gate as `run`: a first-step retry whose prompt was already promoted (and
+        // whose crash predates any tool dispatch, so resumeCrashedStep had nothing to finalize)
+        // must re-stream, not no-op.
+        if (
+          !input.force &&
+          !hasSteer &&
+          !hasQueue &&
+          !(yield* hasRecoverableWork(input.sessionID))
+        )
           return { ran: false, continue: false, step: input.step, promotion: undefined }
         promotion = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       }
