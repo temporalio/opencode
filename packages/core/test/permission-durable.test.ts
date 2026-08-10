@@ -122,6 +122,68 @@ describe("PermissionV2 durable asks", () => {
     }),
   )
 
+  it.live("a re-drive adopts the same pending ask instead of duplicating it", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const file = path.join(tmp.path, "shared.db")
+      yield* seed(file)
+      const A = yield* Layer.build(stack(file))
+      const B = yield* Layer.build(stack(file))
+      const permA = Context.get(A, PermissionV2.Service)
+      const permB = Context.get(B, PermissionV2.Service)
+      const input = {
+        sessionID,
+        action: "bash",
+        resources: ["git push"],
+        agent,
+        source: { type: "tool" as const, messageID: "msg_1", callID: "call_redrive" },
+      }
+
+      // Attempt 1 blocks, then dies (a crashed activity): the row stays pending.
+      const first = yield* permA.assert(input).pipe(Effect.forkChild)
+      const ask = yield* awaitAsk(permB)
+      yield* Fiber.interrupt(first)
+      // Attempt 2 (the Temporal retry) files the same deterministic ask: one row, same id.
+      const second = yield* permA.assert(input).pipe(Effect.forkChild)
+      yield* Effect.sleep(100)
+      const asks = yield* permB.list()
+      expect(asks).toHaveLength(1)
+      expect(asks[0]?.id).toBe(ask.id)
+      yield* permB.reply({ requestID: ask.id, reply: "once" })
+      const exit = yield* Fiber.await(second)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
+    }),
+  )
+
+  it.live("honors an approval that landed while the asker was dead", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const file = path.join(tmp.path, "shared.db")
+      yield* seed(file)
+      const A = yield* Layer.build(stack(file))
+      const B = yield* Layer.build(stack(file))
+      const permA = Context.get(A, PermissionV2.Service)
+      const permB = Context.get(B, PermissionV2.Service)
+      const input = {
+        sessionID,
+        action: "bash",
+        resources: ["make deploy"],
+        agent,
+        source: { type: "tool" as const, messageID: "msg_2", callID: "call_dead_asker" },
+      }
+
+      const first = yield* permA.assert(input).pipe(Effect.forkChild)
+      const ask = yield* awaitAsk(permB)
+      yield* Fiber.interrupt(first)
+      // The human approves after the asker died; the retry short-circuits on the approved row.
+      yield* permB.reply({ requestID: ask.id, reply: "once" })
+      yield* permA.assert(input)
+      expect(yield* permB.list()).toEqual([])
+      yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
+    }),
+  )
+
   it.live("expires locally-pending asks on shutdown so they do not linger as pending rows", () =>
     Effect.gen(function* () {
       const tmp = yield* Effect.promise(() => tmpdir())

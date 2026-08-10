@@ -1,5 +1,6 @@
 export * as PermissionV2 from "./permission"
 
+import { createHash } from "node:crypto"
 import { and, eq } from "drizzle-orm"
 import { makeLocationNode } from "./effect/app-node"
 import { Context, Deferred, Effect as EffectRuntime, Layer, Schema } from "effect"
@@ -208,9 +209,21 @@ const layer = Layer.effect(
       return { effect, rules: all }
     })
 
+    // A tool-originated ask gets a DETERMINISTIC id (session + callID + action + resources), so a
+    // re-driven activity resolves to the same durable row instead of filing a duplicate: a reply
+    // that landed while the asker was dead is honored on the retry, and a still-pending row is
+    // adopted rather than re-asked. Asks without a tool source keep random ids.
+    function deterministicID(input: AssertInput) {
+      if (!input.source?.callID) return undefined
+      const digest = createHash("sha256")
+        .update([input.sessionID, input.source.callID, input.action, ...[...input.resources].sort()].join(" "))
+        .digest("hex")
+      return ID.create(`per_${digest.slice(0, 26)}`)
+    }
+
     function request(input: AssertInput): Request {
       return {
-        id: input.id ?? ID.create(),
+        id: input.id ?? deterministicID(input) ?? ID.create(),
         sessionID: input.sessionID,
         action: input.action,
         resources: input.resources,
@@ -235,11 +248,20 @@ const layer = Layer.effect(
               agent: agent ?? null,
               payload: JSON.stringify(Schema.encodeSync(Request)(request)),
             })
+            .onConflictDoNothing()
             .run()
             .pipe(
               EffectRuntime.orDie,
               EffectRuntime.onError(() => EffectRuntime.sync(() => pending.delete(request.id))),
             )
+          // A deterministic id can collide with its own expired row (a prior attempt shut down
+          // gracefully); revive it so the reply path and pollers see one pending ask again.
+          yield* db
+            .update(PermissionRequestTable)
+            .set({ status: "pending", message: null })
+            .where(and(eq(PermissionRequestTable.id, request.id), eq(PermissionRequestTable.status, "expired")))
+            .run()
+            .pipe(EffectRuntime.orDie)
           yield* events
             .publish(Event.Asked, request)
             .pipe(EffectRuntime.onError(() => EffectRuntime.sync(() => pending.delete(request.id))))
@@ -278,7 +300,19 @@ const layer = Layer.effect(
             })
           }
           if (result.effect === "allow") return
-          const item = yield* create(request(input), input.agent)
+          const value = request(input)
+          // A deterministic id may already have a settled or in-flight row from a prior attempt of
+          // the same call: honor a reply that landed while the asker was dead, and adopt a pending
+          // row instead of duplicating the ask.
+          const existing = yield* readRow(value.id)
+          if (existing) {
+            if (existing.status === "approved") return
+            if (existing.status === "corrected")
+              return yield* new CorrectedError({ feedback: existing.message ?? "" })
+            if (existing.status === "declined") return yield* EffectRuntime.die(new DeclinedError())
+            // pending or expired: fall through; create adopts (insert no-ops) or revives the row.
+          }
+          const item = yield* create(value, input.agent)
           return yield* restore(
             EffectRuntime.raceFirst(Deferred.await(item.deferred), awaitRow(item.request.id)),
           ).pipe(
