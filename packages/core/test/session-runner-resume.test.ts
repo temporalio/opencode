@@ -119,28 +119,37 @@ const seedSession = Effect.gen(function* () {
     .pipe(Effect.orDie)
 })
 
-// Record a step that started and issued a tool call but never published Step.Ended -- exactly what a
-// worker crash between tool dispatch and step settlement leaves in the log. `settle` controls
-// whether the tool already recorded its result (completed) or was still running at the crash.
-const seedCrashedStep = (settle: boolean) =>
-  Effect.gen(function* () {
-    const events = yield* EventV2.Service
-    const publisher = createLLMEventPublisher(events, {
-      sessionID,
-      agent: "build",
-      model: { id: ModelV2.ID.make("gpt-4o-mini"), providerID: ProviderV2.ID.make("openai") },
-    })
-    yield* publisher.publish(LLMEvent.toolCall({ id: "call_1", name: "read", input: { path: "a.txt" } }))
-    if (settle)
-      yield* publisher.publish(
-        LLMEvent.toolResult({
-          id: "call_1",
-          name: "read",
-          result: { type: "content", value: [{ type: "text", text: "seeded" }] },
-          output: { structured: {}, content: [{ type: "text", text: "seeded" }] },
-        }),
-      )
+// Each seed records a step that started but never published Step.Ended -- what a worker crash mid
+// turn leaves in the log.
+const seededPublisher = Effect.gen(function* () {
+  const events = yield* EventV2.Service
+  return createLLMEventPublisher(events, {
+    sessionID,
+    agent: "build",
+    model: { id: ModelV2.ID.make("gpt-4o-mini"), providerID: ProviderV2.ID.make("openai") },
   })
+})
+// Only a tool INPUT started -- the call was never dispatched, so no side effect ran and re-streaming
+// is safe. This exercises slice 1 (close the dangling tool so the re-drive is not a poison loop).
+const seedPendingStep = Effect.gen(function* () {
+  const publisher = yield* seededPublisher
+  yield* publisher.publish(LLMEvent.toolInputStart({ id: "call_pending", name: "read" }))
+})
+// Tools were dispatched: `call_done` recorded its result (completed), `call_running` did not (its
+// side effect may have run). This exercises slice 2 (finalize from the log, never re-stream).
+const seedDispatchedStep = Effect.gen(function* () {
+  const publisher = yield* seededPublisher
+  yield* publisher.publish(LLMEvent.toolCall({ id: "call_done", name: "read", input: { path: "a.txt" } }))
+  yield* publisher.publish(
+    LLMEvent.toolResult({
+      id: "call_done",
+      name: "read",
+      result: { type: "content", value: [{ type: "text", text: "done" }] },
+      output: { structured: {}, content: [{ type: "text", text: "done" }] },
+    }),
+  )
+  yield* publisher.publish(LLMEvent.toolCall({ id: "call_running", name: "read", input: { path: "b.txt" } }))
+})
 
 const toolPart = (messages: ReadonlyArray<SessionMessage.Message>, callID: string) => {
   for (const message of messages) {
@@ -154,12 +163,34 @@ describe("SessionRunner resume", () => {
   harness(empty).effect("closes a dangling tool on a mid-turn (first=false) re-drive", () =>
     Effect.gen(function* () {
       yield* seedSession
-      yield* seedCrashedStep(false) // running, never settled
+      yield* seedPendingStep
       const runner = yield* SessionRunner.Service
       const store = yield* SessionStore.Service
       yield* runner.runStep({ sessionID, step: 2, promotion: "steer", first: false, force: false })
-      const part = toolPart(yield* store.context(sessionID), "call_1")
+      const part = toolPart(yield* store.context(sessionID), "call_pending")
       expect(part?.type === "tool" ? part.state.status : undefined).toBe("error")
+    }),
+  )
+
+  harness(dying).effect("finalizes a dispatched step from the log without re-calling the model", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      yield* seedDispatchedStep
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+      // A dying stream would fail this call if the runner re-streamed; it resolving proves resume.
+      const result = yield* runner.runStep({ sessionID, step: 3, promotion: "steer", first: false, force: false })
+      expect(result.continue).toBe(true)
+      const context = yield* store.context(sessionID)
+      const done = toolPart(context, "call_done")
+      const running = toolPart(context, "call_running")
+      // The completed tool keeps its recorded result (not re-run); the unsettled one is failed.
+      expect(done?.type === "tool" ? done.state.status : undefined).toBe("completed")
+      expect(running?.type === "tool" ? running.state.status : undefined).toBe("error")
+      // The step is finalized in place (no duplicate assistant message).
+      const assistants = context.filter((message) => message.type === "assistant")
+      expect(assistants).toHaveLength(1)
+      expect(assistants[0]?.type === "assistant" ? Boolean(assistants[0].time.completed) : false).toBe(true)
     }),
   )
 })
