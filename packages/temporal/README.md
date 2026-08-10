@@ -177,3 +177,25 @@ distinct worker identities.
   atomicity test runs against an embedded (`file:`) store
   (`packages/core/test/database-libsql-transaction.test.ts`). The networked crash-atomicity itself
   still needs a live `sqld`/Turso to integration-test.
+
+### What resumes cross-host, and what does not
+
+The runner rebuilds a session's LLM context purely from the shared DB (`SessionHistory.entriesForRunner`
+then `toLLMMessages`); it never reads local disk to reconstruct context. So the **conversation** resumes
+on any worker: messages, tool results (the bounded preview and structured output that the model sees),
+prompt attachments (stored inline as `data:` URIs in the prompt), and credentials (`CredentialTable`)
+all ride the shared store.
+
+Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
+
+- **The project working tree.** File-touching tools (read/edit/bash) operate on the local worktree, so
+  a turn that keeps editing files must resume on a worker that has that worktree. This is the one real
+  cross-host correctness constraint. Three ways to satisfy it: co-locate a session's workers by worktree
+  (session affinity via a per-worktree Temporal task queue), share the worktree (a networked
+  filesystem), or reconstruct it from the last snapshot on resume (needs a shared snapshot store). This
+  is a deployment/design choice, not covered here yet.
+- **The snapshot store (`${data}/snapshot`) and the retained full tool-output files
+  (`${data}/tool-output`).** The runner never reads these to rebuild context: snapshot file-diffs are
+  best-effort (`Effect.catch` to `undefined`), and the model sees the bounded tool-output preview, not
+  the file. They only affect the diff/restore/revert features and full-output viewing. Point `${data}`
+  (the XDG data dir) at shared storage to make them portable.
