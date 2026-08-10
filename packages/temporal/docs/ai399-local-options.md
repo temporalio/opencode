@@ -33,7 +33,8 @@ signals/updates/timers) with a local implementation, so unmodified workflow code
 - Complexity: high and permanent; the shim chases the SDK surface every release, and determinism
   constraints stay imposed on local code that gets nothing for them.
 - Where it shines: an existing Temporal-first codebase that cannot be refactored, needing a local
-  mode quickly, using a small enumerable SDK subset.
+  mode quickly, using a small enumerable SDK subset. The confirmed desktop surface (cancel plus
+  one more prompt, below) keeps that subset genuinely small.
 - The ticket's "has been implemented" covers two things (per the assignee): our own TypeScript
   prototype, and shims customers have added inside their own codebases. Strictly, the TS prototype
   (`agent-harness`, AI-363) swaps at an app-defined seam, which this doc classifies as path C;
@@ -160,7 +161,15 @@ Scoring: full / partial / none, with the load-bearing caveat inline. [two cells 
 5. **Harness (E): apply C at the harness API layer** so harness users get a local mode without
    forking the Temporal-native internals.
 
-## Open questions
+## The signal/update surface desktop agents actually need
 
-- What signal/update surface do desktop agents actually need? Evidence here says small and
-  enumerable: wake, interrupt, one awaited update (this fork); approvals and steering (harness).
+Resolved during review: the user can cancel the in-flight request, and can add one more prompt
+while a run is active. That is the whole desktop surface (plus tool approvals where a policy
+engine is present, per the harness). Both first-hand implementations already model exactly this:
+opencode's `SessionExecution` is wake (new prompt), interrupt (cancel), one awaited resume; the
+agent-harness durable mode is submitPrompt, abortSession, closeSession.
+
+The implication for the comparison: Temporal's generic signal/update protocol is not the bar a
+local mode has to clear. A two-verb app-defined interface is. That is what makes path C cheap,
+and it bounds path A's re-implementation burden IF the shim is scoped to these verbs instead of
+the full SDK surface.
