@@ -1,8 +1,10 @@
 export * as PermissionV2 from "./permission"
 
+import { and, eq } from "drizzle-orm"
 import { makeLocationNode } from "./effect/app-node"
 import { Context, Deferred, Effect as EffectRuntime, Layer, Schema } from "effect"
 import { Permission } from "@opencode-ai/schema/permission"
+import { Database } from "./database/database"
 import { EventV2 } from "./event"
 import { Location } from "./location"
 import { AgentV2 } from "./agent"
@@ -10,6 +12,7 @@ import { SessionV2 } from "./session"
 import { SessionStore } from "./session/store"
 import { Wildcard } from "./util/wildcard"
 import { PermissionSaved } from "./permission/saved"
+import { PermissionRequestTable } from "./permission/sql"
 
 export { Effect, Rule, Ruleset } from "@opencode-ai/schema/permission"
 const missingAgentPermissions: Permission.Ruleset = [{ action: "*", resource: "*", effect: "deny" }]
@@ -114,12 +117,56 @@ const layer = Layer.effect(
     const agents = yield* AgentV2.Service
     const sessions = yield* SessionStore.Service
     const saved = yield* PermissionSaved.Service
+    const db = (yield* Database.Service).db
     const pending = new Map<ID, Pending>()
 
+    // Pending asks are durable rows in the shared store, so an ask raised in one process (a
+    // standalone worker's activity) is visible and replyable from another (the HTTP server), and a
+    // reply lands even after the asking process restarted. The in-memory deferred stays as the
+    // same-process fast path; a cross-process reply is observed by polling the row.
+    const readRow = (id: string) =>
+      db
+        .select()
+        .from(PermissionRequestTable)
+        .where(eq(PermissionRequestTable.id, id))
+        .all()
+        .pipe(
+          EffectRuntime.orDie,
+          EffectRuntime.map((rows) => rows[0]),
+        )
+    const pendingRows = (sessionID?: SessionV2.ID) =>
+      db
+        .select()
+        .from(PermissionRequestTable)
+        .where(
+          sessionID
+            ? and(eq(PermissionRequestTable.session_id, sessionID), eq(PermissionRequestTable.status, "pending"))
+            : eq(PermissionRequestTable.status, "pending"),
+        )
+        .all()
+        .pipe(EffectRuntime.orDie)
+    const updateRow = (id: string, status: string, message?: string) =>
+      db
+        .update(PermissionRequestTable)
+        .set({ status, message: message ?? null })
+        .where(eq(PermissionRequestTable.id, id))
+        .run()
+        .pipe(EffectRuntime.orDie)
+    const decodeRow = (row: { payload: string }) =>
+      Schema.decodeUnknownSync(Request)(JSON.parse(row.payload)) as Request
+
     yield* EffectRuntime.addFinalizer(() =>
-      EffectRuntime.forEach(pending.values(), (item) => Deferred.fail(item.deferred, new DeclinedError()), {
-        discard: true,
-      }).pipe(
+      EffectRuntime.forEach(
+        pending.values(),
+        (item) =>
+          // Graceful shutdown: unblock the local waiter and retire the row. The waiting fiber dies
+          // with this process either way, so a later reply would have nothing to resume.
+          Deferred.fail(item.deferred, new DeclinedError()).pipe(
+            EffectRuntime.andThen(updateRow(item.request.id, "expired")),
+            EffectRuntime.catch(() => EffectRuntime.void),
+          ),
+        { discard: true },
+      ).pipe(
         EffectRuntime.ensuring(
           EffectRuntime.sync(() => {
             pending.clear()
@@ -180,12 +227,39 @@ const layer = Layer.effect(
           const item = { request, agent, deferred }
           if (pending.has(request.id)) return yield* EffectRuntime.die(`Duplicate pending permission ID: ${request.id}`)
           pending.set(request.id, item)
+          yield* db
+            .insert(PermissionRequestTable)
+            .values({
+              id: request.id,
+              session_id: request.sessionID,
+              agent: agent ?? null,
+              payload: JSON.stringify(Schema.encodeSync(Request)(request)),
+            })
+            .run()
+            .pipe(
+              EffectRuntime.orDie,
+              EffectRuntime.onError(() => EffectRuntime.sync(() => pending.delete(request.id))),
+            )
           yield* events
             .publish(Event.Asked, request)
             .pipe(EffectRuntime.onError(() => EffectRuntime.sync(() => pending.delete(request.id))))
           return item
         }),
       )
+
+    // Observe a cross-process reply: the replying process updates the row, not our deferred.
+    const awaitRow = (id: ID): EffectRuntime.Effect<void, DeclinedError | CorrectedError> =>
+      EffectRuntime.gen(function* () {
+        for (;;) {
+          const row = yield* readRow(id)
+          if (row && row.status !== "pending") {
+            if (row.status === "approved") return
+            if (row.status === "corrected") return yield* new CorrectedError({ feedback: row.message ?? "" })
+            return yield* new DeclinedError()
+          }
+          yield* EffectRuntime.sleep(500)
+        }
+      })
 
     const ask = EffectRuntime.fn("PermissionV2.ask")(function* (input: AssertInput) {
       const result = yield* evaluateInput(input)
@@ -205,7 +279,9 @@ const layer = Layer.effect(
           }
           if (result.effect === "allow") return
           const item = yield* create(request(input), input.agent)
-          return yield* restore(Deferred.await(item.deferred)).pipe(
+          return yield* restore(
+            EffectRuntime.raceFirst(Deferred.await(item.deferred), awaitRow(item.request.id)),
+          ).pipe(
             EffectRuntime.catchTag("PermissionV2.DeclinedError", (error) => EffectRuntime.die(error)),
             EffectRuntime.ensuring(
               EffectRuntime.sync(() => {
@@ -217,84 +293,104 @@ const layer = Layer.effect(
       ),
     )
 
+    // Complete the local waiter if the ask was raised in this process; a cross-process waiter
+    // observes the row update through its poll.
+    const settleLocal = (
+      id: ID,
+      complete: (deferred: Pending["deferred"]) => EffectRuntime.Effect<boolean>,
+    ) =>
+      EffectRuntime.suspend(() => {
+        const item = pending.get(id)
+        if (!item) return EffectRuntime.void
+        pending.delete(id)
+        return EffectRuntime.asVoid(complete(item.deferred))
+      })
+
+    // The durable row is the source of truth, so a reply works from any process (the HTTP server
+    // replying to an ask raised inside a standalone worker's activity), not just the asking one.
     const reply = EffectRuntime.fn("PermissionV2.reply")((input: ReplyInput) =>
       EffectRuntime.uninterruptible(
         EffectRuntime.gen(function* () {
-          const existing = pending.get(input.requestID)
-          if (!existing) return yield* new NotFoundError({ requestID: input.requestID })
+          const row = yield* readRow(input.requestID)
+          if (!row || row.status !== "pending") return yield* new NotFoundError({ requestID: input.requestID })
+          const existing = decodeRow(row)
           yield* events.publish(Event.Replied, {
-            sessionID: existing.request.sessionID,
-            requestID: existing.request.id,
+            sessionID: existing.sessionID,
+            requestID: existing.id,
             reply: input.reply,
           })
 
           if (input.reply === "reject") {
-            yield* Deferred.fail(
-              existing.deferred,
-              input.message ? new CorrectedError({ feedback: input.message }) : new DeclinedError(),
+            yield* updateRow(existing.id, input.message ? "corrected" : "declined", input.message)
+            yield* settleLocal(existing.id, (deferred) =>
+              Deferred.fail(
+                deferred,
+                input.message ? new CorrectedError({ feedback: input.message }) : new DeclinedError(),
+              ),
             )
-            pending.delete(input.requestID)
-            for (const [id, item] of pending) {
-              if (item.request.sessionID !== existing.request.sessionID) continue
+            // A decline cascades to every other pending ask in the session, wherever it was raised.
+            for (const other of yield* pendingRows(existing.sessionID)) {
+              if (other.id === existing.id) continue
               yield* events.publish(Event.Replied, {
-                sessionID: item.request.sessionID,
-                requestID: item.request.id,
+                sessionID: existing.sessionID,
+                requestID: ID.make(other.id),
                 reply: "reject",
               })
-              yield* Deferred.fail(item.deferred, new DeclinedError())
-              pending.delete(id)
+              yield* updateRow(other.id, "declined")
+              yield* settleLocal(ID.make(other.id), (deferred) => Deferred.fail(deferred, new DeclinedError()))
             }
             return
           }
 
-          if (input.reply === "always" && existing.request.save?.length) {
+          if (input.reply === "always" && existing.save?.length) {
             yield* saved.add({
               projectID: location.project.id,
-              action: existing.request.action,
-              resources: existing.request.save,
+              action: existing.action,
+              resources: existing.save,
             })
           }
-          yield* Deferred.succeed(existing.deferred, undefined)
-          pending.delete(input.requestID)
-          if (input.reply !== "always" || !existing.request.save?.length) return
+          yield* updateRow(existing.id, "approved")
+          yield* settleLocal(existing.id, (deferred) => Deferred.succeed(deferred, undefined))
+          if (input.reply !== "always" || !existing.save?.length) return
 
+          // An always-rule can retro-approve other pending asks it now covers.
           const rememberedRules = yield* savedRules()
-          for (const [id, item] of pending) {
-            const input = { ...item.request }
-            const rules = yield* configured(item.request.sessionID, item.agent).pipe(
+          for (const otherRow of yield* pendingRows()) {
+            if (otherRow.id === existing.id) continue
+            const other = decodeRow(otherRow)
+            const agent = otherRow.agent === null ? undefined : AgentV2.ID.make(otherRow.agent)
+            const rules = yield* configured(other.sessionID, agent).pipe(
               EffectRuntime.catchTag("Session.NotFoundError", () => EffectRuntime.succeed(undefined)),
             )
             if (!rules) continue
-            if (denied(input, rules)) continue
+            if (denied(other, rules)) continue
             const effective = [...rules, ...rememberedRules]
-            if (
-              !item.request.resources.every(
-                (resource) => evaluate(item.request.action, resource, effective).effect === "allow",
-              )
-            )
+            if (!other.resources.every((resource) => evaluate(other.action, resource, effective).effect === "allow"))
               continue
             yield* events.publish(Event.Replied, {
-              sessionID: item.request.sessionID,
-              requestID: item.request.id,
+              sessionID: other.sessionID,
+              requestID: other.id,
               reply: "always",
             })
-            yield* Deferred.succeed(item.deferred, undefined)
-            pending.delete(id)
+            yield* updateRow(other.id, "approved")
+            yield* settleLocal(other.id, (deferred) => Deferred.succeed(deferred, undefined))
           }
         }),
       ),
     )
 
+    // Reads come from the durable rows, so serve can list and inspect asks raised by any worker.
     const list = EffectRuntime.fn("PermissionV2.list")(function* () {
-      return Array.from(pending.values(), (item) => item.request)
+      return (yield* pendingRows()).map(decodeRow)
     })
 
     const get = EffectRuntime.fn("PermissionV2.get")(function* (id: ID) {
-      return pending.get(id)?.request
+      const row = yield* readRow(id)
+      return row && row.status === "pending" ? decodeRow(row) : undefined
     })
 
     const forSession = EffectRuntime.fn("PermissionV2.forSession")(function* (sessionID: SessionV2.ID) {
-      return Array.from(pending.values(), (item) => item.request).filter((request) => request.sessionID === sessionID)
+      return (yield* pendingRows(sessionID)).map(decodeRow)
     })
 
     return Service.of({ ask, assert, reply, get, forSession, list })
@@ -306,5 +402,5 @@ export const locationLayer = layer.pipe(Layer.provideMerge(AgentV2.locationLayer
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [EventV2.node, Location.node, AgentV2.node, SessionStore.node, PermissionSaved.node],
+  deps: [EventV2.node, Location.node, AgentV2.node, SessionStore.node, PermissionSaved.node, Database.node],
 })
