@@ -29,6 +29,7 @@ import { SessionCompaction } from "../compaction"
 import { SessionEvent } from "../event"
 import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
+import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { type RunError, Service } from "./index"
@@ -405,6 +406,65 @@ const layer = Layer.effect(
       }
     })
 
+    // Resume a crashed step from the durable log instead of re-streaming it. A Temporal step retry
+    // re-invokes runStep on the same log; if the in-flight step already DISPATCHED tools (Tool.Called
+    // is recorded before the side effect runs, so a running/completed tool may have run), re-streaming
+    // would re-run that side effect and duplicate the assistant message. Instead we close the step
+    // from the log: keep completed tool results, fail the ones still unsettled (their result never
+    // committed -- we can't know if they ran, so the model redoes them), and publish a synthesized
+    // Step.Ended. The model is NOT re-called. Returns undefined when there is nothing to finalize (a
+    // fresh step, or a partial with no dispatched tools, which is safe to re-stream). Token/cost
+    // metering is 0 for the resumed step only; faithful metering would need a durable step-sealed
+    // marker carrying the provider usage.
+    const resumeCrashedStep = Effect.fn("SessionRunner.resumeCrashedStep")(function* (input: {
+      readonly sessionID: SessionSchema.ID
+      readonly step: number
+    }) {
+      const context = yield* getContext(input.sessionID)
+      // At most one assistant is in flight (the projector supersedes older ones); it only exists at
+      // step entry on a re-drive, never on a fresh step.
+      const inFlight = context.findLast(
+        (message): message is SessionMessage.Assistant => message.type === "assistant" && !message.time.completed,
+      )
+      if (!inFlight) return undefined
+      const toolParts = inFlight.content.filter(
+        (part): part is SessionMessage.AssistantTool => part.type === "tool",
+      )
+      const dispatched = toolParts.some(
+        (part) => part.state.status === "running" || part.state.status === "completed",
+      )
+      if (!dispatched) return undefined
+      // Fail the still-open tools (never re-run them); completed tools keep their recorded results.
+      yield* failInterruptedTools(input.sessionID)
+      const startSnapshot = inFlight.snapshot?.start
+      const endSnapshot = yield* snapshots.capture()
+      const files =
+        startSnapshot && endSnapshot
+          ? yield* snapshots
+              .files({ from: Snapshot.ID.make(startSnapshot), to: endSnapshot })
+              .pipe(Effect.catch(() => Effect.succeed(undefined)))
+          : undefined
+      yield* events.publish(SessionEvent.Step.Ended, {
+        sessionID: input.sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID: inFlight.id,
+        finish: "tool-calls",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        snapshot: endSnapshot,
+        files,
+      })
+      // Mirror runStep's continuation tail: a step with local tool calls continues so the model sees
+      // the (reused or failed) results.
+      let needsContinuation = toolParts.some((part) => part.provider?.executed !== true)
+      if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+      if (needsContinuation)
+        return { ran: true, continue: true, step: input.step + 1, promotion: "steer" as SessionInput.Delivery }
+      const moreQueue = yield* SessionInput.hasPending(db, input.sessionID, "queue")
+      if (moreQueue) return { ran: true, continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
+      return { ran: true, continue: false, step: input.step + 1, promotion: undefined }
+    })
+
     // One iteration of `run`'s loop, exposed so a Temporal workflow can drive the turn one step at
     // a time (each step = one runTurn = one provider attempt + its tools). Semantics match `run`.
     const runStep = Effect.fn("SessionRunner.runStep")(function* (input: {
@@ -414,6 +474,10 @@ const layer = Layer.effect(
       readonly first: boolean
       readonly force: boolean
     }) {
+      // Re-drive of a crashed step: finalize it from the log rather than re-calling the model and
+      // re-running its already-dispatched tools.
+      const resumed = yield* resumeCrashedStep(input)
+      if (resumed) return resumed
       let promotion = input.promotion
       if (input.first) {
         const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
