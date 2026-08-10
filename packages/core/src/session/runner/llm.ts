@@ -500,11 +500,14 @@ const layer = Layer.effect(
               .files({ from: Snapshot.ID.make(startSnapshot), to: endSnapshot })
               .pipe(Effect.catch(() => Effect.succeed(undefined)))
           : undefined
+      const localTools = toolParts.some((part) => part.provider?.executed !== true)
       yield* events.publish(SessionEvent.Step.Ended, {
         sessionID: input.sessionID,
         timestamp: yield* DateTime.now,
         assistantMessageID: inFlight.id,
-        finish: "tool-calls",
+        // "tool-calls" only when a local tool actually needs a follow-up turn; a step whose tools
+        // were all provider-executed finalizes as a plain stop.
+        finish: localTools ? "tool-calls" : "stop",
         cost: 0,
         tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         snapshot: endSnapshot,
@@ -512,7 +515,7 @@ const layer = Layer.effect(
       })
       // Mirror runStep's continuation tail: a step with local tool calls continues so the model sees
       // the (reused or failed) results.
-      let needsContinuation = toolParts.some((part) => part.provider?.executed !== true)
+      let needsContinuation = localTools
       if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
       if (needsContinuation)
         return { ran: true, continue: true, step: input.step + 1, promotion: "steer" as SessionInput.Delivery }

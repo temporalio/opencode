@@ -215,8 +215,10 @@ distinct worker identities.
 
 ### Caveats
 
-- Run migrations once as a deploy step before starting N workers; the first-open migration guard is
-  process-local, so N cold workers migrating at once can race.
+- Cold-start migrations serialize across processes (one `BEGIN IMMEDIATE` transaction wraps
+  check-and-apply, so concurrent starts wait and then no-op). Running migrations once as a deploy
+  step is still good practice for large fleets, and on a remote store it keeps cold starts from
+  contending for the write lock.
 - The PRAGMAs (`journal_mode` / `synchronous` / `busy_timeout` / `cache_size` / `wal_checkpoint`)
   are local-file semantics and are skipped for the shared/libSQL backend, which manages journaling
   itself.
