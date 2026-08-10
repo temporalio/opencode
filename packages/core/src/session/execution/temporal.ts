@@ -35,6 +35,14 @@ const PER_STEP = process.env.OPENCODE_SESSION_EXECUTION === "temporal-turn"
 const WORKFLOW = PER_STEP ? WF.sessionTurn : WF.sessionExecution
 const WORKFLOW_TYPE = PER_STEP ? "sessionTurn" : "sessionExecution"
 
+// Role split so the worker fleet can run separately from the HTTP server. `both` (default) hosts the
+// activity worker AND the workflow client in one process (the serve process). `client` makes serve
+// drive workflows without hosting a worker; `worker` runs a standalone activity worker with no HTTP
+// surface (see packages/server/src/worker.ts).
+const ROLE = process.env.OPENCODE_TEMPORAL_ROLE ?? "both"
+const HOST_WORKER = ROLE !== "client"
+const HOST_CLIENT = ROLE !== "worker"
+
 // The v2 RunError union has no generic member, so a run failure surfaced across the durable
 // boundary is carried as a ContextSnapshotDecodeError with the original text in `details`. Faithful
 // per-member reconstruction (Schema round-trip of the exact tagged error) is a further follow-up.
@@ -133,28 +141,48 @@ const layer = Layer.effect(
       })
     }
 
-    // Worker connection (native) hosts the runContinuation activity + the workflow.
-    const nativeConn = yield* Effect.acquireRelease(
-      Effect.promise(() => NativeConnection.connect({ address: ADDRESS })),
-      (conn) => Effect.promise(() => conn.close().catch(() => {})),
-    )
-    const worker = yield* Effect.promise(() =>
-      Worker.create({
-        connection: nativeConn,
-        namespace: NAMESPACE,
-        taskQueue: TASK_QUEUE,
-        workflowsPath: fileURLToPath(new URL("./temporal-workflow.ts", import.meta.url)),
-        activities: { ...makeActivities(drain), ...makeStepActivities(stepDrain) },
-      }),
-    )
-    const runHandle = worker.run()
-    runHandle.catch(() => {})
-    yield* Effect.addFinalizer(() =>
-      Effect.promise(async () => {
-        worker.shutdown()
-        await runHandle.catch(() => {})
-      }),
-    )
+    // Worker connection (native) hosts the runContinuation activity + the workflow. Skipped in
+    // client-only role so serve can run without an embedded worker.
+    if (HOST_WORKER) {
+      const nativeConn = yield* Effect.acquireRelease(
+        Effect.promise(() => NativeConnection.connect({ address: ADDRESS })),
+        (conn) => Effect.promise(() => conn.close().catch(() => {})),
+      )
+      const worker = yield* Effect.promise(() =>
+        Worker.create({
+          connection: nativeConn,
+          namespace: NAMESPACE,
+          taskQueue: TASK_QUEUE,
+          workflowsPath: fileURLToPath(new URL("./temporal-workflow.ts", import.meta.url)),
+          activities: { ...makeActivities(drain), ...makeStepActivities(stepDrain) },
+        }),
+      )
+      const runHandle = worker.run()
+      runHandle.catch(() => {})
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(async () => {
+          worker.shutdown()
+          await runHandle.catch(() => {})
+        }),
+      )
+    }
+
+    const SESSION_PREFIX = "session-exec-"
+
+    // Worker-only process: it hosts activities but drives no workflows, so the client methods are
+    // unused. Return a service whose driving methods fail loudly if something unexpectedly calls them.
+    if (!HOST_CLIENT) {
+      yield* Effect.logInfo("SessionExecutionTemporal worker ready").pipe(
+        Effect.annotateLogs({ address: ADDRESS, taskQueue: TASK_QUEUE, workflow: WORKFLOW_TYPE, role: ROLE }),
+      )
+      const clientOnly = Effect.die("SessionExecution client is not hosted when OPENCODE_TEMPORAL_ROLE=worker")
+      return SessionExecution.Service.of({
+        active: Effect.succeed(new Set<SessionSchema.ID>()),
+        wake: () => clientOnly,
+        resume: () => clientOnly,
+        interrupt: () => clientOnly,
+      })
+    }
 
     // Client connection drives the per-session workflows.
     const clientConn = yield* Effect.acquireRelease(
@@ -162,7 +190,6 @@ const layer = Layer.effect(
       (conn) => Effect.promise(() => conn.close().catch(() => {})),
     )
     const client = new Client({ connection: clientConn, namespace: NAMESPACE })
-    const SESSION_PREFIX = "session-exec-"
 
     const drive = (id: SessionSchema.ID) =>
       Effect.promise(() =>

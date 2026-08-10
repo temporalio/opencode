@@ -49,13 +49,32 @@ export function createEmbeddedRoutes() {
   return makeRoutes(ServerAuth.Config.configLayer({ username: "opencode", password: Option.none() }))
 }
 
-function makeRoutes<AuthError, AuthServices>(auth: Layer.Layer<ServerAuth.Config, AuthError, AuthServices>) {
+// The application-service context (no HTTP surface), with the execution engine selected by env.
+// Shared by the HTTP routes and the standalone worker entrypoint (src/worker.ts) so both build the
+// exact same context.
+export function createServiceLayer() {
   // Opt in to Temporal-backed durable execution: "temporal" runs one activity per turn,
   // "temporal-turn" runs one activity per step. Otherwise the stock in-process coordinator is used.
   const exec = process.env.OPENCODE_SESSION_EXECUTION
   const executionNode =
     exec === "temporal" || exec === "temporal-turn" ? SessionExecutionTemporal.node : SessionExecutionLocal.node
-  const serviceLayer = AppNodeBuilder.build(applicationServices, [[SessionExecution.node, executionNode]])
+  return AppNodeBuilder.build(applicationServices, [[SessionExecution.node, executionNode]])
+}
+
+// The context for a standalone worker (src/worker.ts). Same services as serve, but with
+// SessionExecution as a built member so constructing the layer eagerly starts the Temporal worker
+// (with OPENCODE_TEMPORAL_ROLE=worker there is no HTTP handler to pull it in lazily).
+export function createWorkerLayer() {
+  const exec = process.env.OPENCODE_SESSION_EXECUTION
+  const executionNode =
+    exec === "temporal" || exec === "temporal-turn" ? SessionExecutionTemporal.node : SessionExecutionLocal.node
+  return AppNodeBuilder.build(LayerNode.group([applicationServices, SessionExecution.node]), [
+    [SessionExecution.node, executionNode],
+  ])
+}
+
+function makeRoutes<AuthError, AuthServices>(auth: Layer.Layer<ServerAuth.Config, AuthError, AuthServices>) {
+  const serviceLayer = createServiceLayer()
 
   return HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
     Layer.provide(handlers),
