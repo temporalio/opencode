@@ -33,7 +33,11 @@ curl -sS -m10 -o /dev/null -w '    prompt HTTP %{http_code}\n' -X POST $B/sessio
 
 echo "[3] let a few steps record, then KILL the whole server mid-turn"
 sleep 7
-echo "    events before crash: $(curl -sS -m8 $B/session/$SID/history -H "$H" | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("data",[])))')"
+PRE=$(curl -sS -m8 $B/session/$SID/history -H "$H" | python3 -c 'import sys,json;d=json.load(sys.stdin).get("data",[]);print(len(d), "seen="+str("CRASH_RECOVERED" in json.dumps(d)))')
+echo "    events before crash: $PRE"
+# The token is written by step 3 of the task; if it already exists the kill landed too late and the
+# run proves nothing about recovery.
+[[ "$PRE" == *seen=True* ]] && { echo "RESULT: INVALID (task finished before the crash; rerun)"; exit 2; }
 killserver; echo "    server killed"
 
 echo "[4] restart server (embedded worker re-registers; Temporal re-drives)"
@@ -48,7 +52,9 @@ import sys,json
 items=json.load(sys.stdin).get("data",[])
 types=[e.get("type","") for e in items]
 print("ENDED" if any(t.endswith("step.ended") for t in types) else "pending", "seen="+str("CRASH_RECOVERED" in json.dumps(items)))' 2>/dev/null)
-  echo "    poll $i: $r"; [[ "$r" == ENDED* ]] && { DONE=yes; break; }
+  # Pass needs the post-crash work to have actually happened (the token is only written by a step
+  # that runs after the kill), not just any pre-crash step.ended in the history.
+  echo "    poll $i: $r"; [[ "$r" == "ENDED seen=True" ]] && { DONE=yes; break; }
 done
 
 echo "[6] evidence from Temporal"
@@ -60,3 +66,4 @@ attempts=[int(e["activityTaskStartedEventAttributes"].get("attempt",1)) for e in
 print("    runContinuation attempts:", attempts, "| max:", max(attempts) if attempts else 0)
 PY
 echo "RESULT: turn completed post-crash = $DONE"
+[[ "$DONE" == yes ]] || exit 1
