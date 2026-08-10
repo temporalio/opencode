@@ -154,7 +154,22 @@ const make = (options: LibsqlConfig) =>
     }
 
     const semaphore = yield* Semaphore.make(1)
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
+    // The permit must cover the STATEMENT, not just the handing-out of the connection: an
+    // auto-commit write racing an open pinned transaction would get SQLITE_BUSY from the server
+    // (the remote path has no busy_timeout) and die the caller. Statements inside a transaction
+    // scope route to the transaction's own connection, so this never self-deadlocks.
+    const guarded = identity<Connection>({
+      execute: (query, params, transformRows) =>
+        semaphore.withPermits(1)(connection.execute(query, params, transformRows)),
+      executeRaw: (query, params) => semaphore.withPermits(1)(connection.executeRaw(query, params)),
+      executeValues: (query, params) => semaphore.withPermits(1)(connection.executeValues(query, params)),
+      executeUnprepared: (query, params, transformRows) =>
+        semaphore.withPermits(1)(connection.executeUnprepared(query, params, transformRows)),
+      executeStream() {
+        return Stream.die("executeStream not implemented")
+      },
+    })
+    const acquirer = Effect.succeed(guarded)
     const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
       const fiber = Fiber.getCurrent()!
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
