@@ -3,11 +3,18 @@ import type * as activities from "./activities"
 
 // Unlimited retries with heartbeat: this is what makes a turn survive a worker crash. The turn
 // runs server-side, so a re-run just re-attaches (idempotent on the user-message count).
-const { createSession, runTurn, abortTurn } = proxyActivities<typeof activities>({
+const { runTurn } = proxyActivities<typeof activities>({
   startToCloseTimeout: "15 minutes",
   // Short heartbeat so a dead worker's in-flight turn is detected and re-driven quickly. The turn
   // keeps running server-side meanwhile, so the retry just re-attaches.
   heartbeatTimeout: "8 seconds",
+})
+// These calls never heartbeat, so they must not carry a heartbeat timeout (any call slower than it
+// would fail spuriously). createSession is a non-idempotent POST: a retry after an ambiguous
+// failure can orphan a server-side session, so retries are bounded.
+const { createSession, abortTurn } = proxyActivities<typeof activities>({
+  startToCloseTimeout: "1 minute",
+  retry: { maximumAttempts: 3 },
 })
 
 export const submitPrompt = defineSignal<[string]>("submitPrompt")
@@ -46,8 +53,9 @@ export async function durableSession(input: DurableSessionInput = {}): Promise<v
   })
   setHandler(abortSession, () => {
     // Best-effort: tell the server to abort the active turn; the running activity then returns the
-    // (aborted) assistant message and the loop moves on.
-    void abortTurn(sessionID)
+    // (aborted) assistant message and the loop moves on. A floating rejection would fail the
+    // workflow task, so it is swallowed.
+    abortTurn(sessionID).catch(() => {})
   })
   setHandler(getState, () => ({ sessionID, turns, pending: queue.length }))
 
