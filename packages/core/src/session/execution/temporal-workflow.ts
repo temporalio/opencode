@@ -47,10 +47,15 @@ export async function sessionExecution(sessionID: string): Promise<void> {
   let draining = false
   let handlers = 0
 
-  // Serialize drains, like the coordinator (one owner fiber per session at a time).
+  // Serialize drains, like the coordinator (one owner fiber per session at a time). Re-check after
+  // every wakeup: two waiters parked on the same condition can both observe `!draining` in one
+  // activation, and without the loop both would start a drain.
   const drainOnce = async (force: boolean) => {
-    await condition(() => !draining || stopping)
-    if (stopping) return
+    for (;;) {
+      await condition(() => !draining || stopping)
+      if (stopping) return
+      if (!draining) break
+    }
     draining = true
     try {
       await runContinuation({ sessionID, force })
@@ -77,21 +82,28 @@ export async function sessionExecution(sessionID: string): Promise<void> {
     }
   })
 
-  for (;;) {
-    const gotWork = await condition(() => pendingWake || stopping, IDLE_TIMEOUT)
-    if (stopping) return
-    if (!gotWork) {
-      // Idle: terminate only when nothing is in flight. A later wake/resume starts a fresh run.
-      if (!draining && handlers === 0) return
-      continue
+  // interrupt cancels the workflow's root scope, so a cancellation can surface at the idle wait
+  // itself, not just inside a drain; treat it as a normal stop rather than a workflow failure.
+  try {
+    for (;;) {
+      const gotWork = await condition(() => pendingWake || stopping, IDLE_TIMEOUT)
+      if (stopping) return
+      if (!gotWork) {
+        // Idle: terminate only when nothing is in flight. A later wake/resume starts a fresh run.
+        if (!draining && handlers === 0) return
+        continue
+      }
+      pendingWake = false
+      try {
+        await drainOnce(false)
+      } catch (e) {
+        // wake tolerates run errors (the coordinator logs and moves on); only cancellation stops us.
+        if (isCancellation(e)) return
+      }
     }
-    pendingWake = false
-    try {
-      await drainOnce(false)
-    } catch (e) {
-      // wake tolerates run errors (the coordinator logs and moves on); only cancellation stops us.
-      if (isCancellation(e)) return
-    }
+  } catch (e) {
+    if (isCancellation(e)) return
+    throw e
   }
 }
 
@@ -106,8 +118,12 @@ export async function sessionTurn(sessionID: string): Promise<void> {
   let handlers = 0
 
   const drainTurn = async (force: boolean) => {
-    await condition(() => !draining || stopping)
-    if (stopping) return
+    // Same re-check loop as drainOnce: a single wakeup must admit a single drain.
+    for (;;) {
+      await condition(() => !draining || stopping)
+      if (stopping) return
+      if (!draining) break
+    }
     draining = true
     try {
       let step = 1
@@ -141,18 +157,24 @@ export async function sessionTurn(sessionID: string): Promise<void> {
     }
   })
 
-  for (;;) {
-    const gotWork = await condition(() => pendingWake || stopping, IDLE_TIMEOUT)
-    if (stopping) return
-    if (!gotWork) {
-      if (!draining && handlers === 0) return
-      continue
+  // Same as sessionExecution: a root-scope cancellation surfacing at the idle wait is a stop.
+  try {
+    for (;;) {
+      const gotWork = await condition(() => pendingWake || stopping, IDLE_TIMEOUT)
+      if (stopping) return
+      if (!gotWork) {
+        if (!draining && handlers === 0) return
+        continue
+      }
+      pendingWake = false
+      try {
+        await drainTurn(false)
+      } catch (e) {
+        if (isCancellation(e)) return
+      }
     }
-    pendingWake = false
-    try {
-      await drainTurn(false)
-    } catch (e) {
-      if (isCancellation(e)) return
-    }
+  } catch (e) {
+    if (isCancellation(e)) return
+    throw e
   }
 }
