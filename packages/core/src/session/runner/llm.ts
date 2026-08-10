@@ -420,9 +420,13 @@ const layer = Layer.effect(
         const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
         if (!input.force && !hasSteer && !hasQueue)
           return { ran: false, continue: false, step: input.step, promotion: undefined }
-        yield* failInterruptedTools(input.sessionID)
         promotion = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       }
+      // Close tools left pending/running by an interrupted attempt before every turn, not just the
+      // first. A mid-turn re-drive (first=false, from a Temporal step retry) would otherwise
+      // re-stream a request with a dangling tool_use and no tool_result, which the provider rejects
+      // -- a retry poison loop. This is a no-op on a healthy step (the prior step settled its tools).
+      yield* failInterruptedTools(input.sessionID)
       const result = yield* runTurn(input.sessionID, promotion, input.step)
       let needsContinuation = result.needsContinuation
       if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
