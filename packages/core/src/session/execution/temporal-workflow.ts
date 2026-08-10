@@ -21,10 +21,13 @@ import {
 import type { Activities, StepActivities, StepDrainResult } from "./temporal-activities"
 
 const activityOptions = {
-  startToCloseTimeout: "30 minutes",
-  // Short heartbeat so a dead worker's in-flight drain is re-driven quickly; the run re-reads the
-  // durable log, so a retry is a safe re-attach. A genuine run error is thrown non-retryable by the
-  // activity, so only crashes/timeouts actually retry.
+  // The heartbeat is the liveness bound (it stops within seconds of a worker death and Temporal
+  // re-drives). startToClose is only the backstop for a drain that hangs while its process stays
+  // alive, so it must comfortably exceed any legitimate turn: long tool runs, many steps, or a
+  // human taking their time over a permission ask. 30 minutes proved far too tight -- it hard-killed
+  // legitimate turns and each kill opened a short two-writer window until the zombie attempt
+  // noticed its heartbeat rejection.
+  startToCloseTimeout: "12 hours",
   heartbeatTimeout: "10 seconds",
   retry: { maximumAttempts: 100 },
 } as const

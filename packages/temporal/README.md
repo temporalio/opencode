@@ -142,6 +142,12 @@ later. Verified by `packages/core/test/session-runner-resume.test.ts`.
 - The per-session workflow is long-lived and self-terminates after an idle period. Layer
   construction connects to Temporal at startup, so the server needs Temporal reachable when
   `OPENCODE_SESSION_EXECUTION=temporal`.
+- Activity bounds: the 10s heartbeat is the liveness bound (worker death re-drives within seconds);
+  `startToCloseTimeout` is a 12-hour backstop for a drain that hangs while its process stays alive.
+  Known limit: when an attempt is retried while the previous one is still alive (a network
+  partition, or the backstop firing), the old attempt keeps publishing for a few seconds until its
+  heartbeat is rejected and the AbortSignal interrupts it; the projector's status guards make
+  duplicate settlements no-ops in projection, but the overlap window is not fully fenced.
 
 `scripts/resume-check.ts` verifies resume: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
