@@ -213,10 +213,13 @@ distinct worker identities.
 - Multi-statement writes commit atomically on both backends. The libSQL client runs each statement
   as its own auto-commit request, so a `BEGIN`/`COMMIT` emitted as plain statements would not bind a
   transaction over a remote URL. The shared backend instead routes a transaction through a real
-  interactive libSQL transaction (one pinned stream), which is all-or-nothing. A commit/rollback
-  atomicity test runs against an embedded (`file:`) store
-  (`packages/core/test/database-libsql-transaction.test.ts`). The networked crash-atomicity itself
-  still needs a live `sqld`/Turso to integration-test.
+  interactive libSQL transaction (one pinned stream), which is all-or-nothing. Verified against an
+  embedded (`file:`) store (`packages/core/test/database-libsql-transaction.test.ts`) AND against a
+  live networked `sqld` over HTTP (`packages/core/test/database-libsql-remote.test.ts`: atomic
+  commit, full rollback on a mid-transaction failure, and the schema migrations applied remotely).
+  The remote suite needs a server, so it runs only when `OPENCODE_LIBSQL_TEST_URL` is set (e.g.
+  `turso dev --port 8899`, then `OPENCODE_LIBSQL_TEST_URL=http://127.0.0.1:8899`); it skips
+  otherwise.
 
 ### What resumes cross-host, and what does not
 
@@ -232,8 +235,9 @@ Host-local state that does NOT ride the DB, so it is not reconstructed on a diff
   a turn that keeps editing files must resume on a worker that has that worktree. This is the one real
   cross-host correctness constraint. Three ways to satisfy it: co-locate a session's workers by worktree
   (session affinity via a per-worktree Temporal task queue), share the worktree (a networked
-  filesystem), or reconstruct it from the last snapshot on resume (needs a shared snapshot store). This
-  is a deployment/design choice, not covered here yet.
+  filesystem), or reconstruct it from the last snapshot on resume (needs a shared snapshot store).
+  [docs/worktree-portability.md](docs/worktree-portability.md) weighs the three; the recommendation is
+  per-worktree task queues, with snapshot reconstruction as the long-term path.
 - **The snapshot store (`${data}/snapshot`) and the retained full tool-output files
   (`${data}/tool-output`).** The runner never reads these to rebuild context: snapshot file-diffs are
   best-effort (`Effect.catch` to `undefined`), and the model sees the bounded tool-output preview, not
