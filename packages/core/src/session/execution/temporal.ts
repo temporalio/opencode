@@ -230,16 +230,25 @@ const layer = Layer.effect(
 
     return SessionExecution.Service.of({
       // Durable and restart-surviving: the open per-session workflows in Temporal ARE the active
-      // set (unlike a process-local Set, which is empty after a restart).
-      active: Effect.promise(async () => {
-        const ids = new Set<SessionSchema.ID>()
-        for await (const wf of client.workflow.list({
-          query: `WorkflowType = '${WORKFLOW_TYPE}' AND ExecutionStatus = 'Running'`,
-        })) {
-          if (wf.workflowId.startsWith(SESSION_PREFIX)) {
-            ids.add(SessionSchema.ID.make(wf.workflowId.slice(SESSION_PREFIX.length)))
+      // set (unlike a process-local Set, which is empty after a restart). Both workflow types are
+      // queried so sessions survive a mode switch, and the result is intersected with this store's
+      // sessions because visibility is namespace-wide (other deployments sharing the namespace must
+      // not appear as ghosts). Visibility is eventually consistent: a just-woken session can lag
+      // here by about a second.
+      active: Effect.gen(function* () {
+        const found = yield* Effect.promise(async () => {
+          const ids: SessionSchema.ID[] = []
+          for await (const wf of client.workflow.list({
+            query: `(WorkflowType = 'sessionExecution' OR WorkflowType = 'sessionTurn') AND ExecutionStatus = 'Running'`,
+          })) {
+            if (wf.workflowId.startsWith(SESSION_PREFIX)) {
+              ids.push(SessionSchema.ID.make(wf.workflowId.slice(SESSION_PREFIX.length)))
+            }
           }
-        }
+          return ids
+        })
+        const ids = new Set<SessionSchema.ID>()
+        for (const id of found) if (yield* store.get(id)) ids.add(id)
         return ids
       }),
       wake: (id) => drive(id).pipe(Effect.asVoid),
@@ -248,25 +257,45 @@ const layer = Layer.effect(
       resume: (id) =>
         Effect.tryPromise({
           try: async () => {
-            const startOp = new WithStartWorkflowOperation(WORKFLOW, {
-              taskQueue: TASK_QUEUE,
-              workflowId: workflowId(id),
-              args: [id],
-              workflowIdConflictPolicy: "USE_EXISTING",
-            })
-            await client.workflow.executeUpdateWithStart(WF.resume, {
-              startWorkflowOperation: startOp,
-              args: [],
-            })
+            const attempt = () => {
+              const startOp = new WithStartWorkflowOperation(WORKFLOW, {
+                taskQueue: TASK_QUEUE,
+                workflowId: workflowId(id),
+                args: [id],
+                workflowIdConflictPolicy: "USE_EXISTING",
+              })
+              return client.workflow.executeUpdateWithStart(WF.resume, {
+                startWorkflowOperation: startOp,
+                args: [],
+              })
+            }
+            try {
+              await attempt()
+            } catch (e) {
+              // The long-lived workflow self-completes after its idle timeout; an update admitted
+              // in that instant fails against the just-completed run instead of starting a fresh
+              // one. Retry once so the caller gets a real run, not the race.
+              const message = String((e as { message?: unknown })?.message ?? "")
+              if (!/already completed|not found/i.test(message)) throw e
+              await attempt()
+            }
           },
           catch: (e) => toRunError(id, e),
         }),
       interrupt: (id) =>
-        Effect.promise(() =>
-          client.workflow
-            .getHandle(workflowId(id))
-            .signal(WF.interrupt)
-            .catch(() => {}),
+        Effect.tryPromise({
+          try: () => client.workflow.getHandle(workflowId(id)).signal(WF.interrupt),
+          catch: (e) => e,
+        }).pipe(
+          Effect.catch((e) => {
+            const message = String((e as { message?: unknown })?.message ?? e)
+            // An idle session's workflow has already completed; nothing to interrupt is fine. A
+            // genuine delivery failure must not be silent: the user asked for a stop.
+            if (/already completed|not found/i.test(message)) return Effect.void
+            return Effect.logWarning("session interrupt signal failed").pipe(
+              Effect.annotateLogs({ sessionID: id, error: message }),
+            )
+          }),
         ),
     })
   }),
