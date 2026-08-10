@@ -87,6 +87,18 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`permission_request\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`agent\` text,
+          \`payload\` text NOT NULL,
+          \`status\` text DEFAULT 'pending' NOT NULL,
+          \`message\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`permission\` (
           \`id\` text PRIMARY KEY,
           \`project_id\` text NOT NULL,
@@ -238,6 +250,9 @@ export default {
       `)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`permission_request_session_status_idx\` ON \`permission_request\` (\`session_id\`,\`status\`);`,
+      )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )
