@@ -34,7 +34,7 @@ import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { type RunError, Service } from "./index"
 import { SessionRunnerModel } from "./model"
-import { createLLMEventPublisher } from "./publish-llm-event"
+import { createLLMEventPublisher, emitToolResult } from "./publish-llm-event"
 import { toLLMMessages } from "./to-llm-message"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
@@ -434,7 +434,37 @@ const layer = Layer.effect(
         (part) => part.state.status === "running" || part.state.status === "completed",
       )
       if (!dispatched) return undefined
-      // Fail the still-open tools (never re-run them); completed tools keep their recorded results.
+      // A tool declared idempotent (a pure read) has no external side effect, so it is safe to
+      // re-run: re-settle it for a real result instead of failing it. Everything else still open is
+      // failed below -- we cannot know whether a side-effecting tool already ran. Completed tools
+      // keep their recorded results either way.
+      const session = yield* getSession(input.sessionID)
+      const agent = yield* agents.select(session.agent)
+      const materialization = yield* tools.materialize(agent.info?.permissions)
+      for (const part of toolParts) {
+        if (part.state.status !== "running") continue
+        if (!materialization.idempotent(part.name)) continue
+        const settlement = yield* materialization.settle({
+          sessionID: session.id,
+          agent: agent.id,
+          assistantMessageID: inFlight.id,
+          call: LLMEvent.toolCall({ id: part.id, name: part.name, input: part.state.input }),
+        })
+        yield* emitToolResult(events, {
+          sessionID: session.id,
+          assistantMessageID: inFlight.id,
+          callID: part.id,
+          result: settlement.result,
+          output: settlement.output,
+          outputPaths: settlement.outputPaths,
+          provider: {
+            executed: part.provider?.executed ?? false,
+            ...(part.provider?.metadata === undefined ? {} : { metadata: part.provider.metadata }),
+          },
+        })
+      }
+      // Fail whatever is still open (non-idempotent or never dispatched); completed and re-settled
+      // tools are terminal now and are skipped.
       yield* failInterruptedTools(input.sessionID)
       const startSnapshot = inFlight.snapshot?.start
       const endSnapshot = yield* snapshots.capture()
