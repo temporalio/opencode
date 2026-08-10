@@ -144,6 +144,28 @@ un-fuse the eager tool dispatch and is left for later. Verified by
 `scripts/resume-check.ts` verifies resume: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
 
+### Running workers separately
+
+By default the serve process hosts both the Temporal activity worker and the workflow client
+(`OPENCODE_TEMPORAL_ROLE=both`). To scale workers independently of the HTTP server, run standalone
+workers and point serve at client-only:
+
+```bash
+# serve drives workflows, hosts no worker
+OPENCODE_TEMPORAL_ROLE=client OPENCODE_SESSION_EXECUTION=temporal-turn ... serve --port 4601
+
+# one or more standalone activity workers (no HTTP surface)
+OPENCODE_TEMPORAL_ROLE=worker OPENCODE_SESSION_EXECUTION=temporal-turn \
+  TEMPORAL_ADDRESS=127.0.0.1:7237 OPENCODE_DB_URL=... \
+  bun run packages/server/src/worker.ts
+```
+
+`packages/server/src/worker.ts` builds the same application context serve uses (`createWorkerLayer`)
+without the HTTP API, so a worker resumes a session purely from the shared store.
+`scripts/standalone-worker-smoke.sh` verifies a worker comes up with no serve process and registers
+on the task queue. Caveat: file-touching tools run against the local working tree, so a worker must
+have the session's worktree present (see "What resumes cross-host").
+
 ## Shared, durable event store (any-worker resume)
 
 The v2 engine event-sources each session to a SQLite store. By default that is a local file, so a
