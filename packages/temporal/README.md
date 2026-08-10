@@ -168,6 +168,22 @@ without the HTTP API, so a worker resumes a session purely from the shared store
 on the task queue. Caveat: file-touching tools run against the local working tree, so a worker must
 have the session's worktree present (see "What resumes cross-host").
 
+### Durable permission asks
+
+A tool waiting for user approval used to park on an in-memory deferred: invisible outside the asking
+process (a standalone worker's ask could never be answered) and gone on restart. A pending ask is now
+also a row in the shared store (`permission_request`). The blocked `assert` races its local deferred
+against a poll of the row, so a reply from ANY process sharing the store (the HTTP server answering
+for a detached worker) unblocks it; `list`/`get`/`forSession` read the rows, so serve can show asks
+raised elsewhere. Replies keep their semantics: `once`/`always` approve (an `always` rule
+retro-approves other pending asks it covers), `reject` declines and cascades to the session's other
+pending asks, a rejection message arrives as the typed `CorrectedError`. A user decline inside a
+Temporal activity is now a non-retryable failure, so the workflow does not re-drive a turn the user
+stopped. Graceful shutdown retires the process's pending asks as `expired`; after a hard crash a row
+can linger pending until a reply lands on it, which then has nothing to resume and is a no-op.
+Verified by `packages/core/test/permission-durable.test.ts` (two independent stacks over one store).
+The `question` tool still uses an in-process deferred and needs the same treatment.
+
 ## Shared, durable event store (any-worker resume)
 
 The v2 engine event-sources each session to a SQLite store. By default that is a local file, so a

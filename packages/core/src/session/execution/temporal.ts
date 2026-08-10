@@ -94,7 +94,18 @@ const layer = Layer.effect(
       )
       if (Exit.isSuccess(exit)) return
       const cause = exit.cause
-      if (Cause.hasInterruptsOnly(cause)) throw new Error("session run interrupted")
+      if (Cause.hasInterruptsOnly(cause)) {
+        // Two interrupt sources: Temporal cancellation (the AbortSignal fired -- rethrow plainly so
+        // the activity settles as cancelled) and an internal halt like a user declining a permission
+        // (the signal did NOT fire). The latter must be non-retryable, or the workflow re-drives a
+        // turn the user explicitly stopped.
+        if (signal.aborted) throw new Error("session run interrupted")
+        throw ApplicationFailure.create({
+          message: "session run halted (user declined)",
+          type: "SessionRunDeclined",
+          nonRetryable: true,
+        })
+      }
       // A genuine run error is thrown non-retryable so Temporal surfaces it (to resume) rather than
       // retrying; only crashes / task timeouts (never thrown here) go through the retry policy. The
       // error is encoded faithfully in `details` so the caller can reconstruct the exact RunError.
@@ -130,7 +141,16 @@ const layer = Layer.effect(
       )
       if (Exit.isSuccess(exit)) return exit.value
       const cause = exit.cause
-      if (Cause.hasInterruptsOnly(cause)) throw new Error("session run interrupted")
+      if (Cause.hasInterruptsOnly(cause)) {
+        // Same split as the whole-turn drain: cancellation rethrows plainly, an internal user-decline
+        // halt is non-retryable.
+        if (signal.aborted) throw new Error("session run interrupted")
+        throw ApplicationFailure.create({
+          message: "session run halted (user declined)",
+          type: "SessionRunDeclined",
+          nonRetryable: true,
+        })
+      }
       const squashed = Cause.squash(cause) as { _tag?: string; message?: string }
       const encoded = encodeRunError(squashed)
       throw ApplicationFailure.create({
