@@ -185,8 +185,12 @@ raised elsewhere. Replies keep their semantics: `once`/`always` approve (an `alw
 retro-approves other pending asks it covers), `reject` declines and cascades to the session's other
 pending asks, a rejection message arrives as the typed `CorrectedError`. A user decline inside a
 Temporal activity is now a non-retryable failure, so the workflow does not re-drive a turn the user
-stopped. Graceful shutdown retires the process's pending asks as `expired`; after a hard crash a row
-can linger pending until a reply lands on it, which then has nothing to resume and is a no-op.
+stopped. Tool-originated asks have deterministic ids (session + callID + action + resources), so a
+re-driven activity adopts the same pending row instead of filing a duplicate, and an approval that
+landed while the asker was dead short-circuits the retry (a one-time approve is honored across
+re-drives without a saved rule). Graceful shutdown retires the process's pending asks as `expired`
+and a revived attempt flips them back to pending; after a hard crash the pending row simply feeds
+the retry. A pending ask whose session is abandoned lingers in the list until a reply retires it.
 Verified by `packages/core/test/permission-durable.test.ts` (two independent stacks over one store).
 The `question` tool still uses an in-process deferred and needs the same treatment.
 
