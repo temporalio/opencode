@@ -111,8 +111,10 @@ Marginal cost measured on THIS app (same engine, same machine):
 - Durability and signal/update fidelity: full Temporal semantics, the only path with no gap.
 - Complexity for the vendor: near zero code; the cost moves to packaging and lifecycle (bundling
   a 237 MB binary, process supervision, ports, upgrades).
-- [research pending: licensing of CLI+UI for redistribution, statements on production use,
-  feature gaps vs the real server.]
+- Redistribution: no licensing issue; shipping it inside a desktop app is a real option. However,
+  the motivating desktop customer (Cursor) does not want a bundled server process, so this path is
+  parked for the desktop archetype and stays the answer for the appliance/single-machine one.
+- [research pending: feature gaps vs the real server.]
 
 ### E. Integrate a local option into the Temporal Agent Harness
 
@@ -146,9 +148,11 @@ Scoring: full / partial / none, with the load-bearing caveat inline. [two cells 
    interface; it is the only path with near-zero sustained maintenance and no semantic pretense.
    When local durability matters, event-source the session in the app (this fork's shape) rather
    than reimplementing Temporal's replay.
-2. **Existing Temporal-first agents needing desktop distribution now: D.** Full fidelity today;
-   the cost is packaging, not code. Requires `--db-filename` and lifecycle supervision.
-   [confirm licensing/support posture]
+2. **Existing Temporal-first agents on a machine the customer controls (appliance,
+   single-machine server): D.** Full fidelity today; the cost is packaging, not code. Requires
+   `--db-filename` and lifecycle supervision. No licensing issue. For the DESKTOP archetype this
+   is off the table by customer preference (no bundled server process), which is exactly why C
+   (or A as the fallback) carries that case.
 3. **A is the fallback** when neither refactoring (C) nor a second process (D) is acceptable:
    scope it to the SDK subset actually used and accept drift risk.
 4. **B is product strategy, not a customer workaround**: an embedded Temporal across all
@@ -158,6 +162,5 @@ Scoring: full / partial / none, with the load-bearing caveat inline. [two cells 
 
 ## Open questions
 
-- Dev server: sanctioned/licensed for redistribution inside customer desktop apps?
 - What signal/update surface do desktop agents actually need? Evidence here says small and
   enumerable: wake, interrupt, one awaited update (this fork); approvals and steering (harness).
