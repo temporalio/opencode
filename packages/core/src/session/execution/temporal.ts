@@ -95,11 +95,12 @@ const layer = Layer.effect(
       if (Exit.isSuccess(exit)) return
       const cause = exit.cause
       if (Cause.hasInterruptsOnly(cause)) {
-        // Two interrupt sources: Temporal cancellation (the AbortSignal fired -- rethrow plainly so
-        // the activity settles as cancelled) and an internal halt like a user declining a permission
-        // (the signal did NOT fire). The latter must be non-retryable, or the workflow re-drives a
-        // turn the user explicitly stopped.
-        if (signal.aborted) throw new Error("session run interrupted")
+        // Two interrupt sources: Temporal cancellation (the AbortSignal fired -- rethrow its reason
+        // so the attempt records Cancelled, not Failed) and an internal halt like a user declining a
+        // permission (the signal did NOT fire). The latter must be non-retryable, or the workflow
+        // re-drives a turn the user explicitly stopped.
+        if (signal.aborted)
+          throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
         throw ApplicationFailure.create({
           message: "session run halted (user declined)",
           type: "SessionRunDeclined",
@@ -142,9 +143,10 @@ const layer = Layer.effect(
       if (Exit.isSuccess(exit)) return exit.value
       const cause = exit.cause
       if (Cause.hasInterruptsOnly(cause)) {
-        // Same split as the whole-turn drain: cancellation rethrows plainly, an internal user-decline
-        // halt is non-retryable.
-        if (signal.aborted) throw new Error("session run interrupted")
+        // Same split as the whole-turn drain: cancellation rethrows its reason (records Cancelled),
+        // an internal user-decline halt is non-retryable.
+        if (signal.aborted)
+          throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
         throw ApplicationFailure.create({
           message: "session run halted (user declined)",
           type: "SessionRunDeclined",
