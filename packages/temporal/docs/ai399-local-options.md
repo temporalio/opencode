@@ -34,7 +34,12 @@ signals/updates/timers) with a local implementation, so unmodified workflow code
   constraints stay imposed on local code that gets nothing for them.
 - Where it shines: an existing Temporal-first codebase that cannot be refactored, needing a local
   mode quickly, using a small enumerable SDK subset.
-- [research pending: the referenced existing implementation; ask reporter which one is meant.]
+- The ticket's "has been implemented" covers two things (per the assignee): our own TypeScript
+  prototype, and shims customers have added inside their own codebases. Strictly, the TS prototype
+  (`agent-harness`, AI-363) swaps at an app-defined seam, which this doc classifies as path C;
+  the customer-authored variants are true path A: they fake the SDK surface their code touches and
+  carry the drift risk described above. The distinction matters because the two have opposite
+  maintenance profiles.
 
 ### B. Shim in the Rust core
 
@@ -133,7 +138,7 @@ Scoring: full / partial / none, with the load-bearing caveat inline. [two cells 
 | Desktop packaging | best | good | best | worst (bundle+supervise a server) |
 | Upgrade path to Temporal Cloud | same code, repoint | same code, repoint | swap the factory | same code, repoint |
 | Offline | yes | yes | yes | yes (local server) |
-| Exists today | partially (referenced implementation [research]) | no | yes, twice (this fork; agent-harness) | yes (shipped CLI) |
+| Exists today | yes, by customers in their own code | no | yes, twice (this fork; agent-harness) | yes (shipped CLI) |
 
 ## Recommendations (draft)
 
@@ -153,7 +158,6 @@ Scoring: full / partial / none, with the load-bearing caveat inline. [two cells 
 
 ## Open questions
 
-- Which language-layer shim does the ticket refer to, and what SDK subset did it cover?
 - Dev server: sanctioned/licensed for redistribution inside customer desktop apps?
 - What signal/update surface do desktop agents actually need? Evidence here says small and
   enumerable: wake, interrupt, one awaited update (this fork); approvals and steering (harness).
