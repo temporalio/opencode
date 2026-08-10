@@ -115,8 +115,19 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
 tools) is its own activity with its own retry/timeout/visibility, and the step loop is workflow
 control flow. It reuses `SessionRunner.runStep` (one iteration of `run`'s loop), so the turn
 semantics are unchanged. Verified: a create-then-read-then-reply turn recorded three `runTurnStep`
-activities under a `sessionTurn` workflow and completed. Finer granularity (the model call and each
-tool as separate activities) is a larger rewrite left for later; this is the per-step increment.
+activities under a `sessionTurn` workflow and completed.
+
+A per-step re-drive resumes from the durable event log rather than re-running work. `runStep` closes
+any tool left dangling by an interrupted attempt on every entry, not just the first. Without that, a
+mid-turn retry (`first=false`) re-streamed a request carrying a `tool_use` with no `tool_result`,
+which the provider rejects, a retry poison loop. And if the crashed step had already dispatched tools
+it is finalized from the log: completed tool results are kept, still-unsettled tools are failed, and
+a synthesized `Step.Ended` closes the step without re-calling the model. A tool in flight at the
+instant of the crash is marked interrupted (its result never committed, so the harness cannot know
+whether it ran) and the model redoes it; true safety for that window needs per-tool idempotency
+metadata. Finer granularity (the model call and each tool as separate Temporal activities) would
+un-fuse the eager tool dispatch and is left for later. Verified by
+`packages/core/test/session-runner-resume.test.ts`.
 
 ### Notes
 
