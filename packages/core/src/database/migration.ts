@@ -16,27 +16,66 @@ export type Migration = {
 }
 
 export function apply(db: Database) {
+  // Serialize across processes, not just within one. N cold workers pointing at the same shared
+  // store would otherwise race: both create the schema, or both insert the same migration id (the
+  // table check was a read outside any lock, a TOCTOU). The process-local semaphore covers
+  // same-process concurrency; the single BEGIN IMMEDIATE transaction makes check-and-apply atomic
+  // and write-locked, so a concurrent start on another process waits and then observes the
+  // migrations already applied and does nothing. The incremental branch mirrors `applyOnly` on the
+  // shared transaction (keep the two in sync).
   return lock.withPermit(
-    Effect.gen(function* () {
-      const tables = yield* db.all<{ name: string }>(
-        sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
-      )
-      if (tables.some((table) => table.name === "session")) return yield* applyOnly(db, migrations)
-      if (tables.length > 0) return yield* Effect.die("Database is not empty and has no session table")
-      yield* db.transaction((tx) =>
+    db.transaction(
+      (tx) =>
         Effect.gen(function* () {
-          yield* schema.up(tx)
+          const tables = yield* tx.all<{ name: string }>(
+            sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`,
+          )
+          const hasSession = tables.some((table) => table.name === "session")
+          if (!hasSession && tables.length > 0)
+            return yield* Effect.die("Database is not empty and has no session table")
+          if (!hasSession) {
+            yield* schema.up(tx)
+            yield* tx.run(
+              sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
+            )
+            yield* Effect.forEach(migrations, (migration) =>
+              tx.run(
+                sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed) VALUES (${migration.id}, ${Date.now()})`,
+              ),
+            )
+            return
+          }
           yield* tx.run(
-            sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
+            sql`CREATE TABLE IF NOT EXISTS ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
           )
-          yield* Effect.forEach(migrations, (migration) =>
-            tx.run(
+          let completed = new Set(
+            (yield* tx.all<{ id: string }>(sql`SELECT id FROM ${sql.identifier("migration")}`)).map((row) => row.id),
+          )
+          if (completed.size === 0) {
+            if (
+              yield* tx.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${"__drizzle_migrations"}`)
+            ) {
+              yield* tx.run(sql`
+                INSERT OR IGNORE INTO ${sql.identifier("migration")} (id, time_completed)
+                SELECT name, ${Date.now()}
+                FROM ${sql.identifier("__drizzle_migrations")}
+                WHERE name IS NOT NULL
+              `)
+              completed = new Set(
+                (yield* tx.all<{ id: string }>(sql`SELECT id FROM ${sql.identifier("migration")}`)).map((row) => row.id),
+              )
+            }
+          }
+          for (const migration of migrations) {
+            if (completed.has(migration.id)) continue
+            yield* migration.up(tx)
+            yield* tx.run(
               sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed) VALUES (${migration.id}, ${Date.now()})`,
-            ),
-          )
+            )
+          }
         }),
-      )
-    }),
+      { behavior: "immediate" },
+    ),
   )
 }
 
