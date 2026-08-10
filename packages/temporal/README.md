@@ -230,6 +230,10 @@ distinct worker identities.
   The remote suite needs a server, so it runs only when `OPENCODE_LIBSQL_TEST_URL` is set (e.g.
   `turso dev --port 8899`, then `OPENCODE_LIBSQL_TEST_URL=http://127.0.0.1:8899`); it skips
   otherwise.
+- Known limit: every durable event is its own transaction, and the engine records text/reasoning
+  deltas as events, so a streaming turn against a REMOTE store pays one interactive transaction per
+  delta, serialized per process. Fine for a shared local file; expect reduced streaming throughput
+  over a network URL until delta events are batched for the remote backend.
 
 ### What resumes cross-host, and what does not
 
