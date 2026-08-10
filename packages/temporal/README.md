@@ -159,7 +159,10 @@ distinct worker identities.
 - The PRAGMAs (`journal_mode` / `synchronous` / `busy_timeout` / `cache_size` / `wal_checkpoint`)
   are local-file semantics and are skipped for the shared/libSQL backend, which manages journaling
   itself.
-- The libSQL client issues each statement as its own request, so a `BEGIN`/`COMMIT` transaction is
-  atomic against an embedded (`file:`) store but not against a remote URL without the libSQL
-  batch/transaction API; wiring that (or using Postgres) is the remaining step for a networked
-  writer. Verified here against an embedded `file:` store and against a shared local file.
+- Multi-statement writes commit atomically on both backends. The libSQL client runs each statement
+  as its own auto-commit request, so a `BEGIN`/`COMMIT` emitted as plain statements would not bind a
+  transaction over a remote URL. The shared backend instead routes a transaction through a real
+  interactive libSQL transaction (one pinned stream), which is all-or-nothing. A commit/rollback
+  atomicity test runs against an embedded (`file:`) store
+  (`packages/core/test/database-libsql-transaction.test.ts`). The networked crash-atomicity itself
+  still needs a live `sqld`/Turso to integration-test.
