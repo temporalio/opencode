@@ -43,6 +43,10 @@ type Config<
   Structured extends SchemaType<any> = Output,
 > = {
   readonly description: string
+  // Opt-in: this tool has no external side effect (a pure read), so it is safe to re-run. Used to
+  // re-settle a tool caught in flight at a crash instead of failing it. Defaults to false; anything
+  // that writes files, runs shell, or mutates a remote must leave it unset.
+  readonly idempotent?: boolean
   readonly input: Input
   readonly output: Output
   readonly structured?: Structured
@@ -62,6 +66,7 @@ type Config<
 
 type Runtime = {
   readonly permission?: string
+  readonly idempotent: boolean
   readonly definition: (name: string) => ToolDefinition
   readonly settle: (call: ToolCall, context: Context) => Effect.Effect<ToolOutput, ToolFailure>
 }
@@ -76,6 +81,7 @@ export function make<
   const tool = Object.freeze({}) as Definition<Input, Structured>
   const definitions = new Map<string, ToolDefinition>()
   runtimes.set(tool, {
+    idempotent: config.idempotent === true,
     definition: (name) => {
       const cached = definitions.get(name)
       if (cached) return cached
@@ -146,6 +152,7 @@ export const withPermission = <Input extends SchemaType<any>, Output extends Sch
 }
 
 export const permission = (tool: AnyTool, name: string) => runtimeOf(tool).permission ?? name
+export const idempotent = (tool: AnyTool) => runtimeOf(tool).idempotent
 export const definition = (name: string, tool: AnyTool) => runtimeOf(tool).definition(name)
 export const settle = (tool: AnyTool, call: ToolCall, context: Context) => runtimeOf(tool).settle(call, context)
 
