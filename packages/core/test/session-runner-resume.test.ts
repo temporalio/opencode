@@ -26,6 +26,8 @@ import * as SessionRunnerLLM from "@opencode-ai/core/session/runner/llm"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
 import { createLLMEventPublisher } from "@opencode-ai/core/session/runner/publish-llm-event"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
+import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
+import { Tool } from "@opencode-ai/core/tool/tool"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
@@ -40,7 +42,7 @@ import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { Auth } from "@opencode-ai/llm/route"
 import { describe, expect } from "bun:test"
-import { Effect, Layer, Stream } from "effect"
+import { Effect, Layer, Schema, Stream } from "effect"
 import { testEffect } from "./lib/effect"
 
 const model = OpenAIChat.route
@@ -85,6 +87,7 @@ const harness = (stream: LLMClientShape["stream"]) =>
         Config.node,
         Snapshot.node,
         SessionRunnerLLM.node,
+        ApplicationTools.node,
       ]),
       [
         [LayerNodePlatform.llmClient, mockClient(stream)],
@@ -191,6 +194,46 @@ describe("SessionRunner resume", () => {
       const assistants = context.filter((message) => message.type === "assistant")
       expect(assistants).toHaveLength(1)
       expect(assistants[0]?.type === "assistant" ? Boolean(assistants[0].time.completed) : false).toBe(true)
+    }),
+  )
+
+  harness(dying).effect("re-settles an idempotent tool on resume but fails a side-effecting one", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      // A pure-read tool is safe to re-run; a side-effecting one is not.
+      yield* (yield* ApplicationTools.Service).register({
+        probe_read: Tool.make({
+          description: "read probe",
+          idempotent: true,
+          input: Schema.Struct({}),
+          output: Schema.String,
+          toModelOutput: ({ output }) => [{ type: "text", text: output }],
+          execute: () => Effect.succeed("resettled"),
+        }),
+        probe_write: Tool.make({
+          description: "write probe",
+          input: Schema.Struct({}),
+          output: Schema.String,
+          execute: () => Effect.succeed("wrote"),
+        }),
+      })
+      const publisher = yield* seededPublisher
+      yield* publisher.publish(LLMEvent.toolCall({ id: "call_ro", name: "probe_read", input: {} }))
+      yield* publisher.publish(LLMEvent.toolCall({ id: "call_rw", name: "probe_write", input: {} }))
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+      // Dying stream: resume must not re-call the model; the idempotent tool is re-run via the registry.
+      yield* runner.runStep({ sessionID, step: 4, promotion: "steer", first: false, force: false })
+      const context = yield* store.context(sessionID)
+      const readPart = toolPart(context, "call_ro")
+      const writePart = toolPart(context, "call_rw")
+      expect(readPart?.type === "tool" ? readPart.state.status : undefined).toBe("completed")
+      expect(
+        readPart?.type === "tool" && readPart.state.status === "completed"
+          ? readPart.state.content.some((item) => item.type === "text" && item.text === "resettled")
+          : false,
+      ).toBe(true)
+      expect(writePart?.type === "tool" ? writePart.state.status : undefined).toBe("error")
     }),
   )
 })

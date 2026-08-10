@@ -122,12 +122,14 @@ any tool left dangling by an interrupted attempt on every entry, not just the fi
 mid-turn retry (`first=false`) re-streamed a request carrying a `tool_use` with no `tool_result`,
 which the provider rejects, a retry poison loop. And if the crashed step had already dispatched tools
 it is finalized from the log: completed tool results are kept, still-unsettled tools are failed, and
-a synthesized `Step.Ended` closes the step without re-calling the model. A tool in flight at the
-instant of the crash is marked interrupted (its result never committed, so the harness cannot know
-whether it ran) and the model redoes it; true safety for that window needs per-tool idempotency
-metadata. Finer granularity (the model call and each tool as separate Temporal activities) would
-un-fuse the eager tool dispatch and is left for later. Verified by
-`packages/core/test/session-runner-resume.test.ts`.
+a synthesized `Step.Ended` closes the step without re-calling the model. A tool caught in flight at
+the crash is handled by declared idempotency: a side-effect-free tool (`read`/`glob`/`grep`, marked
+`idempotent: true`) is re-run for a real result, while a side-effecting tool is marked interrupted
+and left for the model to redo. The harness cannot know whether the side-effecting one already ran
+and must not re-run `git push`, so the default is non-idempotent; the blanket case (idempotency keys
+against an external system) is per-integration and out of scope. Finer granularity (the model call
+and each tool as separate Temporal activities) would un-fuse the eager tool dispatch and is left for
+later. Verified by `packages/core/test/session-runner-resume.test.ts`.
 
 ### Notes
 
