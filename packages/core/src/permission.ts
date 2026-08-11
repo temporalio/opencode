@@ -216,7 +216,7 @@ const layer = Layer.effect(
     function deterministicID(input: AssertInput) {
       if (!input.source?.callID) return undefined
       const digest = createHash("sha256")
-        .update([input.sessionID, input.source.callID, input.action, ...[...input.resources].sort()].join(" "))
+        .update([input.sessionID, input.source.callID, input.action, ...[...input.resources].sort()].join("\u0000"))
         .digest("hex")
       return ID.create(`per_${digest.slice(0, 26)}`)
     }
