@@ -56,16 +56,38 @@ const make = (options: LibsqlConfig) =>
         reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
       })
 
+    // sqld surfaces a cross-process write-lock conflict as a busy error instead of queueing, and
+    // the remote path has no `busy_timeout` pragma. Without a bounded retry, a routine collision
+    // (serve writing while a worker holds a turn transaction) dies the caller.
+    const isBusy = (cause: unknown) =>
+      /SQLITE_BUSY|database is locked|database table is locked/i.test(String(cause))
+    const withBusyRetry = async <A>(attempt: () => Promise<A>): Promise<A> => {
+      for (let tries = 0; ; tries++) {
+        try {
+          return await attempt()
+        } catch (cause) {
+          if (tries >= 5 || !isBusy(cause)) throw cause
+          const delay = Math.min(50 * 2 ** tries, 500) * (0.5 + Math.random())
+          await new Promise((resolve) => setTimeout(resolve, delay))
+        }
+      }
+    }
+
     const toRows = (r: ResultSet) => r.rows as unknown as Array<Record<string, unknown>>
     const toValues = (r: ResultSet) =>
       r.rows.map((row) => r.columns.map((c) => (row as Record<string, unknown>)[c])) as Array<unknown[]>
 
     // Auto-commit connection: each statement is its own request. Used outside transactions.
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
-      Effect.tryPromise({ try: () => native.execute({ sql: query, args: params as never[] }).then(toRows), catch: fail })
+      Effect.tryPromise({
+        try: () =>
+          withBusyRetry(() => native.execute({ sql: query, args: params as never[] })).then(toRows),
+        catch: fail,
+      })
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.tryPromise({
-        try: () => native.execute({ sql: query, args: params as never[] }).then(toValues),
+        try: () =>
+          withBusyRetry(() => native.execute({ sql: query, args: params as never[] })).then(toValues),
         catch: fail,
       })
 
@@ -95,7 +117,8 @@ const make = (options: LibsqlConfig) =>
       let tx: Transaction | null = null
       const exec = async (query: string, params: ReadonlyArray<unknown>): Promise<ResultSet> => {
         if (BEGIN.test(query)) {
-          tx = await native.transaction("write")
+          // Opening the write transaction is where the cross-process lock conflict lands.
+          tx = await withBusyRetry(() => native.transaction("write"))
           return EMPTY
         }
         if (COMMIT.test(query)) {
@@ -158,13 +181,19 @@ const make = (options: LibsqlConfig) =>
     // auto-commit write racing an open pinned transaction would get SQLITE_BUSY from the server
     // (the remote path has no busy_timeout) and die the caller. Statements inside a transaction
     // scope route to the transaction's own connection, so this never self-deadlocks.
+    // Reads never take the write lock (WAL), so they skip the permit: a permission poll or an
+    // `active` read must not queue behind an open turn transaction. Busy retry is the backstop if
+    // a server still reports a conflict.
+    const isRead = (query: string) => /^\s*(select|pragma)\b/i.test(query)
+    const guard = <A, E>(query: string, effect: Effect.Effect<A, E>) =>
+      isRead(query) ? effect : semaphore.withPermits(1)(effect)
     const guarded = identity<Connection>({
       execute: (query, params, transformRows) =>
-        semaphore.withPermits(1)(connection.execute(query, params, transformRows)),
-      executeRaw: (query, params) => semaphore.withPermits(1)(connection.executeRaw(query, params)),
-      executeValues: (query, params) => semaphore.withPermits(1)(connection.executeValues(query, params)),
+        guard(query, connection.execute(query, params, transformRows)),
+      executeRaw: (query, params) => guard(query, connection.executeRaw(query, params)),
+      executeValues: (query, params) => guard(query, connection.executeValues(query, params)),
       executeUnprepared: (query, params, transformRows) =>
-        semaphore.withPermits(1)(connection.executeUnprepared(query, params, transformRows)),
+        guard(query, connection.executeUnprepared(query, params, transformRows)),
       executeStream() {
         return Stream.die("executeStream not implemented")
       },
