@@ -195,7 +195,13 @@ const layer = Layer.effect(
       active: Effect.sync(() => new Set(drivers.keys())),
       wake: (id) =>
         Effect.sync(() => {
-          ensure(id).signal("wake")
+          // A wake can land between the supervisor's return and its finally; retry onto a fresh
+          // driver so the prompt is not stranded until the next wake.
+          for (let tries = 0; tries < 3; tries++) {
+            const driver = ensure(id)
+            driver.signal("wake")
+            if (!driver.completed) return
+          }
         }),
       resume: (id) =>
         Effect.tryPromise({
