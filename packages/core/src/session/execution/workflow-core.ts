@@ -1,0 +1,178 @@
+// The session supervisor, written ONCE, over a six-primitive runtime interface. Two drivers
+// execute it: the Temporal workflow adapter (temporal-workflow.ts; the real SDK provides the
+// primitives, activities carry the drains) and the in-process micro-driver (local-driver.ts; plain
+// promises provide the primitives, the drains run directly). The supervisor cannot drift between
+// modes because there is only one of it.
+//
+// MUST stay pure: the Temporal driver bundles this into the workflow sandbox, so no `effect`, no
+// `@opencode-ai/core` runtime imports, no Node builtins. Type-only imports are erased and safe.
+//
+// Semantics mirror the local coordinator (run-coordinator.ts): drains are serialized (one at a
+// time), a `wake` drives a drain and is tolerant of errors, and `resume` (an update) drives a
+// forced drain and returns its result to the caller (throwing the run's error). The supervisor
+// stays alive to serve later wakes/resumes and terminates after an idle period.
+
+import type { DrainInput, StepDrainInput, StepDrainResult } from "./temporal-activities"
+
+/** What a driver must provide. Six primitives; everything else is supervisor logic. */
+export interface WorkflowRuntime {
+  /** Wait until the predicate is true. With a timeout, resolve false when it expires first. */
+  readonly condition: (predicate: () => boolean, timeout?: string) => Promise<boolean>
+  readonly setSignalHandler: (name: "wake" | "interrupt", handler: () => void) => void
+  readonly setUpdateHandler: (name: "resume", handler: () => Promise<void>) => void
+  /** One whole-turn drain (SessionRunner.run). The Temporal driver runs it as an activity. */
+  readonly runContinuation: (input: DrainInput) => Promise<void>
+  /** One step of a turn (SessionRunner.runStep), for the per-step variant. */
+  readonly runTurnStep: (input: StepDrainInput) => Promise<StepDrainResult>
+  /** Cancel the in-flight drain and any parked condition (interrupt semantics). */
+  readonly cancelCurrentScope: () => void
+  /** Whether an error is the driver's cancellation (a normal stop, not a failure). */
+  readonly isCancellation: (error: unknown) => boolean
+}
+
+export interface WorkflowOptions {
+  /** How long to stay alive with no work before self-terminating. */
+  readonly idleTimeout?: string
+}
+
+export const makeWorkflows = (rt: WorkflowRuntime, options?: WorkflowOptions) => {
+  const IDLE_TIMEOUT = options?.idleTimeout ?? "5 minutes"
+
+  async function sessionExecution(sessionID: string): Promise<void> {
+    let pendingWake = true // started by a wake -> there is work to drain
+    let stopping = false
+    let draining = false
+    let handlers = 0
+
+    // Serialize drains, like the coordinator (one owner fiber per session at a time). Re-check
+    // after every wakeup: two waiters parked on the same condition can both observe `!draining`
+    // in one activation, and without the loop both would start a drain.
+    const drainOnce = async (force: boolean) => {
+      for (;;) {
+        await rt.condition(() => !draining || stopping)
+        if (stopping) return
+        if (!draining) break
+      }
+      draining = true
+      try {
+        await rt.runContinuation({ sessionID, force })
+      } finally {
+        draining = false
+      }
+    }
+
+    rt.setSignalHandler("wake", () => {
+      pendingWake = true
+    })
+    rt.setSignalHandler("interrupt", () => {
+      stopping = true
+      rt.cancelCurrentScope()
+    })
+    // resume = coordinator.run: force one drain and surface its result (a run error rejects the
+    // update, so the caller observes it).
+    rt.setUpdateHandler("resume", async () => {
+      handlers++
+      try {
+        await drainOnce(true)
+      } finally {
+        handlers--
+      }
+    })
+
+    // interrupt cancels the whole scope, so a cancellation can surface at the idle wait itself,
+    // not just inside a drain; treat it as a normal stop rather than a failure.
+    try {
+      for (;;) {
+        const gotWork = await rt.condition(() => pendingWake || stopping, IDLE_TIMEOUT)
+        if (stopping) return
+        if (!gotWork) {
+          // Idle: terminate only when nothing is in flight. A later wake/resume starts a fresh run.
+          if (!draining && handlers === 0) return
+          continue
+        }
+        pendingWake = false
+        try {
+          await drainOnce(false)
+        } catch (e) {
+          // wake tolerates run errors (the coordinator logs and moves on); only cancellation stops us.
+          if (rt.isCancellation(e)) return
+        }
+      }
+    } catch (e) {
+      if (rt.isCancellation(e)) return
+      throw e
+    }
+  }
+
+  // Per-step variant: identical lifecycle, but a turn is driven one step at a time -- each step
+  // (one provider attempt + its tools) is its own drain call, and the step loop is supervisor
+  // control flow. The loop state (step / promotion / first) mirrors SessionRunner.run's loop.
+  async function sessionTurn(sessionID: string): Promise<void> {
+    let pendingWake = true
+    let stopping = false
+    let draining = false
+    let handlers = 0
+
+    const drainTurn = async (force: boolean) => {
+      // Same re-check loop as drainOnce: a single wakeup must admit a single drain.
+      for (;;) {
+        await rt.condition(() => !draining || stopping)
+        if (stopping) return
+        if (!draining) break
+      }
+      draining = true
+      try {
+        let step = 1
+        let promotion: string | null = null
+        let first = true
+        for (;;) {
+          const r: StepDrainResult = await rt.runTurnStep({ sessionID, step, promotion, first, force })
+          if (!r.continue) break
+          step = r.step
+          promotion = r.promotion
+          first = false
+        }
+      } finally {
+        draining = false
+      }
+    }
+
+    rt.setSignalHandler("wake", () => {
+      pendingWake = true
+    })
+    rt.setSignalHandler("interrupt", () => {
+      stopping = true
+      rt.cancelCurrentScope()
+    })
+    rt.setUpdateHandler("resume", async () => {
+      handlers++
+      try {
+        await drainTurn(true)
+      } finally {
+        handlers--
+      }
+    })
+
+    try {
+      for (;;) {
+        const gotWork = await rt.condition(() => pendingWake || stopping, IDLE_TIMEOUT)
+        if (stopping) return
+        if (!gotWork) {
+          if (!draining && handlers === 0) return
+          continue
+        }
+        pendingWake = false
+        try {
+          await drainTurn(false)
+        } catch (e) {
+          if (rt.isCancellation(e)) return
+        }
+      }
+    } catch (e) {
+      if (rt.isCancellation(e)) return
+      throw e
+    }
+  }
+
+  return { sessionExecution, sessionTurn }
+}

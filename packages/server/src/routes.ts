@@ -10,6 +10,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
+import { SessionExecutionLocalDriver } from "@opencode-ai/core/session/execution/local-driver"
 import { SessionExecutionTemporal } from "@opencode-ai/core/session/execution/temporal"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
@@ -53,11 +54,17 @@ export function createEmbeddedRoutes() {
 // Shared by the HTTP routes and the standalone worker entrypoint (src/worker.ts) so both build the
 // exact same context.
 export function createServiceLayer() {
-  // Opt in to Temporal-backed durable execution: "temporal" runs one activity per turn,
-  // "temporal-turn" runs one activity per step. Otherwise the stock in-process coordinator is used.
+  // The factory: one binding selects how sessions execute. "temporal" runs one activity per turn,
+  // "temporal-turn" one per step; "local-driver"/"local-driver-turn" run the SAME supervisor
+  // in-process with no server (workflow-core.ts + local-driver.ts). Otherwise the stock
+  // in-process coordinator is used.
   const exec = process.env.OPENCODE_SESSION_EXECUTION
   const executionNode =
-    exec === "temporal" || exec === "temporal-turn" ? SessionExecutionTemporal.node : SessionExecutionLocal.node
+    exec === "temporal" || exec === "temporal-turn"
+      ? SessionExecutionTemporal.node
+      : exec === "local-driver" || exec === "local-driver-turn"
+        ? SessionExecutionLocalDriver.node
+        : SessionExecutionLocal.node
   return AppNodeBuilder.build(applicationServices, [[SessionExecution.node, executionNode]])
 }
 
