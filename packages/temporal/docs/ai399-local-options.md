@@ -12,8 +12,9 @@ selected by an env var.
 
 1. **Same loop, no infrastructure at all** (desktop/CLI): no server process, no ports, minimal
    footprint. Durability degrades gracefully (a checkpoint file beats nothing).
-2. **Same loop, no OPERATED infrastructure** (single-machine server, appliance): a local process
-   is fine if it is zero-admin. Full Temporal semantics wanted.
+2. **Same loop, no OPERATED infrastructure** (an appliance: one machine the customer operates,
+   e.g. an on-prem server box or an edge device): a local process is fine if it is zero-admin.
+   Full Temporal semantics wanted.
 3. **Same CODE, both worlds**: the vendor ships one codebase; cloud deployments get durability,
    desktop gets local. The dominant engineering constraint is preventing drift between the paths.
 
