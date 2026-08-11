@@ -13,6 +13,7 @@ import {
   defineUpdate,
   setHandler,
   condition,
+  continueAsNew,
   CancellationScope,
   isCancellation,
 } from "@temporalio/workflow"
@@ -54,6 +55,7 @@ const runtime: WorkflowRuntime = {
   runTurnStep,
   cancelCurrentScope: () => CancellationScope.current().cancel(),
   isCancellation,
+  continueAsNew: (sessionID) => continueAsNew<(id: string) => Promise<void>>(sessionID),
 }
 
 const workflows = makeWorkflows(runtime)
