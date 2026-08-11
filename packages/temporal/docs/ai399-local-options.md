@@ -92,10 +92,10 @@ prototype the ticket's "has been implemented" refers to. Local mode gives up ret
 process death mid-tool, multi-worker capacity, and the audit trail; it keeps the same loop, tools,
 prompts, and checkpoint crash-resume.
 
-**Evidence 3, and the headline: Temporal already ships this pattern for ADK.** The ticket points
-at ADK as the example; research found the official integration
-(`pip install "temporalio[google-adk]"`, `temporalio.contrib.google_adk_agents`, experimental) IS
-the dual-mode answer, with a mechanism cheaper than a factory:
+**Evidence 3: Temporal already ships a dual-mode ADK integration.** The ticket points at ADK as
+the example; the official integration (`pip install "temporalio[google-adk]"`,
+`temporalio.contrib.google_adk_agents`, experimental) is shipped and dual-mode. Its mechanism is
+an ambient check, not a factory:
 
 - ADK's own seam is the `Runner` + `BaseSessionService` (in-memory, sqlite, database, vertex
   implementations), so local ADK needs no infrastructure.
@@ -109,6 +109,19 @@ the dual-mode answer, with a mechanism cheaper than a factory:
   telling customers: MCP toolsets cannot auto-fall-back (the caller must supply
   `not_in_workflow_toolset`), and durable mode is STRICTER than local (whole session state must
   serialize within payload limits), so local-only testing can pass and then fail under Temporal.
+
+The ambient check is the compatibility variant of this pattern, not the recommended shape. It
+exists because Temporal does not own ADK's composition root, and because a workflow cannot receive
+a live object graph as input, so the check detects which behavior is legal in the current
+environment. Its costs are structural: the mode is invisible at call sites, the conditional
+repeats in every wrapper, the type system cannot enforce a complete local graph, and where uniform
+degradation is impossible the failure is a runtime raise (the MCP edge above) instead of a
+construction-time requirement. When you own the composition root, prefer a factory that returns
+the interface: both implementations above do exactly that (one binding selects the
+`SessionExecution` implementation; one `Effects` value selects the runner), and a missing local
+implementation then fails at construction, not mid-run. The two shapes compose: a substrate
+factory at the agent-definition level with the ambient check kept only as a safety net would
+also close the MCP hole in ADK-shaped integrations.
 
 Characteristics of the family:
 
@@ -250,8 +263,11 @@ The ask is real, old, and largely unanswered publicly:
    (six years of #298, unanswered desktop/OEM threads, two abandoned commitments) says there is a
    real, unclaimed "embedded Temporal" position; claiming it means owning that implementation
    indefinitely. That decision belongs to product, informed by this doc.
-6. **Harness (E): apply C at the harness API layer**, using the ADK integration's fallback
-   mechanism as the shipped precedent for how Temporal-aware pieces degrade in-process.
+6. **Harness (E): apply C at the harness API layer**, as a factory returning the harness's
+   execution interface, chosen once at the composition root. Not ambient `in_workflow()` checks:
+   we own this composition root, so the local implementation should be enforced at construction
+   time. The ADK integration is the precedent for the wrapper technique where we do not own the
+   root, not for the harness's own design.
 
 ## Sources
 
