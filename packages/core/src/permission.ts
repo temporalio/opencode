@@ -146,11 +146,13 @@ const layer = Layer.effect(
         )
         .all()
         .pipe(EffectRuntime.orDie)
-    const updateRow = (id: string, status: string, message?: string) =>
+    // Status moves are compare-and-set on the stated `from`, so a reply that lost a race, or a
+    // shutdown racing an approval, cannot overwrite a landed outcome.
+    const transitionRow = (id: string, from: string, to: string, message?: string) =>
       db
         .update(PermissionRequestTable)
-        .set({ status, message: message ?? null })
-        .where(eq(PermissionRequestTable.id, id))
+        .set({ status: to, message: message ?? null })
+        .where(and(eq(PermissionRequestTable.id, id), eq(PermissionRequestTable.status, from)))
         .run()
         .pipe(EffectRuntime.orDie)
     const decodeRow = (row: { payload: string }) =>
@@ -160,12 +162,22 @@ const layer = Layer.effect(
       EffectRuntime.forEach(
         pending.values(),
         (item) =>
-          // Graceful shutdown: unblock the local waiter and retire the row. The waiting fiber dies
-          // with this process either way, so a later reply would have nothing to resume.
-          Deferred.fail(item.deferred, new DeclinedError()).pipe(
-            EffectRuntime.andThen(updateRow(item.request.id, "expired")),
-            EffectRuntime.catch(() => EffectRuntime.void),
-          ),
+          // Graceful shutdown: a reply may have landed on the row before the local poll saw it.
+          // Honor it, or the shutdown records a decline the user never made. Only a row that is
+          // still pending gets retired.
+          EffectRuntime.gen(function* () {
+            const row = yield* readRow(item.request.id)
+            if (row?.status === "approved") {
+              yield* Deferred.succeed(item.deferred, undefined)
+              return
+            }
+            if (row?.status === "corrected") {
+              yield* Deferred.fail(item.deferred, new CorrectedError({ feedback: row.message ?? "" }))
+              return
+            }
+            yield* transitionRow(item.request.id, "pending", "expired")
+            yield* Deferred.fail(item.deferred, new DeclinedError())
+          }).pipe(EffectRuntime.catch(() => EffectRuntime.void)),
         { discard: true },
       ).pipe(
         EffectRuntime.ensuring(
@@ -236,9 +248,12 @@ const layer = Layer.effect(
     const create = (request: Request, agent?: AgentV2.ID) =>
       EffectRuntime.uninterruptible(
         EffectRuntime.gen(function* () {
+          // A retry can land in this process while the prior attempt's waiter is still parked
+          // (deterministic ids make them the same ask). Share the waiter instead of dying.
+          const parked = pending.get(request.id)
+          if (parked) return parked
           const deferred = yield* Deferred.make<void, DeclinedError | CorrectedError>()
           const item = { request, agent, deferred }
-          if (pending.has(request.id)) return yield* EffectRuntime.die(`Duplicate pending permission ID: ${request.id}`)
           pending.set(request.id, item)
           yield* db
             .insert(PermissionRequestTable)
@@ -355,7 +370,7 @@ const layer = Layer.effect(
           })
 
           if (input.reply === "reject") {
-            yield* updateRow(existing.id, input.message ? "corrected" : "declined", input.message)
+            yield* transitionRow(existing.id, "pending", input.message ? "corrected" : "declined", input.message)
             yield* settleLocal(existing.id, (deferred) =>
               Deferred.fail(
                 deferred,
@@ -370,7 +385,7 @@ const layer = Layer.effect(
                 requestID: ID.make(other.id),
                 reply: "reject",
               })
-              yield* updateRow(other.id, "declined")
+              yield* transitionRow(other.id, "pending", "declined")
               yield* settleLocal(ID.make(other.id), (deferred) => Deferred.fail(deferred, new DeclinedError()))
             }
             return
@@ -383,7 +398,7 @@ const layer = Layer.effect(
               resources: existing.save,
             })
           }
-          yield* updateRow(existing.id, "approved")
+          yield* transitionRow(existing.id, "pending", "approved")
           yield* settleLocal(existing.id, (deferred) => Deferred.succeed(deferred, undefined))
           if (input.reply !== "always" || !existing.save?.length) return
 
@@ -406,7 +421,7 @@ const layer = Layer.effect(
               requestID: other.id,
               reply: "always",
             })
-            yield* updateRow(other.id, "approved")
+            yield* transitionRow(other.id, "pending", "approved")
             yield* settleLocal(other.id, (deferred) => Deferred.succeed(deferred, undefined))
           }
         }),

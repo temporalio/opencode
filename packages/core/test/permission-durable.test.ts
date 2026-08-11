@@ -4,7 +4,7 @@
 // independent service stacks share one DB file to simulate the two processes.
 import { describe, expect } from "bun:test"
 import path from "path"
-import { Cause, Context, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Context, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Database } from "@opencode-ai/core/database/database"
@@ -180,6 +180,59 @@ describe("PermissionV2 durable asks", () => {
       yield* permB.reply({ requestID: ask.id, reply: "once" })
       yield* permA.assert(input)
       expect(yield* permB.list()).toEqual([])
+      yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
+    }),
+  )
+
+  it.live("shutdown honors an approval that landed before the poll saw it", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const file = path.join(tmp.path, "shared.db")
+      yield* seed(file)
+      const B = yield* Layer.build(stack(file))
+      const permB = Context.get(B, PermissionV2.Service)
+      // A lives in its own scope so the test can shut it down while the waiter is parked.
+      const scope = yield* Scope.make()
+      const A = yield* Layer.build(stack(file)).pipe(Effect.provideService(Scope.Scope, scope))
+      const permA = Context.get(A, PermissionV2.Service)
+      const blocked = yield* permA
+        .assert({ sessionID, action: "bash", resources: ["echo hi"], agent })
+        .pipe(Effect.forkChild)
+      const ask = yield* awaitAsk(permB)
+      yield* permB.reply({ requestID: ask.id, reply: "once" })
+      // Shut A down inside the poll window: the finalizer must honor the approval on the row,
+      // not record a decline the user never made.
+      yield* Scope.close(scope, Exit.void)
+      const exit = yield* Fiber.await(blocked)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
+    }),
+  )
+
+  it.live("a same-process retry shares the parked waiter instead of dying", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const file = path.join(tmp.path, "shared.db")
+      yield* seed(file)
+      const A = yield* Layer.build(stack(file))
+      const B = yield* Layer.build(stack(file))
+      const permA = Context.get(A, PermissionV2.Service)
+      const permB = Context.get(B, PermissionV2.Service)
+      const input = {
+        sessionID,
+        action: "bash",
+        resources: ["make it"],
+        agent,
+        source: { type: "tool" as const, messageID: "msg_3", callID: "call_shared" },
+      }
+      const first = yield* permA.assert(input).pipe(Effect.forkChild)
+      yield* Effect.sleep(100)
+      const second = yield* permA.assert(input).pipe(Effect.forkChild)
+      const ask = yield* awaitAsk(permB)
+      expect(yield* permB.list()).toHaveLength(1)
+      yield* permB.reply({ requestID: ask.id, reply: "once" })
+      const exits = [yield* Fiber.await(first), yield* Fiber.await(second)]
+      expect(exits.every(Exit.isSuccess)).toBe(true)
       yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
     }),
   )
