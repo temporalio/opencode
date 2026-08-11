@@ -140,7 +140,10 @@ machine's dev build):
 
 Marginal cost measured on THIS app (same engine, same machine): stock local serve 297 MB RSS;
 `temporal-turn` serve 494 MB (embedded worker) + dev server 123 MB = ~617 MB across two processes,
-plus the binary on disk, for full Temporal semantics on identical code.
+plus the binary on disk, for full Temporal semantics on identical code. Measured to quantify the
+alternative, not to propose it here: this fork's intended desktop shape is the in-process local
+mode (path C), which is what we would suggest to the desktop customer. A bundled server is the
+appliance answer, not the desktop one.
 
 - **Fidelity is the differentiator: it is the real server against SQLite, not an emulator.**
   Research verified multi-namespace and Nexus endpoints work and persist. Signals, updates,
