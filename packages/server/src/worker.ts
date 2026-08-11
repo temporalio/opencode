@@ -3,7 +3,7 @@
 // forcing SessionExecution constructs the Temporal worker, which then polls the task queue and runs
 // session continuations. Run one or many of these next to (or instead of) an embedded worker.
 //
-//   OPENCODE_TEMPORAL_ROLE=worker OPENCODE_SESSION_EXECUTION=temporal-turn \
+//   OPENCODE_TEMPORAL_ROLE=worker OPENCODE_SESSION_EXECUTION=temporal \
 //   TEMPORAL_ADDRESS=127.0.0.1:7237 OPENCODE_DB_URL=... \
 //   bun run packages/server/src/worker.ts
 //

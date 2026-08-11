@@ -156,11 +156,8 @@ const layer = Layer.effect(
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
     const drains = makeDrains({ store, locations, ctx })
     const drivers = new Map<SessionSchema.ID, SessionDriver>()
-    // Read at layer build (not module load) so tests can set these before constructing the layer.
-    // local-driver = whole-turn drains; local-driver-turn = one drain call per step, mirroring the
-    // temporal / temporal-turn split so both drivers exercise both supervisors. The idle override
-    // shortens the supervisor's 5-minute self-termination.
-    const PER_STEP = process.env.OPENCODE_SESSION_EXECUTION === "local-driver-turn"
+    // Read at layer build (not module load) so tests can set it before constructing the layer.
+    // The idle override shortens the supervisor's 5-minute self-termination.
     const IDLE_TIMEOUT = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
 
     const ensure = (id: SessionSchema.ID): SessionDriver => {
@@ -169,7 +166,7 @@ const layer = Layer.effect(
       const driver = new SessionDriver(
         (rt) => {
           const workflows = makeWorkflows(rt, IDLE_TIMEOUT ? { idleTimeout: IDLE_TIMEOUT } : undefined)
-          return (PER_STEP ? workflows.sessionTurn : workflows.sessionExecution)(id)
+          return workflows.sessionTurn(id)
         },
         drains,
         () => {
@@ -191,7 +188,7 @@ const layer = Layer.effect(
     )
 
     yield* Effect.logInfo("SessionExecutionLocalDriver ready").pipe(
-      Effect.annotateLogs({ supervisor: PER_STEP ? "sessionTurn" : "sessionExecution" }),
+      Effect.annotateLogs({ supervisor: "sessionTurn" }),
     )
 
     return SessionExecution.Service.of({

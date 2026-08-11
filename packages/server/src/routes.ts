@@ -9,7 +9,6 @@ import { PtyTicket } from "@opencode-ai/core/pty/ticket"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
-import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
 import { SessionExecutionLocalDriver } from "@opencode-ai/core/session/execution/local-driver"
 import { SessionExecutionTemporal } from "@opencode-ai/core/session/execution/temporal"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
@@ -54,17 +53,13 @@ export function createEmbeddedRoutes() {
 // Shared by the HTTP routes and the standalone worker entrypoint (src/worker.ts) so both build the
 // exact same context.
 export function createServiceLayer() {
-  // The factory: one binding selects how sessions execute. "temporal" runs one activity per turn,
-  // "temporal-turn" one per step; "local-driver"/"local-driver-turn" run the SAME supervisor
-  // in-process with no server (workflow-core.ts + local-driver.ts). Otherwise the stock
-  // in-process coordinator is used.
-  const exec = process.env.OPENCODE_SESSION_EXECUTION
+  // The factory: two modes, one supervisor (workflow-core.ts). "temporal" runs it on a Temporal
+  // worker (one activity per step); anything else runs it in-process with no server
+  // (local-driver.ts). The loop, the drains, and the error codec are the same code either way.
   const executionNode =
-    exec === "temporal" || exec === "temporal-turn"
+    process.env.OPENCODE_SESSION_EXECUTION === "temporal"
       ? SessionExecutionTemporal.node
-      : exec === "local-driver" || exec === "local-driver-turn"
-        ? SessionExecutionLocalDriver.node
-        : SessionExecutionLocal.node
+      : SessionExecutionLocalDriver.node
   return AppNodeBuilder.build(applicationServices, [[SessionExecution.node, executionNode]])
 }
 
@@ -72,11 +67,9 @@ export function createServiceLayer() {
 // SessionExecution as a built member so constructing the layer eagerly starts the Temporal worker
 // (with OPENCODE_TEMPORAL_ROLE=worker there is no HTTP handler to pull it in lazily).
 export function createWorkerLayer() {
-  const exec = process.env.OPENCODE_SESSION_EXECUTION
-  const executionNode =
-    exec === "temporal" || exec === "temporal-turn" ? SessionExecutionTemporal.node : SessionExecutionLocal.node
+  // A standalone worker only makes sense in temporal mode.
   return AppNodeBuilder.build(LayerNode.group([applicationServices, SessionExecution.node]), [
-    [SessionExecution.node, executionNode],
+    [SessionExecution.node, SessionExecutionTemporal.node],
   ])
 }
 

@@ -20,11 +20,10 @@ const NAMESPACE = process.env.TEMPORAL_NAMESPACE ?? "default"
 const TASK_QUEUE = process.env.OPENCODE_TEMPORAL_TASK_QUEUE ?? "opencode-session-exec"
 const workflowId = (id: string) => `session-exec-${id}`
 
-// temporal = one activity per turn; temporal-turn = one activity per step (the model call + its
-// tools), with the step loop as workflow control flow.
-const PER_STEP = process.env.OPENCODE_SESSION_EXECUTION === "temporal-turn"
-const WORKFLOW = PER_STEP ? WF.sessionTurn : WF.sessionExecution
-const WORKFLOW_TYPE = PER_STEP ? "sessionTurn" : "sessionExecution"
+// One activity per step (the model call + its tools), with the step loop as workflow control
+// flow. The whole-turn sessionExecution workflow stays exported for workflows already running.
+const WORKFLOW = WF.sessionTurn
+const WORKFLOW_TYPE = "sessionTurn"
 
 // Role split so the worker fleet can run separately from the HTTP server. `both` (default) hosts the
 // activity worker AND the workflow client in one process (the serve process). `client` makes serve

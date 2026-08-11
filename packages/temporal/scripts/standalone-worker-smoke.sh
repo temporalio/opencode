@@ -34,7 +34,7 @@ done
 
 echo "starting standalone worker (role=worker, no serve)"
 OPENCODE_TEMPORAL_ROLE=worker \
-  OPENCODE_SESSION_EXECUTION=temporal-turn \
+  OPENCODE_SESSION_EXECUTION=temporal \
   TEMPORAL_ADDRESS="127.0.0.1:$PORT" \
   OPENCODE_DB="$DB" \
   bun run "$REPO/packages/server/src/worker.ts" >"$WLOG" 2>&1 &

@@ -1,4 +1,4 @@
-// Resumability of a per-step turn (temporal-turn): a Temporal step retry re-invokes runStep on the
+// Resumability of a per-step turn (temporal mode): a Temporal step retry re-invokes runStep on the
 // same durable log. These tests seed a crashed in-flight step (Step.Started + tool events, no
 // Step.Ended) and drive runStep to check the two recovery behaviors:
 //   - Slice 1: a dangling tool left by an interrupted attempt is closed on every step entry, not
