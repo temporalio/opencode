@@ -35,7 +35,7 @@ export function makeActivities(
   }
 }
 
-// Per-step variant (OPENCODE_SESSION_EXECUTION=temporal-turn): one runTurnStep activity = one step
+// Per-step activities: one runTurnStep activity = one step
 // (one provider attempt + its tools). The workflow loops it, so each step is its own activity with
 // its own retry/timeout/visibility. `promotion` is null (not undefined) so it serializes cleanly.
 export interface StepDrainInput {

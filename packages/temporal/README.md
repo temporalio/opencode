@@ -107,15 +107,18 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
   embedded worker) mid-turn, then restarting, still completes the turn. Temporal re-drives
   `runContinuation` (attempt 2), the run continues from the event log, and the workflow completes.
 
-### Per-step turns (`temporal-turn`)
+### Two modes, one supervisor
 
-`OPENCODE_SESSION_EXECUTION=temporal` runs a whole turn in one `runContinuation` activity.
-`OPENCODE_SESSION_EXECUTION=temporal-turn` instead drives the turn one **step** at a time: the
-`sessionTurn` workflow loops a `runTurnStep` activity, so each step (one provider attempt + its
-tools) is its own activity with its own retry/timeout/visibility, and the step loop is workflow
-control flow. It reuses `SessionRunner.runStep` (one iteration of `run`'s loop), so the turn
-semantics are unchanged. Verified: a create-then-read-then-reply turn recorded three `runTurnStep`
-activities under a `sessionTurn` workflow and completed.
+The factory has exactly two modes. `OPENCODE_SESSION_EXECUTION=temporal` runs the session
+supervisor on a Temporal worker; anything else (the default) runs the SAME supervisor in-process
+with the micro-driver (`workflow-core.ts` + `local-driver.ts`): no server, no worker, no ports,
+durability from the event log. Both modes drive the turn one **step** at a time: the `sessionTurn`
+supervisor loops a `runTurnStep` drain, so in temporal mode each step (one provider attempt + its
+tools) is its own activity with its own retry/timeout/visibility. It reuses `SessionRunner.runStep`
+(one iteration of `run`'s loop), so the turn semantics are unchanged. Verified: a
+create-then-read-then-reply turn recorded three `runTurnStep` activities under a `sessionTurn`
+workflow and completed. (Earlier whole-turn-per-activity and stock-coordinator modes were folded
+away; the whole-turn workflow stays exported for executions already running.)
 
 A per-step re-drive resumes from the durable event log rather than re-running work. `runStep` closes
 any tool left dangling by an interrupted attempt on every entry, not just the first. Without that, a
@@ -160,10 +163,10 @@ workers and point serve at client-only:
 
 ```bash
 # serve drives workflows, hosts no worker
-OPENCODE_TEMPORAL_ROLE=client OPENCODE_SESSION_EXECUTION=temporal-turn ... serve --port 4601
+OPENCODE_TEMPORAL_ROLE=client OPENCODE_SESSION_EXECUTION=temporal ... serve --port 4601
 
 # one or more standalone activity workers (no HTTP surface)
-OPENCODE_TEMPORAL_ROLE=worker OPENCODE_SESSION_EXECUTION=temporal-turn \
+OPENCODE_TEMPORAL_ROLE=worker OPENCODE_SESSION_EXECUTION=temporal \
   TEMPORAL_ADDRESS=127.0.0.1:7237 OPENCODE_DB_URL=... \
   bun run packages/server/src/worker.ts
 ```
