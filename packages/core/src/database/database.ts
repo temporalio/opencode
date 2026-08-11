@@ -35,6 +35,10 @@ function makeServiceLayer(localPragmas: boolean) {
         yield* db.run("PRAGMA cache_size = -64000")
         yield* db.run("PRAGMA foreign_keys = ON")
         yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
+      } else {
+        // Best effort on the shared backend: an embedded file honors it, a remote server applies
+        // it per stream at most. Deletes on a remote store rely on the application-side cascades.
+        yield* db.run("PRAGMA foreign_keys = ON").pipe(Effect.exit)
       }
       yield* DatabaseMigration.apply(db)
 
