@@ -146,6 +146,7 @@ describe("SessionExecution local micro-driver", () => {
     const sessionID = SessionV2.ID.make("ses_driver_wake")
     it.live("wake drives a turn to settlement, then the idle supervisor retires", () =>
       Effect.gen(function* () {
+        const previousIdle = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
         process.env.OPENCODE_SESSION_IDLE_TIMEOUT = "2 seconds"
         yield* seedSession(sessionID)
         yield* seedPrompt(sessionID)
@@ -160,6 +161,9 @@ describe("SessionExecution local micro-driver", () => {
         expect((yield* exec.active).has(sessionID)).toBe(true)
         // Idle self-termination: the driver retires without an interrupt.
         yield* until(exec.active, (active) => !active.has(sessionID))
+        // Restore so later layer builds in this process get the real default.
+        if (previousIdle === undefined) delete process.env.OPENCODE_SESSION_IDLE_TIMEOUT
+        else process.env.OPENCODE_SESSION_IDLE_TIMEOUT = previousIdle
       }),
     )
   }

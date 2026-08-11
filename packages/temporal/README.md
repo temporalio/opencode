@@ -150,7 +150,11 @@ later. Verified by `packages/core/test/session-runner-resume.test.ts`.
   Known limit: when an attempt is retried while the previous one is still alive (a network
   partition, or the backstop firing), the old attempt keeps publishing for a few seconds until its
   heartbeat is rejected and the AbortSignal interrupts it; the projector's status guards make
-  duplicate settlements no-ops in projection, but the overlap window is not fully fenced.
+  duplicate settlements no-ops in projection, but the overlap window is not fully fenced. The
+  fence design exists as a follow-up: `event_sequence.owner_id` and `claim()` are already in the
+  event store; claim the aggregate per attempt and reject stale-owner appends inside the per-event
+  transaction. It threads an owner through every publish (including compaction's), so it deserves
+  its own change.
 
 `scripts/resume-check.ts` verifies resume: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
@@ -221,7 +225,12 @@ distinct worker identities.
 - Cold-start migrations serialize across processes (one `BEGIN IMMEDIATE` transaction wraps
   check-and-apply, so concurrent starts wait and then no-op). Running migrations once as a deploy
   step is still good practice for large fleets, and on a remote store it keeps cold starts from
-  contending for the write lock.
+  contending for the write lock. A fresh remote store also builds the whole schema inside one
+  write transaction; a slow link or a server-side transaction timeout can kill that, one more
+  reason to migrate before starting workers.
+- Foreign keys are enforced on the local backend and best-effort on the shared one (SQLite
+  defaults them off; a remote server applies the pragma per stream at most). Deletes on the
+  shared store rely on the application-side cascades.
 - The PRAGMAs (`journal_mode` / `synchronous` / `busy_timeout` / `cache_size` / `wal_checkpoint`)
   are local-file semantics and are skipped for the shared/libSQL backend, which manages journaling
   itself.
