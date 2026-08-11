@@ -1,13 +1,11 @@
-// The durable equivalent of SessionRunCoordinator, as a Temporal workflow (one per session).
+// The Temporal driver for the session supervisor. The supervisor itself lives in workflow-core.ts
+// and is written once; this file adapts the real SDK's primitives (condition, signal/update
+// handlers, activity proxies, cancellation) to the WorkflowRuntime interface and exports the two
+// workflow functions the worker registers. The in-process driver (local-driver.ts) runs the SAME
+// supervisor with plain promises.
 //
-// MUST stay pure: Temporal bundles this in an isolated sandbox, so no `effect`, no
-// `@opencode-ai/core`, no Node builtins. It only ever sees the sessionID string. All real work
-// (SessionRunner.run against the durable event log) happens in the runContinuation activity.
-//
-// Semantics mirror the coordinator (run-coordinator.ts): drains are serialized (one at a time),
-// a `wake` drives a drain and is tolerant of errors, and `resume` (an Update) drives a forced
-// drain and returns its result to the caller (throwing the run's error). The workflow stays alive
-// to serve later wakes/resumes and terminates after an idle period.
+// MUST stay sandbox-safe: Temporal bundles this in an isolated context, so no `effect`, no
+// `@opencode-ai/core` runtime imports, no Node builtins.
 
 import {
   proxyActivities,
@@ -18,7 +16,8 @@ import {
   CancellationScope,
   isCancellation,
 } from "@temporalio/workflow"
-import type { Activities, StepActivities, StepDrainResult } from "./temporal-activities"
+import type { Activities, StepActivities } from "./temporal-activities"
+import { makeWorkflows, type WorkflowRuntime } from "./workflow-core"
 
 const activityOptions = {
   // The heartbeat is the liveness bound (it stops within seconds of a worker death and Temporal
@@ -38,143 +37,31 @@ const { runTurnStep } = proxyActivities<StepActivities>(activityOptions)
 export const wake = defineSignal("wake")
 export const interrupt = defineSignal("interrupt")
 export const resume = defineUpdate<void>("resume")
+const signals = { wake, interrupt } as const
 
-const IDLE_TIMEOUT = "5 minutes"
-
-export async function sessionExecution(sessionID: string): Promise<void> {
-  let pendingWake = true // started via signalWithStart -> there is work to drain
-  let stopping = false
-  let draining = false
-  let handlers = 0
-
-  // Serialize drains, like the coordinator (one owner fiber per session at a time). Re-check after
-  // every wakeup: two waiters parked on the same condition can both observe `!draining` in one
-  // activation, and without the loop both would start a drain.
-  const drainOnce = async (force: boolean) => {
-    for (;;) {
-      await condition(() => !draining || stopping)
-      if (stopping) return
-      if (!draining) break
+const runtime: WorkflowRuntime = {
+  condition: async (predicate, timeout) => {
+    if (timeout === undefined) {
+      await condition(predicate)
+      return true
     }
-    draining = true
-    try {
-      await runContinuation({ sessionID, force })
-    } finally {
-      draining = false
-    }
-  }
-
-  setHandler(wake, () => {
-    pendingWake = true
-  })
-  setHandler(interrupt, () => {
-    stopping = true
-    CancellationScope.current().cancel()
-  })
-  // resume = coordinator.run: force one drain and surface its result (a run error rejects the
-  // Update, so the caller observes it).
-  setHandler(resume, async () => {
-    handlers++
-    try {
-      await drainOnce(true)
-    } finally {
-      handlers--
-    }
-  })
-
-  // interrupt cancels the workflow's root scope, so a cancellation can surface at the idle wait
-  // itself, not just inside a drain; treat it as a normal stop rather than a workflow failure.
-  try {
-    for (;;) {
-      const gotWork = await condition(() => pendingWake || stopping, IDLE_TIMEOUT)
-      if (stopping) return
-      if (!gotWork) {
-        // Idle: terminate only when nothing is in flight. A later wake/resume starts a fresh run.
-        if (!draining && handlers === 0) return
-        continue
-      }
-      pendingWake = false
-      try {
-        await drainOnce(false)
-      } catch (e) {
-        // wake tolerates run errors (the coordinator logs and moves on); only cancellation stops us.
-        if (isCancellation(e)) return
-      }
-    }
-  } catch (e) {
-    if (isCancellation(e)) return
-    throw e
-  }
+    // The runtime interface uses plain strings; the SDK's Duration is a branded string template.
+    return condition(predicate, timeout as never)
+  },
+  setSignalHandler: (name, handler) => setHandler(signals[name], handler),
+  setUpdateHandler: (_name, handler) => setHandler(resume, handler),
+  runContinuation,
+  runTurnStep,
+  cancelCurrentScope: () => CancellationScope.current().cancel(),
+  isCancellation,
 }
 
-// Per-step variant (OPENCODE_SESSION_EXECUTION=temporal-turn): identical lifecycle, but a turn is
-// driven one step at a time -- each step (one provider attempt + its tools) is its own
-// runTurnStep activity, and the step loop is workflow control flow. The loop state (step /
-// promotion / first) mirrors SessionRunner.run's loop and lives in the (deterministic) workflow.
+const workflows = makeWorkflows(runtime)
+
+export async function sessionExecution(sessionID: string): Promise<void> {
+  return workflows.sessionExecution(sessionID)
+}
+
 export async function sessionTurn(sessionID: string): Promise<void> {
-  let pendingWake = true
-  let stopping = false
-  let draining = false
-  let handlers = 0
-
-  const drainTurn = async (force: boolean) => {
-    // Same re-check loop as drainOnce: a single wakeup must admit a single drain.
-    for (;;) {
-      await condition(() => !draining || stopping)
-      if (stopping) return
-      if (!draining) break
-    }
-    draining = true
-    try {
-      let step = 1
-      let promotion: string | null = null
-      let first = true
-      for (;;) {
-        const r: StepDrainResult = await runTurnStep({ sessionID, step, promotion, first, force })
-        if (!r.continue) break
-        step = r.step
-        promotion = r.promotion
-        first = false
-      }
-    } finally {
-      draining = false
-    }
-  }
-
-  setHandler(wake, () => {
-    pendingWake = true
-  })
-  setHandler(interrupt, () => {
-    stopping = true
-    CancellationScope.current().cancel()
-  })
-  setHandler(resume, async () => {
-    handlers++
-    try {
-      await drainTurn(true)
-    } finally {
-      handlers--
-    }
-  })
-
-  // Same as sessionExecution: a root-scope cancellation surfacing at the idle wait is a stop.
-  try {
-    for (;;) {
-      const gotWork = await condition(() => pendingWake || stopping, IDLE_TIMEOUT)
-      if (stopping) return
-      if (!gotWork) {
-        if (!draining && handlers === 0) return
-        continue
-      }
-      pendingWake = false
-      try {
-        await drainTurn(false)
-      } catch (e) {
-        if (isCancellation(e)) return
-      }
-    }
-  } catch (e) {
-    if (isCancellation(e)) return
-    throw e
-  }
+  return workflows.sessionTurn(sessionID)
 }

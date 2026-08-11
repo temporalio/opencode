@@ -1,27 +1,18 @@
 export * as SessionExecutionTemporal from "./temporal"
 
 import { fileURLToPath } from "node:url"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Effect, Layer } from "effect"
 import { Client, Connection, WithStartWorkflowOperation } from "@temporalio/client"
-import { ApplicationFailure } from "@temporalio/activity"
 import { NativeConnection, Worker } from "@temporalio/worker"
 
 import { LocationServiceMap } from "../../location-service-map"
 import { makeGlobalNode } from "../../effect/app-node"
-import { SessionRunner } from "../runner"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { SessionExecution } from "../execution"
-import { ContextSnapshotDecodeError } from "../error"
-import {
-  makeActivities,
-  makeStepActivities,
-  type DrainInput,
-  type StepDrainInput,
-  type StepDrainResult,
-} from "./temporal-activities"
-import type { SessionInput } from "../input"
-import { encodeRunError, decodeRunError } from "./run-error-codec"
+import { makeActivities, makeStepActivities } from "./temporal-activities"
+import { makeDrains } from "./drain"
+import { toRunError } from "./run-error-codec"
 import * as WF from "./temporal-workflow"
 
 const ADDRESS = process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7237"
@@ -43,24 +34,6 @@ const ROLE = process.env.OPENCODE_TEMPORAL_ROLE ?? "both"
 const HOST_WORKER = ROLE !== "client"
 const HOST_CLIENT = ROLE !== "worker"
 
-// The v2 RunError union has no generic member, so a run failure surfaced across the durable
-// boundary is carried as a ContextSnapshotDecodeError with the original text in `details`. Faithful
-// per-member reconstruction (Schema round-trip of the exact tagged error) is a further follow-up.
-const toRunError = (sessionID: SessionSchema.ID, e: unknown): SessionRunner.RunError => {
-  // Walk the failure chain (WorkflowUpdateFailedError -> ActivityFailure -> ApplicationFailure) to
-  // the encoded run error the activity attached, and reconstruct the exact tagged error.
-  let node: any = e
-  for (let depth = 0; node && depth < 6; depth++) {
-    if (Array.isArray(node.details) && node.details.length > 0) {
-      const decoded = decodeRunError(node.details[0])
-      if (decoded) return decoded
-      return new ContextSnapshotDecodeError({ sessionID, details: `session run failed: ${node.message}` })
-    }
-    node = node.cause
-  }
-  return new ContextSnapshotDecodeError({ sessionID, details: `session run failed: ${(e as any)?.message ?? String(e)}` })
-}
-
 /**
  * A Temporal-backed SessionExecution. It makes each session a durable workflow:
  *   - wake      -> signalWithStart(wake)   (start while idle, or coalesce into the running run)
@@ -81,87 +54,9 @@ const layer = Layer.effect(
     // SessionRunner and all of its dependencies.
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
 
-    const drain = async (input: DrainInput, signal: AbortSignal): Promise<void> => {
-      const exit = await Effect.runPromiseExit(
-        Effect.gen(function* () {
-          const session = yield* store.get(SessionSchema.ID.make(input.sessionID))
-          if (!session) return
-          yield* SessionRunner.Service.use((runner) =>
-            runner.run({ sessionID: session.id, force: input.force }),
-          ).pipe(Effect.provide(locations.get(session.location)))
-        }).pipe(Effect.provide(ctx), Effect.scoped),
-        { signal },
-      )
-      if (Exit.isSuccess(exit)) return
-      const cause = exit.cause
-      if (Cause.hasInterruptsOnly(cause)) {
-        // Two interrupt sources: Temporal cancellation (the AbortSignal fired -- rethrow its reason
-        // so the attempt records Cancelled, not Failed) and an internal halt like a user declining a
-        // permission (the signal did NOT fire). The latter must be non-retryable, or the workflow
-        // re-drives a turn the user explicitly stopped.
-        if (signal.aborted)
-          throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
-        throw ApplicationFailure.create({
-          message: "session run halted (user declined)",
-          type: "SessionRunDeclined",
-          nonRetryable: true,
-        })
-      }
-      // A genuine run error is thrown non-retryable so Temporal surfaces it (to resume) rather than
-      // retrying; only crashes / task timeouts (never thrown here) go through the retry policy. The
-      // error is encoded faithfully in `details` so the caller can reconstruct the exact RunError.
-      const squashed = Cause.squash(cause) as { _tag?: string; message?: string }
-      const encoded = encodeRunError(squashed)
-      throw ApplicationFailure.create({
-        message: squashed?.message ?? Cause.pretty(cause),
-        type: squashed?._tag ?? "SessionRunError",
-        nonRetryable: true,
-        details: encoded === undefined ? undefined : [encoded],
-      })
-    }
-
-    // Per-step drain: run exactly one step of the turn (used by temporal-turn mode). Same context
-    // and error encoding as the whole-turn drain; returns the next loop state to the workflow.
-    const stepDrain = async (input: StepDrainInput, signal: AbortSignal): Promise<StepDrainResult> => {
-      const exit = await Effect.runPromiseExit(
-        Effect.gen(function* () {
-          const session = yield* store.get(SessionSchema.ID.make(input.sessionID))
-          if (!session) return { ran: false, continue: false, step: input.step, promotion: null }
-          const r = yield* SessionRunner.Service.use((runner) =>
-            runner.runStep({
-              sessionID: session.id,
-              step: input.step,
-              promotion: (input.promotion ?? undefined) as SessionInput.Delivery | undefined,
-              first: input.first,
-              force: input.force,
-            }),
-          ).pipe(Effect.provide(locations.get(session.location)))
-          return { ran: r.ran, continue: r.continue, step: r.step, promotion: r.promotion ?? null }
-        }).pipe(Effect.provide(ctx), Effect.scoped),
-        { signal },
-      )
-      if (Exit.isSuccess(exit)) return exit.value
-      const cause = exit.cause
-      if (Cause.hasInterruptsOnly(cause)) {
-        // Same split as the whole-turn drain: cancellation rethrows its reason (records Cancelled),
-        // an internal user-decline halt is non-retryable.
-        if (signal.aborted)
-          throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
-        throw ApplicationFailure.create({
-          message: "session run halted (user declined)",
-          type: "SessionRunDeclined",
-          nonRetryable: true,
-        })
-      }
-      const squashed = Cause.squash(cause) as { _tag?: string; message?: string }
-      const encoded = encodeRunError(squashed)
-      throw ApplicationFailure.create({
-        message: squashed?.message ?? Cause.pretty(cause),
-        type: squashed?._tag ?? "SessionRunError",
-        nonRetryable: true,
-        details: encoded === undefined ? undefined : [encoded],
-      })
-    }
+    // The drain bodies are shared with the in-process micro-driver (drain.ts), so turn semantics
+    // and error encoding cannot differ between drivers.
+    const { drain, stepDrain } = makeDrains({ store, locations, ctx })
 
     // Worker connection (native) hosts the runContinuation activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.

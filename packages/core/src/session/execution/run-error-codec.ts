@@ -7,6 +7,7 @@ import { LLMError } from "@opencode-ai/llm"
 import { Integration } from "../../integration"
 import { SystemContext } from "../../system-context/index"
 import { ToolOutputStore } from "../../tool-output-store"
+import type { SessionSchema } from "../schema"
 import { ContextSnapshotDecodeError, MessageDecodeError } from "../error"
 import {
   ModelNotSelectedError,
@@ -49,4 +50,24 @@ export function decodeRunError(payload: unknown): SessionRunner.RunError | undef
   } catch {
     return undefined
   }
+}
+
+// Walk a failure chain (WorkflowUpdateFailedError -> ActivityFailure -> ApplicationFailure, or a
+// bare ApplicationFailure from the in-process driver) to the encoded run error the drain attached,
+// and reconstruct the exact tagged error. Falls back to a ContextSnapshotDecodeError carrying the
+// text, since the RunError union has no generic member.
+export function toRunError(sessionID: SessionSchema.ID, e: unknown): SessionRunner.RunError {
+  let node = e as { details?: unknown; cause?: unknown; message?: string } | undefined
+  for (let depth = 0; node && depth < 6; depth++) {
+    if (Array.isArray(node.details) && node.details.length > 0) {
+      const decoded = decodeRunError(node.details[0])
+      if (decoded) return decoded
+      return new ContextSnapshotDecodeError({ sessionID, details: `session run failed: ${node.message}` })
+    }
+    node = node.cause as typeof node
+  }
+  return new ContextSnapshotDecodeError({
+    sessionID,
+    details: `session run failed: ${(e as { message?: string })?.message ?? String(e)}`,
+  })
 }
