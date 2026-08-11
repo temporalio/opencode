@@ -179,6 +179,57 @@ definition, tools, approval policy, event stream) the swap seam with a non-Tempo
 locally (in-process bus, identical schemas). The ADK integration's `in_workflow()` mechanism is
 the shipped precedent for how the harness's Temporal-aware pieces could degrade in-process.
 
+## One supervisor, two drivers (demonstrated on this branch)
+
+The two-implementations objection to the plugin pattern is real: the loop is written once, but the
+SUPERVISOR contract (drains serialize, wakes coalesce, interrupt cancels, resume surfaces the
+error) existed twice, once as the local coordinator and once as the workflow, and the independent
+review found bugs precisely in the duplicated copy. This branch now closes that gap:
+
+- `workflow-core.ts`: the supervisor, written ONCE, over a six-primitive `WorkflowRuntime`
+  interface (`condition`, signal handlers, update handlers, the drain calls, cancellation,
+  `isCancellation`). Temporal's sandbox had already forced it to be pure, which is what makes it
+  executable anywhere.
+- `temporal-workflow.ts`: the Temporal driver; the real SDK provides the six primitives, the
+  drains run as activities.
+- `local-driver.ts` (`OPENCODE_SESSION_EXECUTION=local-driver` / `local-driver-turn`): the
+  in-process driver; plain promises provide the primitives (a polled `condition`, method-call
+  signals, an `AbortController` for cancellation), the drains run directly. No server, no worker,
+  no ports.
+- `drain.ts` and the error codec are shared modules, so turn semantics and typed errors are
+  byte-identical in both modes; contract tests drive the shared supervisor in-process (a turn
+  settles, the exact tagged `RunError` crosses the same encode/decode path, interrupt cancels, an
+  idle supervisor retires), and the worker smoke proves the same file still bundles in the
+  Temporal sandbox.
+
+The factory still hides the choice: one binding selects the driver. This is the factory-shaped
+answer to the ADK integration's ambient check, demonstrated.
+
+## Can the whole SDK surface be covered this way?
+
+The micro-driver needed six primitives because the supervisor uses six. Extending it across
+`@temporalio/workflow`'s API splits cleanly:
+
+- **Mechanical for live execution:** `sleep`/timers (`setTimeout`), `workflow.now` (`Date.now`),
+  `random`/`uuid4` (plain random: determinism only matters for replay, which a local driver never
+  does), queries (read a handler map), `patched`/`deprecatePatch` (constant true / no-op),
+  `sideEffect` (run the function), search attributes and memo (a local map), logging sinks
+  (console), child workflows and external handles (spawn sibling drivers, route signals through an
+  in-process registry), continue-as-new (re-invoke the function with the new arguments).
+- **The fundamental line is replay.** Temporal recovers workflow-VARIABLE state after a crash by
+  replaying history; a local driver has no history, so in-flight workflow variables and pending
+  timers die with the process. Covering that is not a shim, it is the embedded-service payload of
+  path B.
+
+Two consequences. First, the design rule for dual-mode apps: keep durable truth in an app-owned
+log and treat workflow variables as ephemeral. This branch already obeys it (supervisor state is
+reconstructible; turn state is in the event store; re-drives are log-based), which is why the
+local driver loses nothing that matters on a desktop crash, and it is the rule to hand any
+customer taking this path. Second, the honest scope statement: a whole-SDK local runtime is
+achievable for LIVE semantics as a bounded engineering effort, but replay-grade durability of
+workflow-local state is exactly where "cover the SDK surface" becomes "build embedded Temporal",
+and should be decided as that (path B), not approached incrementally by accident.
+
 ## What the local mode actually has to support: the control surface
 
 Measured from opencode's protocol (the session group plus human-in-the-loop groups), the session
