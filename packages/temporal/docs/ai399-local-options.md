@@ -151,12 +151,10 @@ machine's dev build):
 | Embedding-friendly flags | `--headless`, `--db-filename`, `--port`, `--ip`, repeatable `--namespace`, `--sqlite-pragma`, `--dynamic-config-value`; http/metrics ports default to random free |
 | License | MIT (verified in release tarball and via GitHub API) |
 
-Marginal cost measured on THIS app (same engine, same machine): stock local serve 297 MB RSS;
-temporal-mode serve 494 MB (embedded worker) + dev server 123 MB = ~617 MB across two processes,
-plus the binary on disk, for full Temporal semantics on identical code. Measured to quantify the
-alternative, not to propose it here: this fork's intended desktop shape is the in-process local
-mode (path C), which is what we would suggest to the desktop customer. A bundled server is the
-appliance answer, not the desktop one.
+On this app the desktop number is 297 MB RSS, one process, local mode. A bundled server was
+measured once to close the desktop question and is not a configuration anyone ships: desktop is
+local mode, and temporal mode's server is Cloud or a fleet. The standalone figures above are the
+appliance-archetype numbers.
 
 - **Fidelity is the differentiator: it is the real server against SQLite, not an emulator.**
   Research verified multi-namespace and Nexus endpoints work and persist. Signals, updates,
@@ -285,7 +283,7 @@ The ask is real, old, and largely unanswered publicly:
 | | A: language shim | B: rust-core shim | C: plugin pattern (incl. ADK-style fallback) | D: local dev server |
 |---|---|---|---|---|
 | Durability (crash mid-turn) | partial: what the shim persists; faithful replay = reimplementing Temporal | full IF built (it IS an embedded service) | partial: checkpoint-file coarse; event-sourced local store near-full for one machine | full (with `--db-filename`; default is in-memory) |
-| Resource needs | lightest (in-process) | in-process; core carries matching+history | lightest (in-process; store is a file) | ~102-139 MB RSS second process, ~128 MiB disk; measured here ~617 MB total for this app |
+| Resource needs | lightest (in-process) | in-process; core carries matching+history | lightest (in-process; store is a file) | ~102-139 MB RSS second process, ~128 MiB disk (appliance archetype; not a desktop configuration) |
 | Signal/Update support | re-implemented, drift-prone | full IF built | the app's control surface (~a dozen verbs), honored identically by both modes | full |
 | Complexity / maintainability | high, permanent (chases SDK surface per language); bounded if scoped to the control surface | highest; a second Temporal service implementation (Java test server: years, still short of parity) | lowest sustained; up-front loop design, or shipped by Temporal (ADK) | near-zero code; packaging+lifecycle burden |
 | Feature fidelity | subset, hand-built | full IF built | app semantics, not Temporal's | full: the real server (multi-namespace, Nexus verified) |
