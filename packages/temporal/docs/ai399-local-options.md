@@ -77,7 +77,7 @@ substrate, a local runner is another.
 **Evidence 1: this fork.** opencode's v2 engine event-sources every session to a store and exposes
 a substitutable `SessionExecution` interface (`active`/`wake`/`resume`/`interrupt`, four methods).
 The stock implementation is an in-process coordinator; this fork adds a Temporal-backed one
-(`OPENCODE_SESSION_EXECUTION=temporal` per turn, `temporal-turn` per step) plus a shared store so
+(`OPENCODE_SESSION_EXECUTION=temporal`, one activity per step) plus a shared store so
 any worker resumes any session. Because durability lives in the engine's event log, the LOCAL mode
 is already crash-recoverable without Temporal; Temporal adds supervised retries, worker
 distribution, restart-surviving visibility, and cross-process interrupt/resume. The swap point is
@@ -152,7 +152,7 @@ machine's dev build):
 | License | MIT (verified in release tarball and via GitHub API) |
 
 Marginal cost measured on THIS app (same engine, same machine): stock local serve 297 MB RSS;
-`temporal-turn` serve 494 MB (embedded worker) + dev server 123 MB = ~617 MB across two processes,
+temporal-mode serve 494 MB (embedded worker) + dev server 123 MB = ~617 MB across two processes,
 plus the binary on disk, for full Temporal semantics on identical code. Measured to quantify the
 alternative, not to propose it here: this fork's intended desktop shape is the in-process local
 mode (path C), which is what we would suggest to the desktop customer. A bundled server is the
@@ -192,18 +192,20 @@ review found bugs precisely in the duplicated copy. This branch now closes that 
   executable anywhere.
 - `temporal-workflow.ts`: the Temporal driver; the real SDK provides the six primitives, the
   drains run as activities.
-- `local-driver.ts` (`OPENCODE_SESSION_EXECUTION=local-driver` / `local-driver-turn`): the
-  in-process driver; plain promises provide the primitives (a polled `condition`, method-call
-  signals, an `AbortController` for cancellation), the drains run directly. No server, no worker,
-  no ports.
+- `local-driver.ts` (the default mode; `OPENCODE_SESSION_EXECUTION=temporal` selects the Temporal
+  driver instead): the in-process driver; plain promises provide the primitives (a polled
+  `condition`, method-call signals, an `AbortController` for cancellation), the drains run
+  directly. No server, no worker, no ports.
 - `drain.ts` and the error codec are shared modules, so turn semantics and typed errors are
   byte-identical in both modes; contract tests drive the shared supervisor in-process (a turn
   settles, the exact tagged `RunError` crosses the same encode/decode path, interrupt cancels, an
   idle supervisor retires), and the worker smoke proves the same file still bundles in the
   Temporal sandbox.
 
-The factory still hides the choice: one binding selects the driver. This is the factory-shaped
-answer to the ADK integration's ambient check, demonstrated.
+The factory still hides the choice, and it is now exactly two modes: the in-process driver by
+default, `temporal` for the server-backed one. The earlier whole-turn and stock-coordinator modes
+were folded away once the shared supervisor made them redundant. This is the factory-shaped answer
+to the ADK integration's ambient check, demonstrated.
 
 ## Can the whole SDK surface be covered this way?
 
