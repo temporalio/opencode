@@ -118,10 +118,13 @@ const layer = Layer.effect(
     const getContext = Effect.fn("SessionRunner.getContext")(function* (sessionID: SessionSchema.ID) {
       return yield* store.context(sessionID)
     })
+    // `preloaded` lets one projected-history read serve the step-entry checks; callers that just
+    // mutated the projection must not pass it, or they act on a stale view.
     const failInterruptedTools = Effect.fn("SessionRunner.failInterruptedTools")(function* (
       sessionID: SessionSchema.ID,
+      preloaded?: ReadonlyArray<SessionMessage.Message>,
     ) {
-      for (const message of yield* getContext(sessionID)) {
+      for (const message of preloaded ?? (yield* getContext(sessionID))) {
         if (message.type !== "assistant") continue
         for (const tool of message.content) {
           if (tool.type !== "tool" || (tool.state.status !== "pending" && tool.state.status !== "running")) continue
@@ -149,8 +152,11 @@ const layer = Layer.effect(
     // conversational message is a user prompt with no assistant reply, or the latest assistant is
     // still in flight. An interrupted turn stays excluded because its cleanup completes the
     // assistant via Step.Failed.
-    const hasRecoverableWork = Effect.fnUntraced(function* (sessionID: SessionSchema.ID) {
-      const context = yield* getContext(sessionID)
+    const hasRecoverableWork = Effect.fnUntraced(function* (
+      sessionID: SessionSchema.ID,
+      preloaded?: ReadonlyArray<SessionMessage.Message>,
+    ) {
+      const context = preloaded ?? (yield* getContext(sessionID))
       for (let index = context.length - 1; index >= 0; index--) {
         const message = context[index]
         if (message?.type === "assistant") return !message.time.completed
@@ -412,9 +418,12 @@ const layer = Layer.effect(
     }) {
       const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
       const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
-      const recover = !input.force && !hasSteer && !hasQueue && (yield* hasRecoverableWork(input.sessionID))
+      const entryContext = yield* getContext(input.sessionID)
+      const recover =
+        !input.force && !hasSteer && !hasQueue &&
+        (yield* hasRecoverableWork(input.sessionID, entryContext))
       if (!input.force && !hasSteer && !hasQueue && !recover) return
-      yield* failInterruptedTools(input.sessionID)
+      yield* failInterruptedTools(input.sessionID, entryContext)
       let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       let shouldRun = input.force || hasSteer || hasQueue || recover
       while (shouldRun) {
@@ -442,11 +451,14 @@ const layer = Layer.effect(
     // fresh step, or a partial with no dispatched tools, which is safe to re-stream). Token/cost
     // metering is 0 for the resumed step only; faithful metering would need a durable step-sealed
     // marker carrying the provider usage.
-    const resumeCrashedStep = Effect.fn("SessionRunner.resumeCrashedStep")(function* (input: {
-      readonly sessionID: SessionSchema.ID
-      readonly step: number
-    }) {
-      const context = yield* getContext(input.sessionID)
+    const resumeCrashedStep = Effect.fn("SessionRunner.resumeCrashedStep")(function* (
+      input: {
+        readonly sessionID: SessionSchema.ID
+        readonly step: number
+      },
+      preloaded?: ReadonlyArray<SessionMessage.Message>,
+    ) {
+      const context = preloaded ?? (yield* getContext(input.sessionID))
       // At most one assistant is in flight (the projector supersedes older ones); it only exists at
       // step entry on a re-drive, never on a fresh step.
       const inFlight = context.findLast(
@@ -533,9 +545,12 @@ const layer = Layer.effect(
       readonly first: boolean
       readonly force: boolean
     }) {
+      // One projected-history load serves all the entry checks; nothing mutates the projection
+      // between them. The turn itself reloads after the first mutation.
+      const entryContext = yield* getContext(input.sessionID)
       // Re-drive of a crashed step: finalize it from the log rather than re-calling the model and
       // re-running its already-dispatched tools.
-      const resumed = yield* resumeCrashedStep(input)
+      const resumed = yield* resumeCrashedStep(input, entryContext)
       if (resumed) return resumed
       let promotion = input.promotion
       if (input.first) {
@@ -548,7 +563,7 @@ const layer = Layer.effect(
           !input.force &&
           !hasSteer &&
           !hasQueue &&
-          !(yield* hasRecoverableWork(input.sessionID))
+          !(yield* hasRecoverableWork(input.sessionID, entryContext))
         )
           return { ran: false, continue: false, step: input.step, promotion: undefined }
         promotion = hasSteer ? "steer" : hasQueue ? "queue" : undefined
@@ -557,7 +572,7 @@ const layer = Layer.effect(
       // first. A mid-turn re-drive (first=false, from a Temporal step retry) would otherwise
       // re-stream a request with a dangling tool_use and no tool_result, which the provider rejects
       // -- a retry poison loop. This is a no-op on a healthy step (the prior step settled its tools).
-      yield* failInterruptedTools(input.sessionID)
+      yield* failInterruptedTools(input.sessionID, entryContext)
       const result = yield* runTurn(input.sessionID, promotion, input.step)
       let needsContinuation = result.needsContinuation
       if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
