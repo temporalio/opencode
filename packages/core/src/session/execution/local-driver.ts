@@ -40,6 +40,8 @@ const parseDuration = (value: string): number => {
 
 class LocalCancellation extends Error {}
 
+const BACKSTOP_MS = 12 * 60 * 60 * 1000
+
 interface Waiter {
   readonly predicate: () => boolean
   readonly resolve: (value: boolean) => void
@@ -78,8 +80,10 @@ class SessionDriver {
         }),
       setSignalHandler: (name, handler) => this.signalHandlers.set(name, handler),
       setUpdateHandler: (name, handler) => this.updateHandlers.set(name, handler),
-      runContinuation: (input) => drains.drain(input, this.abort.signal),
-      runTurnStep: (input) => drains.stepDrain(input, this.abort.signal),
+      // Same 12 h backstop as the Temporal activity: a hung tool must not hold `draining` forever.
+      // The abort reason is a LocalCancellation, so a timed-out drain looks like any other cancel.
+      runContinuation: (input) => this.withBackstop((signal) => drains.drain(input, signal)),
+      runTurnStep: (input) => this.withBackstop((signal) => drains.stepDrain(input, signal)),
       cancelCurrentScope: () => this.cancel(),
       isCancellation: (error) => error instanceof LocalCancellation,
     }
@@ -102,6 +106,17 @@ class SessionDriver {
     // Nudge parked conditions when the update settles; the poll covers everything in between.
     result.finally(() => this.tick()).catch(() => {})
     return result
+  }
+
+  // The drain shares the driver's abort signal so an interrupt still cancels it; the timer only
+  // adds an upper bound.
+  private async withBackstop<A>(run: (signal: AbortSignal) => Promise<A>): Promise<A> {
+    const timer = setTimeout(() => this.abort.abort(new LocalCancellation("drain backstop")), BACKSTOP_MS)
+    try {
+      return await run(this.abort.signal)
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   private cancel() {
