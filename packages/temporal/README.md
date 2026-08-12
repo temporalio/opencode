@@ -20,14 +20,14 @@ durable and resumable. The turn itself runs inside opencode (`prompt_async` fork
 so it keeps running even while the Temporal worker is down; recovery re-attaches by reading the
 recorded messages.
 
-- `src/opencode.ts` — a thin `fetch` client for the opencode HTTP API.
-- `src/activities.ts` — `createSession`, `runTurn` (idempotent on the user-message count, so a
+- `src/opencode.ts`: a thin `fetch` client for the opencode HTTP API.
+- `src/activities.ts`: `createSession`, `runTurn` (idempotent on the user-message count, so a
   retry never double-sends), `abortTurn`.
-- `src/workflows.ts` — `durableSession`: create session, drain the prompt queue, one turn per
+- `src/workflows.ts`: `durableSession`: create session, drain the prompt queue, one turn per
   activity; signals `submitPrompt` / `abortSession` / `closeSession`; query `getState`.
-- `src/worker.ts` — the Temporal worker (runs on Node via `tsx`).
-- `src/demo.ts` — drive a two-turn session end to end.
-- `src/crash-demo.ts` — kill the worker mid-turn and show the session still completes.
+- `src/worker.ts`: the Temporal worker (runs on Node via `tsx`).
+- `src/demo.ts`: drive a two-turn session end to end.
+- `src/crash-demo.ts`: kill the worker mid-turn and show the session still completes.
 
 ### Run it
 
