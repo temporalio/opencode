@@ -29,7 +29,7 @@ async function prompt(sid: string, text: string): Promise<void> {
 }
 
 async function resume(client: Client, sid: string): Promise<void> {
-  const startOp = new WithStartWorkflowOperation("sessionExecution", {
+  const startOp = new WithStartWorkflowOperation("sessionTurn", {
     taskQueue: QUEUE,
     workflowId: `session-exec-${sid}`,
     args: [sid],
