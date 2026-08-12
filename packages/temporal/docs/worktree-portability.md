@@ -38,20 +38,29 @@ network filesystems are slow and occasionally surprising, and two sessions shari
 collide across hosts just as they can within one (a session's own tools stay serialized either way,
 one activity at a time).
 
-## C. Reconstruct the worktree from snapshots (long-term)
+## C. Reconstruct the worktree from snapshots (implemented)
 
 The engine already captures git-tree snapshots around each step (`Step.Started`/`Step.Ended` carry
-snapshot ids); today they live in a local per-project git store (`${data}/snapshot`). Point that
-store at shared storage and a worker without the worktree can materialize the session's exact file
-state on resume: clone the repository, then check out the last recorded snapshot tree. This is the
-only option that gives true any-worker resume including uncommitted changes. Its honest limits:
-materialization latency on first touch, and snapshots capture the git tree, not the world around it
-(ignored files, dependencies, running processes), so a reconstructed worktree may still need a
-dependency install before `bash` behaves identically.
+snapshot ids). Those trees now also ride the shared store: after each capture the runner ships the
+tree as a git pack (`snapshot-sync.ts` into the `snapshot_pack` table), incremental against the
+previous shipped state. Before a drain runs, the worker checks the session's directory and, when
+it is missing, rebuilds the worktree from the stored packs
+(`session/execution/worktree.ts`): a fresh repo, every pack indexed, the newest tree checked out,
+uncommitted edits and untracked files included. Verified by
+`packages/core/test/worktree-materialize.test.ts` (capture on one stack, delete the tree,
+materialize from the store alone on a second stack).
+
+Honest limits: the tree is rebuilt at the same absolute path it was captured at (a uniform fleet
+layout, containers in practice); snapshots capture the git tree, not the world around it (ignored
+files, dependencies, running processes), so a reconstructed worktree may still need a dependency
+install before `bash` behaves identically; and shipping is best-effort on the capture side, so a
+worker that dies between the last capture and its edits loses those edits, exactly as it would
+have lost them locally.
 
 ## Recommendation
 
-Ship **A** as the deployment default (small change, no new infra, correct by construction), allow
-**B** where shared volumes already exist, and treat **C** as the future enhancement that removes
-the affinity constraint entirely. A and C compose: affinity routes the common case to the warm
-worktree; snapshot reconstruction lets a cold worker join the queue after materializing.
+**C is on by default**: any worker can pick up any session and materialize the tree it needs.
+Layer **A** on top when worktrees are large or hot (affinity routes the common case to the warm
+worktree and skips materialization latency); use **B** where shared volumes already exist. A and C
+compose: affinity serves the warm path, snapshot reconstruction lets a cold worker join after
+materializing.

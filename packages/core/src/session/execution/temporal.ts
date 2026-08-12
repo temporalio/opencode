@@ -13,6 +13,7 @@ import { SessionStore } from "../store"
 import { SessionExecution } from "../execution"
 import { makeActivities, makeStepActivities } from "./temporal-activities"
 import { makeDrains } from "./drain"
+import { WorktreeMaterializer } from "./worktree"
 import { toRunError } from "./run-error-codec"
 import * as WF from "./temporal-workflow"
 
@@ -54,10 +55,11 @@ const layer = Layer.effect(
     // SessionRunner and all of its dependencies.
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
     const events = yield* EventV2.Service
+    const worktrees = yield* WorktreeMaterializer.Service
 
     // The drain bodies are shared with the in-process micro-driver (drain.ts), so turn semantics
     // and error encoding cannot differ between drivers.
-    const { drain, stepDrain } = makeDrains({ store, locations, ctx, events })
+    const { drain, stepDrain } = makeDrains({ store, locations, ctx, events, worktrees })
 
     // Worker connection (native) hosts the runContinuation activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
@@ -205,5 +207,5 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: SessionExecution.Service,
   layer,
-  deps: [SessionStore.node, LocationServiceMap.node, EventV2.node],
+  deps: [SessionStore.node, LocationServiceMap.node, EventV2.node, WorktreeMaterializer.node],
 })
