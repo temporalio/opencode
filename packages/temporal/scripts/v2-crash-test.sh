@@ -1,9 +1,9 @@
 #!/bin/bash
-# Engine-level crash recovery for the v2 Temporal SessionExecution (Phase 2).
+# Engine-level crash recovery for the v2 Temporal SessionExecution.
 #
 # Kills the whole v2 server (which co-hosts the embedded Temporal worker) mid-turn, restarts it,
-# and shows the turn still completes: Temporal re-drives the runContinuation activity, and
-# SessionRunner.run re-reads the durable event log and continues from where it stopped.
+# and shows the turn still completes: Temporal re-drives the in-flight step activity, and the
+# runner re-reads the durable event log and continues from where it stopped.
 #
 # Prereqs: a Temporal dev server on :7237, an OpenAI key at $OPENCODE_KEY_FILE (default
 # ~/.config/ai363/llm.key), and the v2 server run with OPENCODE_SESSION_EXECUTION=temporal.
@@ -63,7 +63,7 @@ python3 - <<'PY'
 import json
 ev=json.load(open("/tmp/v2wf.json")).get("events",[])
 attempts=[int(e["activityTaskStartedEventAttributes"].get("attempt",1)) for e in ev if e.get("activityTaskStartedEventAttributes")]
-print("    runContinuation attempts:", attempts, "| max:", max(attempts) if attempts else 0)
+print("    step activity attempts:", attempts, "| max:", max(attempts) if attempts else 0)
 PY
 echo "RESULT: turn completed post-crash = $DONE"
 [[ "$DONE" == yes ]] || exit 1

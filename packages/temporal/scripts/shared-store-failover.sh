@@ -81,6 +81,6 @@ python3 - <<'PY'
 import json
 ev=json.load(open("/tmp/failover-wf.json")).get("events",[])
 ids=sorted(set(e["activityTaskStartedEventAttributes"].get("identity") for e in ev if e.get("activityTaskStartedEventAttributes")))
-print("    runContinuation ran on worker identities:", ids)
+print("    step activities ran on worker identities:", ids)
 PY
 kill_port 4602
