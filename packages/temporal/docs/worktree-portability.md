@@ -3,17 +3,16 @@
 ## Problem
 
 The shared event store makes the **conversation** resumable on any worker: history, tool results,
-attachments, and credentials are all rebuilt from the DB. The one thing that is not in the DB is the
-**project working tree**. File-touching tools (`bash`, `read`, `edit`, `write`, `apply_patch`,
-`glob`, `grep`) operate on `Location.directory`, a local filesystem path. A worker that picks up a
-session without that worktree resumes the conversation correctly and then acts on a missing (or
-wrong) directory. Mid-session uncommitted changes make this worse: they exist only on the disk of
-the worker that made them, so even a fresh clone of the repository is not the session's real state.
+attachments, and credentials are all rebuilt from the DB. The **project working tree** is the one
+piece of session state that lives outside it. File-touching tools (`bash`, `read`, `edit`,
+`write`, `apply_patch`, `glob`, `grep`) operate on `Location.directory`, a local filesystem path,
+and mid-session uncommitted changes exist only on the disk of the worker that made them, so even
+a fresh clone of the repository is not the session's real state.
 
-This is a deployment/design decision, not a bug fix. Three ways to satisfy it, in order of
-recommendation.
+Option **C** below closes this and is on by default. **A** and **B** remain as deployment choices
+that avoid materialization cost on warm paths.
 
-## A. Session affinity: one task queue per worktree (recommended default)
+## A. Session affinity: one task queue per worktree (warm-path optimization)
 
 Temporal-native and no new infrastructure. Derive the task queue from the worktree identity
 (`opencode-session-exec@<hash(worktree)>`); a worker registers on the queues for the worktrees whose
