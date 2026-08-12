@@ -18,6 +18,10 @@ import { PermissionRequestTable } from "./permission/sql"
 export { Effect, Rule, Ruleset } from "@opencode-ai/schema/permission"
 const missingAgentPermissions: Permission.Ruleset = [{ action: "*", resource: "*", effect: "deny" }]
 
+// A pending ask older than this is treated as abandoned (the turn that raised it was interrupted or
+// crashed, so nothing will answer it). Long enough that a human deliberating never trips it.
+const PENDING_TTL_MS = 24 * 60 * 60 * 1000
+
 export const ID = Permission.ID
 export type ID = typeof ID.Type
 
@@ -135,17 +139,30 @@ const layer = Layer.effect(
           EffectRuntime.orDie,
           EffectRuntime.map((rows) => rows[0]),
         )
+    // An interrupted turn leaves its asks pending with nothing to answer them; without a bound they
+    // linger forever in list()/forSession() and the decline cascade. A row untouched past the TTL
+    // is treated as abandoned. Reads sweep them lazily (opportunistic prune), so no scheduler and
+    // no cross-process coordination.
     const pendingRows = (sessionID?: SessionV2.ID) =>
-      db
-        .select()
-        .from(PermissionRequestTable)
-        .where(
-          sessionID
-            ? and(eq(PermissionRequestTable.session_id, sessionID), eq(PermissionRequestTable.status, "pending"))
-            : eq(PermissionRequestTable.status, "pending"),
-        )
-        .all()
-        .pipe(EffectRuntime.orDie)
+      EffectRuntime.gen(function* () {
+        const cutoff = Date.now() - PENDING_TTL_MS
+        const rows = yield* db
+          .select()
+          .from(PermissionRequestTable)
+          .where(
+            sessionID
+              ? and(eq(PermissionRequestTable.session_id, sessionID), eq(PermissionRequestTable.status, "pending"))
+              : eq(PermissionRequestTable.status, "pending"),
+          )
+          .all()
+          .pipe(EffectRuntime.orDie)
+        const fresh: typeof rows = []
+        for (const row of rows) {
+          if (row.time_updated < cutoff) yield* transitionRow(row.id, "pending", "expired")
+          else fresh.push(row)
+        }
+        return fresh
+      })
     // Status moves are compare-and-set on the stated `from`, so a reply that lost a race, or a
     // shutdown racing an approval, cannot overwrite a landed outcome.
     const transitionRow = (id: string, from: string, to: string, message?: string) =>

@@ -4,6 +4,7 @@
 // independent service stacks share one DB file to simulate the two processes.
 import { describe, expect } from "bun:test"
 import path from "path"
+import { createClient } from "@libsql/client"
 import { Cause, Context, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -233,6 +234,32 @@ describe("PermissionV2 durable asks", () => {
       yield* permB.reply({ requestID: ask.id, reply: "once" })
       const exits = [yield* Fiber.await(first), yield* Fiber.await(second)]
       expect(exits.every(Exit.isSuccess)).toBe(true)
+      yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
+    }),
+  )
+
+  it.live("sweeps an abandoned pending ask out of the list on read", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const file = path.join(tmp.path, "shared.db")
+      yield* seed(file)
+      const A = yield* Layer.build(stack(file))
+      const permA = Context.get(A, PermissionV2.Service)
+      const blocked = yield* permA
+        .assert({ sessionID, action: "bash", resources: ["echo hi"], agent })
+        .pipe(Effect.forkChild)
+      const ask = yield* awaitAsk(permA)
+      // Backdate the row past the TTL: the turn that raised it is gone.
+      yield* Effect.promise(async () => {
+        const raw = createClient({ url: `file:${file}` })
+        await raw.execute({
+          sql: "UPDATE permission_request SET time_updated = ? WHERE id = ?",
+          args: [Date.now() - 25 * 60 * 60 * 1000, ask.id],
+        })
+        raw.close()
+      })
+      expect(yield* permA.list()).toEqual([])
+      yield* Fiber.interrupt(blocked)
       yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
     }),
   )
