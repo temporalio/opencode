@@ -6,6 +6,7 @@ import { Client, Connection, WithStartWorkflowOperation } from "@temporalio/clie
 import { NativeConnection, Worker } from "@temporalio/worker"
 
 import { LocationServiceMap } from "../../location-service-map"
+import { EventV2 } from "../../event"
 import { makeGlobalNode } from "../../effect/app-node"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
@@ -52,10 +53,11 @@ const layer = Layer.effect(
     // The app context the local drain runs in: providing it, then the per-location layer, supplies
     // SessionRunner and all of its dependencies.
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
+    const events = yield* EventV2.Service
 
     // The drain bodies are shared with the in-process micro-driver (drain.ts), so turn semantics
     // and error encoding cannot differ between drivers.
-    const { drain, stepDrain } = makeDrains({ store, locations, ctx })
+    const { drain, stepDrain } = makeDrains({ store, locations, ctx, events })
 
     // Worker connection (native) hosts the runContinuation activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
@@ -203,5 +205,5 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: SessionExecution.Service,
   layer,
-  deps: [SessionStore.node, LocationServiceMap.node],
+  deps: [SessionStore.node, LocationServiceMap.node, EventV2.node],
 })
