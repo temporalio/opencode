@@ -205,15 +205,17 @@ on any worker: messages, tool results (the bounded preview and structured output
 prompt attachments (stored inline as `data:` URIs in the prompt), and credentials (`CredentialTable`)
 all ride the shared store.
 
+**The project working tree** now rides the store too. After each step capture the runner ships
+the snapshot tree as an incremental git pack (`snapshot-sync.ts`, `snapshot_pack` table). Before a
+drain runs, a worker missing the session's directory rebuilds the worktree from those packs
+(`session/execution/worktree.ts`): uncommitted edits and untracked files included, checked out at
+the same absolute path it was captured at (a uniform fleet layout). Ignored files and dependencies
+are not captured, so a rebuilt tree may need an install step before `bash` behaves identically.
+[docs/worktree-portability.md](docs/worktree-portability.md) covers the design and the
+affinity/shared-volume alternatives that skip materialization latency on warm paths.
+
 Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
 
-- **The project working tree.** File-touching tools (read/edit/bash) operate on the local worktree, so
-  a turn that keeps editing files must resume on a worker that has that worktree. This is the one real
-  cross-host correctness constraint. Three ways to satisfy it: co-locate a session's workers by worktree
-  (session affinity via a per-worktree Temporal task queue), share the worktree (a networked
-  filesystem), or reconstruct it from the last snapshot on resume (needs a shared snapshot store).
-  [docs/worktree-portability.md](docs/worktree-portability.md) weighs the three; the recommendation is
-  per-worktree task queues, with snapshot reconstruction as the long-term path.
 - **The snapshot store (`${data}/snapshot`) and the retained full tool-output files
   (`${data}/tool-output`).** The runner never reads these to rebuild context: snapshot file-diffs are
   best-effort (`Effect.catch` to `undefined`), and the model sees the bounded tool-output preview, not

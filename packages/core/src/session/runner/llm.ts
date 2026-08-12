@@ -39,6 +39,7 @@ import { toLLMMessages } from "./to-llm-message"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { DEFAULT_MAX_STEPS, REPEAT_LIMIT, REPEATED_CALLS_PROMPT, trailingIdenticalToolSteps } from "./loop-guard"
 import { Snapshot } from "../../snapshot"
+import { SnapshotSync } from "../../snapshot-sync"
 import { makeLocationNode } from "../../effect/app-node"
 import { llmClient } from "../../effect/app-node-platform"
 
@@ -107,6 +108,7 @@ const layer = Layer.effect(
     const referenceGuidance = yield* ReferenceGuidance.Service
     const config = yield* Config.Service
     const snapshots = yield* Snapshot.Service
+    const snapshotSync = yield* SnapshotSync.Service
     const db = (yield* Database.Service).db
     const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
@@ -247,6 +249,8 @@ const layer = Layer.effect(
       if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
         return yield* Effect.die(continueAfterCompaction(currentStep))
       const startSnapshot = yield* snapshots.capture()
+      // Ship the pre-step tree so another host can rebuild the worktree; best-effort inside push.
+      if (startSnapshot) yield* snapshotSync.push(startSnapshot)
       const publisher = createLLMEventPublisher(events, {
         sessionID: session.id,
         agent: agent.id,
@@ -348,6 +352,8 @@ const layer = Layer.effect(
           const stepSettlement = publisher.stepSettlement()
           if (stepSettlement && !publisher.hasProviderError()) {
             const endSnapshot = yield* snapshots.capture()
+            // Ship the post-step tree: this is the state a resumed step on another host needs.
+            if (endSnapshot) yield* snapshotSync.push(endSnapshot)
             const files =
               startSnapshot && endSnapshot
                 ? yield* snapshots
@@ -506,6 +512,7 @@ const layer = Layer.effect(
       yield* failInterruptedTools(input.sessionID)
       const startSnapshot = inFlight.snapshot?.start
       const endSnapshot = yield* snapshots.capture()
+      if (endSnapshot) yield* snapshotSync.push(endSnapshot)
       const files =
         startSnapshot && endSnapshot
           ? yield* snapshots
@@ -606,6 +613,7 @@ export const node = makeLocationNode({
     ReferenceGuidance.node,
     Config.node,
     Snapshot.node,
+    SnapshotSync.node,
     Database.node,
   ],
 })
