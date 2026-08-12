@@ -161,11 +161,22 @@ const nativeLayer = (config: Config) =>
         create: config.create ?? true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      // busy_timeout must come first: switching to WAL takes a write lock, and N cold workers
-      // opening the same shared file race on it. Without the timeout the losers get SQLITE_BUSY at
-      // open instead of waiting.
+      // Set busy_timeout first so later writers wait on a held lock instead of erroring.
       native.run("PRAGMA busy_timeout = 5000;")
-      if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
+      // A journal_mode change does NOT honor busy_timeout, so N cold workers racing the first WAL
+      // switch on a fresh file can get SQLITE_BUSY. Retry until one wins; the rest then find the
+      // file already in WAL and the pragma returns at once.
+      if (config.disableWAL !== true) {
+        for (let attempt = 0; ; attempt++) {
+          try {
+            native.run("PRAGMA journal_mode = WAL;")
+            break
+          } catch (cause) {
+            if (attempt >= 50 || !/SQLITE_BUSY|database is locked/i.test(String(cause))) throw cause
+            Bun.sleepSync(20)
+          }
+        }
+      }
       return native
     }),
   )
