@@ -8,7 +8,7 @@ import { Integration } from "../../integration"
 import { SystemContext } from "../../system-context/index"
 import { ToolOutputStore } from "../../tool-output-store"
 import type { SessionSchema } from "../schema"
-import { ContextSnapshotDecodeError, MessageDecodeError } from "../error"
+import { ContextSnapshotDecodeError, MessageDecodeError, SessionRunDeclinedError } from "../error"
 import {
   ModelNotSelectedError,
   ModelUnavailableError,
@@ -26,6 +26,7 @@ const RunErrorSchema = Schema.Union([
   Integration.AuthorizationError,
   MessageDecodeError,
   ContextSnapshotDecodeError,
+  SessionRunDeclinedError,
   SystemContext.InitializationBlocked,
   ToolOutputStore.StorageError,
 ])
