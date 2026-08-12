@@ -57,11 +57,12 @@ Temporal-backed `SessionExecution` in `packages/core/src/session/execution/`:
 
 - `temporal-workflow.ts` — the pure per-session workflow (the Temporal equivalent of
   `SessionRunCoordinator`: `wake`/`force` drive one drain, wakes coalesce, quiescent runs end).
-- `temporal-activities.ts` — the `runContinuation` activity (heartbeats; forwards cancellation).
+- `temporal-activities.ts` — the `runTurnStep` activity (heartbeats; forwards cancellation;
+  injects the attempt's event-log owner token).
 - `temporal.ts` — the `SessionExecution` layer + node: `wake` → `signalWithStart`, `resume` →
-  forced `signalWithStart`, `interrupt` → cancel signal; the drain is the local coordinator's body
-  (`SessionRunner.run`) run in the activity against the durable event log. The Temporal client and
-  an embedded worker are co-hosted in the server process (both run under bun).
+  forced `signalWithStart`, `interrupt` → cancel signal; each drain runs one step of the local
+  coordinator's loop (`SessionRunner.runStep`) in an activity against the durable event log. The
+  Temporal client and an embedded worker are co-hosted in the server process (both run under bun).
 
 Wiring is one binding in `packages/server/src/routes.ts`, opt-in via
 `OPENCODE_SESSION_EXECUTION=temporal`. Because turn state lives in the event log, the workflow stays
@@ -85,7 +86,8 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
   `TEMPORAL_V2_OK`), recorded as a completed per-session workflow.
 - Engine-level crash recovery (`scripts/v2-crash-test.sh`): killing the whole server (with its
   embedded worker) mid-turn, then restarting, still completes the turn. Temporal re-drives
-  `runContinuation` (attempt 2), the run continues from the event log, and the workflow completes.
+  the in-flight step activity (attempt 2), the run continues from the event log, and the workflow
+  completes.
 
 ### Two modes, one supervisor
 
@@ -98,7 +100,7 @@ tools) is its own activity with its own retry/timeout/visibility. It reuses `Ses
 (one iteration of `run`'s loop), so the turn semantics are unchanged. Verified: a
 create-then-read-then-reply turn recorded three `runTurnStep` activities under a `sessionTurn`
 workflow and completed. (Earlier whole-turn-per-activity and stock-coordinator modes were folded
-away; the whole-turn workflow stays exported for executions already running.)
+away.)
 
 A per-step re-drive resumes from the durable event log rather than re-running work. `runStep` closes
 any tool left dangling by an interrupted attempt on every entry, not just the first. Without that, a
@@ -185,7 +187,7 @@ The `question` tool still uses an in-process deferred and needs the same treatme
 
 The v2 engine event-sources each session to a SQLite store. By default that is a local file, so a
 session can only be resumed on the host holding the file. Point every worker at one **shared** store
-and any worker resumes any session: Temporal load-balances `runContinuation` across the fleet,
+and any worker resumes any session: Temporal load-balances `runTurnStep` across the fleet,
 `active` is visibility-backed, and the resumed worker reads the session purely from the shared log.
 
 - **Same host**: set `OPENCODE_DB` to one absolute path on all workers (WAL + `busy_timeout` allow

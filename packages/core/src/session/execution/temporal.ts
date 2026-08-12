@@ -11,7 +11,7 @@ import { makeGlobalNode } from "../../effect/app-node"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { SessionExecution } from "../execution"
-import { makeActivities, makeStepActivities } from "./temporal-activities"
+import { makeStepActivities } from "./temporal-activities"
 import { makeDrains } from "./drain"
 import { WorktreeMaterializer } from "./worktree"
 import { toRunError } from "./run-error-codec"
@@ -22,8 +22,7 @@ const NAMESPACE = process.env.TEMPORAL_NAMESPACE ?? "default"
 const TASK_QUEUE = process.env.OPENCODE_TEMPORAL_TASK_QUEUE ?? "opencode-session-exec"
 const workflowId = (id: string) => `session-exec-${id}`
 
-// One activity per step (the model call + its tools), with the step loop as workflow control
-// flow. The whole-turn sessionExecution workflow stays exported for workflows already running.
+// One activity per step (the model call + its tools), with the step loop as workflow control flow.
 const WORKFLOW = WF.sessionTurn
 const WORKFLOW_TYPE = "sessionTurn"
 
@@ -59,9 +58,9 @@ const layer = Layer.effect(
 
     // The drain bodies are shared with the in-process micro-driver (drain.ts), so turn semantics
     // and error encoding cannot differ between drivers.
-    const { drain, stepDrain } = makeDrains({ store, locations, ctx, events, worktrees })
+    const { stepDrain } = makeDrains({ store, locations, ctx, events, worktrees })
 
-    // Worker connection (native) hosts the runContinuation activity + the workflow. Skipped in
+    // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
     if (HOST_WORKER) {
       const nativeConn = yield* Effect.acquireRelease(
@@ -74,7 +73,7 @@ const layer = Layer.effect(
           namespace: NAMESPACE,
           taskQueue: TASK_QUEUE,
           workflowsPath: fileURLToPath(new URL("./temporal-workflow.ts", import.meta.url)),
-          activities: { ...makeActivities(drain), ...makeStepActivities(stepDrain) },
+          activities: makeStepActivities(stepDrain),
         }),
       )
       const runHandle = worker.run()
@@ -137,7 +136,7 @@ const layer = Layer.effect(
         const found = yield* Effect.promise(async () => {
           const ids: SessionSchema.ID[] = []
           for await (const wf of client.workflow.list({
-            query: `(WorkflowType = 'sessionExecution' OR WorkflowType = 'sessionTurn') AND ExecutionStatus = 'Running'`,
+            query: `WorkflowType = 'sessionTurn' AND ExecutionStatus = 'Running'`,
           })) {
             if (wf.workflowId.startsWith(SESSION_PREFIX)) {
               ids.push(SessionSchema.ID.make(wf.workflowId.slice(SESSION_PREFIX.length)))

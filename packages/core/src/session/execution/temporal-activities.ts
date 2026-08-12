@@ -1,5 +1,5 @@
-// The runContinuation activity: it runs one drain (SessionRunner.run for the whole turn) by calling
-// the `drain` closure the layer captured over the app's Effect context. It heartbeats so a worker
+// The runTurnStep activity: one step of a turn (one provider attempt + its tools), run through the
+// `stepDrain` closure the layer captured over the app's Effect context. It heartbeats so a worker
 // crash is detected quickly, and forwards Temporal cancellation as an AbortSignal so an interrupt
 // turns into Effect fiber interruption inside the runner.
 
@@ -13,49 +13,16 @@ function ownerToken(): string {
   return `${info.workflowExecution?.runId ?? info.workflowType}#${info.attempt}`
 }
 
-export interface DrainInput {
-  sessionID: string
-  force: boolean
-  // The attempt that owns the event log while this drain runs. Set activity-side from the run id
-  // and attempt so it stays out of the workflow's deterministic input.
-  owner?: string
-}
-
-export type Activities = {
-  runContinuation(input: DrainInput): Promise<void>
-}
-
-export function makeActivities(
-  drain: (input: DrainInput, signal: AbortSignal) => Promise<void>,
-): Activities {
-  return {
-    async runContinuation(input) {
-      const beat = setInterval(() => {
-        try {
-          heartbeat()
-        } catch {
-          // heartbeat outside an activity context is a no-op for our purposes
-        }
-      }, 3000)
-      try {
-        await drain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal)
-      } finally {
-        clearInterval(beat)
-      }
-    },
-  }
-}
-
-// Per-step activities: one runTurnStep activity = one step
-// (one provider attempt + its tools). The workflow loops it, so each step is its own activity with
-// its own retry/timeout/visibility. `promotion` is null (not undefined) so it serializes cleanly.
+// The workflow loops runTurnStep, so each step is its own activity with its own
+// retry/timeout/visibility. `promotion` is null (not undefined) so it serializes cleanly.
 export interface StepDrainInput {
   sessionID: string
   step: number
   promotion: string | null
   first: boolean
   force: boolean
-  // Set activity-side (see ownerToken), not part of the workflow's deterministic input.
+  // The attempt that owns the event log while this drain runs. Set activity-side (see
+  // ownerToken), so it stays out of the workflow's deterministic input.
   owner?: string
 }
 
@@ -78,7 +45,9 @@ export function makeStepActivities(
       const beat = setInterval(() => {
         try {
           heartbeat()
-        } catch {}
+        } catch {
+          // heartbeat outside an activity context is a no-op for our purposes
+        }
       }, 3000)
       try {
         return await stepDrain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal)
