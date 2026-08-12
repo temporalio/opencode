@@ -1143,6 +1143,51 @@ describe("EventV2", () => {
       // would outlive the layer and keep reading a database being torn down.
       const settled = yield* Fiber.await(tail).pipe(Effect.timeout("5 seconds"), Effect.exit)
       expect(Exit.isSuccess(settled)).toBe(true)
+  it.effect("fences a live publish from a superseded owner and admits the current one", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+
+      yield* events
+        .publish(DurableMessage, durableData(aggregateID, "seed"))
+        .pipe(Effect.provideService(EventV2.EventOwner, "owner-a"))
+      // A newer attempt takes the log.
+      yield* events.claim(aggregateID, "owner-b")
+
+      const fenced = yield* events
+        .publish(DurableMessage, durableData(aggregateID, "stale"))
+        .pipe(Effect.provideService(EventV2.EventOwner, "owner-a"), Effect.exit)
+      yield* events
+        .publish(DurableMessage, durableData(aggregateID, "fresh"))
+        .pipe(Effect.provideService(EventV2.EventOwner, "owner-b"))
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(String(fenced)).toContain("Owner fence")
+      expect(rows.map((row) => row.seq)).toEqual([0, 1])
+      expect(rows.map((row) => (row.data as { messageID: string }).messageID)).toEqual([
+        durableData(aggregateID, "seed").messageID,
+        durableData(aggregateID, "fresh").messageID,
+      ])
+    }),
+  )
+
+  it.effect("never fences a publish made outside a drain", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
+      yield* events.claim(aggregateID, "owner-b")
+
+      // No owner in context (the default), so ownership is not enforced for ordinary callers.
+      const event = yield* events.publish(DurableMessage, durableData(aggregateID, "unfenced"))
+
+      expect(event.durable?.seq).toBe(1)
     }),
   )
 

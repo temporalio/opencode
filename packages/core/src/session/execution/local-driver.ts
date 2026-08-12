@@ -9,7 +9,9 @@ export * as SessionExecutionLocalDriver from "./local-driver"
 // drivers" shape: the factory picks the driver, the supervisor is written once.
 
 import { Effect, Layer } from "effect"
+import { randomUUID } from "node:crypto"
 import { LocationServiceMap } from "../../location-service-map"
+import { EventV2 } from "../../event"
 import { makeGlobalNode } from "../../effect/app-node"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
@@ -62,6 +64,9 @@ class SessionDriver {
   private ticker: ReturnType<typeof setInterval> | undefined
   private cancelled = false
   private readonly abort = new AbortController()
+  // One token per driver instance. A wake that lands after a driver finished starts a fresh driver
+  // (a new token), so the retired one's late appends are fenced, mirroring the Temporal attempt.
+  private readonly owner = randomUUID()
 
   constructor(run: (rt: WorkflowRuntime) => Promise<void>, drains: Drains, onDone: () => void) {
     const rt: WorkflowRuntime = {
@@ -82,8 +87,10 @@ class SessionDriver {
       setUpdateHandler: (name, handler) => this.updateHandlers.set(name, handler),
       // Same 12 h backstop as the Temporal activity: a hung tool must not hold `draining` forever.
       // The abort reason is a LocalCancellation, so a timed-out drain looks like any other cancel.
-      runContinuation: (input) => this.withBackstop((signal) => drains.drain(input, signal)),
-      runTurnStep: (input) => this.withBackstop((signal) => drains.stepDrain(input, signal)),
+      runContinuation: (input) =>
+        this.withBackstop((signal) => drains.drain({ ...input, owner: this.owner }, signal)),
+      runTurnStep: (input) =>
+        this.withBackstop((signal) => drains.stepDrain({ ...input, owner: this.owner }, signal)),
       cancelCurrentScope: () => this.cancel(),
       isCancellation: (error) => error instanceof LocalCancellation,
     }
@@ -169,7 +176,8 @@ const layer = Layer.effect(
     const store = yield* SessionStore.Service
     const locations = yield* LocationServiceMap.Service
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
-    const drains = makeDrains({ store, locations, ctx })
+    const events = yield* EventV2.Service
+    const drains = makeDrains({ store, locations, ctx, events })
     const drivers = new Map<SessionSchema.ID, SessionDriver>()
     // Read at layer build (not module load) so tests can set it before constructing the layer.
     // The idle override shortens the supervisor's 5-minute self-termination.
@@ -234,5 +242,5 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: SessionExecution.Service,
   layer,
-  deps: [SessionStore.node, LocationServiceMap.node],
+  deps: [SessionStore.node, LocationServiceMap.node, EventV2.node],
 })
