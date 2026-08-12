@@ -5,9 +5,13 @@ Temporal workflow, so a coding session survives worker loss, can run detached or
 background, and can be driven from anywhere by signal. It is a drop-in layer: opencode's loop,
 tools, model, storage, and HTTP API are untouched.
 
-There are two phases.
+This package wraps the **shipping** `opencode serve`: the agent stays a black box behind its HTTP
+API, and durability is added from the outside. It is the pattern for an agent you can't or won't
+modify. The deeper integration (a Temporal-backed `SessionExecution` inside the v2 engine, with
+per-step activities and engine-level crash resume) is a separate change on the
+`2026/08/opencode-temporal` branch.
 
-## Phase 1 (this directory): wrap the shipping `opencode serve`
+## How it works
 
 A workflow owns one session. It creates the session, then drains a queue of prompts, running each
 turn as an activity that drives the shipping opencode server over its HTTP API. The conversation,
@@ -60,21 +64,11 @@ CRASH-RECOVERY: PASS
 That is: the turn completed after the crash, Temporal re-drove the activity on a new worker
 (attempt 2), and idempotency kept it to a single prompt (no double-send).
 
-### Honest limits of Phase 1
+### Honest limits
 
 - It makes the **orchestration** durable (the session, the queue, turn re-drive), not opencode's
   in-process turn. If the opencode **server** dies mid-turn, the turn's host side effects can be
-  partial; re-driving re-attaches to whatever the server recorded.
+  partial; re-driving re-attaches to whatever the server recorded. Closing that requires the
+  engine-level integration on the `2026/08/opencode-temporal` branch.
 - The worker talks to the opencode server over unauthenticated HTTP by default. Run them together
   or set `OPENCODE_SERVER_PASSWORD` and pass the header.
-
-## Phase 2 (next): a durable `SessionExecution` on the v2 engine
-
-opencode's newer v2 engine (`packages/core` + `packages/server`) is already event-sourced per
-session and exposes a substitutable `SessionExecution` service (`active` / `resume` / `wake` /
-`interrupt`) whose local impl comments "Future remote placement belongs here." Phase 2 provides a
-Temporal-backed `SessionExecution`: a workflow per session (`resume` = start-or-signal, `wake` =
-signal, `interrupt` = cancel) with `SessionRunner.run` (one continuation from recorded history) as
-the activity. Because turn state lives in the event log, the workflow stays thin and the recovery
-is engine-level, not a re-attach. It is wired by changing one binding in
-`packages/server/src/routes.ts`.
