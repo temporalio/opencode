@@ -22,7 +22,7 @@ driver runs it as a per-session workflow with one activity per step; the in-proc
 the shared drain bodies keep turn semantics identical in both modes (see
 [Two modes, one supervisor](#two-modes-one-supervisor)).
 
-Taking durability seriously then forces six things:
+That forces six things:
 
 1. **State must be shareable.** Any worker resumes any session only if the event log is not
    host-local: the libSQL backend, atomic remote writes, busy retry, serialized migrations
@@ -55,11 +55,11 @@ exposes a substitutable `SessionExecution` service (`active` / `resume` / `wake`
 whose local impl comments "Future remote placement belongs here." This change provides a
 Temporal-backed `SessionExecution` in `packages/core/src/session/execution/`:
 
-- `temporal-workflow.ts` — the pure per-session workflow (the Temporal equivalent of
+- `temporal-workflow.ts`: the pure per-session workflow (the Temporal equivalent of
   `SessionRunCoordinator`: `wake`/`force` drive one drain, wakes coalesce, quiescent runs end).
-- `temporal-activities.ts` — the `runTurnStep` activity (heartbeats; forwards cancellation;
+- `temporal-activities.ts`: the `runTurnStep` activity (heartbeats; forwards cancellation;
   injects the attempt's event-log owner token).
-- `temporal.ts` — the `SessionExecution` layer + node: `wake` → `signalWithStart`, `resume` →
+- `temporal.ts`: the `SessionExecution` layer + node: `wake` → `signalWithStart`, `resume` →
   forced `signalWithStart`, `interrupt` → cancel signal; each drain runs one step of the local
   coordinator's loop (`SessionRunner.runStep`) in an activity against the durable event log. The
   Temporal client and an embedded worker are co-hosted in the server process (both run under bun).
@@ -178,8 +178,8 @@ stopped. Tool-originated asks have deterministic ids (session + callID + action 
 re-driven activity adopts the same pending row instead of filing a duplicate, and an approval that
 landed while the asker was dead short-circuits the retry (a one-time approve is honored across
 re-drives without a saved rule). Graceful shutdown retires the process's pending asks as `expired`
-and a revived attempt flips them back to pending; after a hard crash the pending row simply feeds
-the retry. A pending ask whose session is abandoned lingers in the list until a reply retires it.
+and a revived attempt flips them back to pending; after a hard crash the pending row feeds the
+retry. A pending ask whose session is abandoned lingers in the list until a reply retires it.
 Verified by `packages/core/test/permission-durable.test.ts` (two independent stacks over one store).
 The `question` tool still uses an in-process deferred and needs the same treatment.
 
