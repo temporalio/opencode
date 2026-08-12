@@ -161,6 +161,10 @@ const nativeLayer = (config: Config) =>
         create: config.create ?? true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+      // busy_timeout must come first: switching to WAL takes a write lock, and N cold workers
+      // opening the same shared file race on it. Without the timeout the losers get SQLITE_BUSY at
+      // open instead of waiting.
+      native.run("PRAGMA busy_timeout = 5000;")
       if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
       return native
     }),
