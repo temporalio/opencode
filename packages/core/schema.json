@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "ef05c3dc-ecd1-4def-9573-6b872e58366e",
+  "id": "69462d47-737f-4005-83ff-1f43cf647276",
   "prevIds": [
-    "f14a9b18-8207-487e-a3d3-227e629ba9ad"
+    "ef05c3dc-ecd1-4def-9573-6b872e58366e"
   ],
   "ddl": [
     {
@@ -1999,6 +1999,20 @@
       "where": null,
       "origin": "manual",
       "name": "permission_request_session_status_idx",
+      "entityType": "indexes",
+      "table": "permission_request"
+    },
+    {
+      "columns": [
+        {
+          "value": "status",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "permission_request_status_idx",
       "entityType": "indexes",
       "table": "permission_request"
     },

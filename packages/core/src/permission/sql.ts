@@ -34,5 +34,9 @@ export const PermissionRequestTable = sqliteTable(
     message: text(),
     ...Timestamps,
   },
-  (table) => [index("permission_request_session_status_idx").on(table.session_id, table.status)],
+  (table) => [
+    index("permission_request_session_status_idx").on(table.session_id, table.status),
+    // The no-session list() and the TTL sweep both filter by status alone.
+    index("permission_request_status_idx").on(table.status),
+  ],
 )
