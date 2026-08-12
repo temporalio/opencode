@@ -1,7 +1,7 @@
 // The Temporal driver for the session supervisor. The supervisor itself lives in workflow-core.ts
 // and is written once; this file adapts the real SDK's primitives (condition, signal/update
-// handlers, activity proxies, cancellation) to the WorkflowRuntime interface and exports the two
-// workflow functions the worker registers. The in-process driver (local-driver.ts) runs the SAME
+// handlers, activity proxies, cancellation) to the WorkflowRuntime interface and exports the
+// workflow function the worker registers. The in-process driver (local-driver.ts) runs the SAME
 // supervisor with plain promises.
 //
 // MUST stay sandbox-safe: Temporal bundles this in an isolated context, so no `effect`, no
@@ -17,7 +17,7 @@ import {
   CancellationScope,
   isCancellation,
 } from "@temporalio/workflow"
-import type { Activities, StepActivities } from "./temporal-activities"
+import type { StepActivities } from "./temporal-activities"
 import { makeWorkflows, type WorkflowRuntime } from "./workflow-core"
 
 const activityOptions = {
@@ -32,7 +32,6 @@ const activityOptions = {
   retry: { maximumAttempts: 100 },
 } as const
 
-const { runContinuation } = proxyActivities<Activities>(activityOptions)
 const { runTurnStep } = proxyActivities<StepActivities>(activityOptions)
 
 export const wake = defineSignal("wake")
@@ -51,7 +50,6 @@ const runtime: WorkflowRuntime = {
   },
   setSignalHandler: (name, handler) => setHandler(signals[name], handler),
   setUpdateHandler: (_name, handler) => setHandler(resume, handler),
-  runContinuation,
   runTurnStep,
   cancelCurrentScope: () => CancellationScope.current().cancel(),
   isCancellation,
@@ -59,10 +57,6 @@ const runtime: WorkflowRuntime = {
 }
 
 const workflows = makeWorkflows(runtime)
-
-export async function sessionExecution(sessionID: string): Promise<void> {
-  return workflows.sessionExecution(sessionID)
-}
 
 export async function sessionTurn(sessionID: string): Promise<void> {
   return workflows.sessionTurn(sessionID)

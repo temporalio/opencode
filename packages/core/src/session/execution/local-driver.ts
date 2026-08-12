@@ -88,8 +88,6 @@ class SessionDriver {
       setUpdateHandler: (name, handler) => this.updateHandlers.set(name, handler),
       // Same 12 h backstop as the Temporal activity: a hung tool must not hold `draining` forever.
       // The abort reason is a LocalCancellation, so a timed-out drain looks like any other cancel.
-      runContinuation: (input) =>
-        this.withBackstop((signal) => drains.drain({ ...input, owner: this.owner }, signal)),
       runTurnStep: (input) =>
         this.withBackstop((signal) => drains.stepDrain({ ...input, owner: this.owner }, signal)),
       cancelCurrentScope: () => this.cancel(),
