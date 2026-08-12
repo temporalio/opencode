@@ -141,9 +141,14 @@ const layer = Layer.effect(
           }
           return ids
         })
-        const ids = new Set<SessionSchema.ID>()
-        for (const id of found) if (yield* store.get(id)) ids.add(id)
-        return ids
+        // Point reads, but concurrent: they bypass the store permit, and the running-workflow set
+        // is small. A single IN query is the upgrade if this ever grows to hundreds.
+        const known = yield* Effect.forEach(
+          found,
+          (id) => Effect.map(store.get(id), (session) => (session ? id : undefined)),
+          { concurrency: 8 },
+        )
+        return new Set(known.filter((id): id is SessionSchema.ID => id !== undefined))
       }),
       wake: (id) => drive(id).pipe(Effect.asVoid),
       // resume = coordinator.run: drive a forced run via an Update-with-Start and AWAIT its result,
