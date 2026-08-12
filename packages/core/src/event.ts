@@ -115,6 +115,15 @@ export class SubscriberOverflowError extends Schema.TaggedErrorClass<SubscriberO
 export const define = Event.define
 export const versionedType = Event.versionedType
 
+// The session attempt that owns the event log right now. A drain claims the aggregate and provides
+// its token here (see makeDrains); a live durable append then dies if the log has since been
+// claimed by a newer attempt. Without it a superseded Temporal attempt (a retry) or a stale local
+// driver still spinning the loop would keep appending events under a session another attempt has
+// taken over. Undefined outside a drain, where nothing is fenced.
+export const EventOwner = Context.Reference<string | undefined>("@opencode/Event/Owner", {
+  defaultValue: () => undefined,
+})
+
 export interface PublishOptions {
   readonly id?: ID
   readonly metadata?: Record<string, unknown>
@@ -234,6 +243,7 @@ export const layerWith = (options?: LayerOptions) =>
                 )
               }
               const list = projectors.get(event.type) ?? []
+              const owner = yield* EventOwner
               return yield* Effect.uninterruptible(
                 Effect.gen(function* () {
                   const committed = yield* db
@@ -256,6 +266,18 @@ export const layerWith = (options?: LayerOptions) =>
                               new InvalidDurableEventError({
                                 type: event.type,
                                 message: `Replay owner mismatch for aggregate ${aggregateID}: expected ${row.ownerID}, got ${input.ownerID ?? "none"}`,
+                              }),
+                            )
+                          }
+                          // Fence a live append behind the current owner. A superseded attempt
+                          // still holding the loop would otherwise keep writing events under a
+                          // session a newer attempt has claimed. `input` is the replay path, which
+                          // owns its check above.
+                          if (!input && owner !== undefined && row?.ownerID != null && row.ownerID !== owner) {
+                            yield* Effect.die(
+                              new InvalidDurableEventError({
+                                type: event.type,
+                                message: `Owner fence for aggregate ${aggregateID}: held by ${row.ownerID}, publisher ${owner}`,
                               }),
                             )
                           }
@@ -323,12 +345,14 @@ export const layerWith = (options?: LayerOptions) =>
                           if (commit) yield* commit(seq)
                           yield* db
                             .insert(EventSequenceTable)
-                            .values([{ aggregate_id: aggregateID, seq, owner_id: input?.ownerID }])
+                            .values([{ aggregate_id: aggregateID, seq, owner_id: input?.ownerID ?? owner }])
                             .onConflictDoUpdate({
                               target: EventSequenceTable.aggregate_id,
                               set: {
                                 seq,
-                                ...(input?.ownerID && row?.ownerID == null ? { owner_id: input.ownerID } : {}),
+                                ...((input?.ownerID ?? owner) && row?.ownerID == null
+                                  ? { owner_id: input?.ownerID ?? owner }
+                                  : {}),
                               },
                             })
                             .run()

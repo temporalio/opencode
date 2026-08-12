@@ -7,6 +7,7 @@ import { ApplicationFailure } from "@temporalio/activity"
 import type { LocationServiceMap } from "../../location-service-map"
 import type { Location } from "../../location"
 import type { LocationError, LocationServices } from "../../location-services"
+import { EventV2 } from "../../event"
 import { SessionRunner } from "../runner"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
@@ -21,18 +22,22 @@ export interface DrainDeps {
   /** The app context the drain runs in; providing it plus the per-location layer supplies
    * SessionRunner and all of its dependencies. */
   readonly ctx: Context.Context<SessionStore.Service | LocationServiceMap.Service>
+  /** Used to claim the event log for the running attempt so a superseded one is fenced. */
+  readonly events: EventV2.Interface
 }
 
-export const makeDrains = ({ store, locations, ctx }: DrainDeps) => {
+export const makeDrains = ({ store, locations, ctx, events }: DrainDeps) => {
   const drain = async (input: DrainInput, signal: AbortSignal): Promise<void> => {
     const exit = await Effect.runPromiseExit(
       Effect.gen(function* () {
         const session = yield* store.get(SessionSchema.ID.make(input.sessionID))
         if (!session) return
+        // Take the event log before running so a superseded attempt's later appends are fenced.
+        if (input.owner) yield* events.claim(session.id, input.owner)
         yield* SessionRunner.Service.use((runner) =>
           runner.run({ sessionID: session.id, force: input.force }),
         ).pipe(Effect.provide(locations.get(session.location)))
-      }).pipe(Effect.provide(ctx), Effect.scoped),
+      }).pipe(Effect.provideService(EventV2.EventOwner, input.owner), Effect.provide(ctx), Effect.scoped),
       { signal },
     )
     if (Exit.isSuccess(exit)) return
@@ -74,6 +79,8 @@ export const makeDrains = ({ store, locations, ctx }: DrainDeps) => {
       Effect.gen(function* () {
         const session = yield* store.get(SessionSchema.ID.make(input.sessionID))
         if (!session) return { ran: false, continue: false, step: input.step, promotion: null }
+        // Take the event log before running so a superseded attempt's later appends are fenced.
+        if (input.owner) yield* events.claim(session.id, input.owner)
         const r = yield* SessionRunner.Service.use((runner) =>
           runner.runStep({
             sessionID: session.id,
@@ -84,7 +91,7 @@ export const makeDrains = ({ store, locations, ctx }: DrainDeps) => {
           }),
         ).pipe(Effect.provide(locations.get(session.location)))
         return { ran: r.ran, continue: r.continue, step: r.step, promotion: r.promotion ?? null }
-      }).pipe(Effect.provide(ctx), Effect.scoped),
+      }).pipe(Effect.provideService(EventV2.EventOwner, input.owner), Effect.provide(ctx), Effect.scoped),
       { signal },
     )
     if (Exit.isSuccess(exit)) return exit.value

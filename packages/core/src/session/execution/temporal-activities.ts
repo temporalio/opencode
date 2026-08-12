@@ -5,9 +5,20 @@
 
 import { heartbeat, Context } from "@temporalio/activity"
 
+// The event-log owner for this attempt: the run id plus the attempt number. A Temporal retry gets a
+// fresh attempt, so once the retry claims the log, the previous attempt (if it is still running) is
+// fenced out of writing.
+function ownerToken(): string {
+  const info = Context.current().info
+  return `${info.workflowExecution?.runId ?? info.workflowType}#${info.attempt}`
+}
+
 export interface DrainInput {
   sessionID: string
   force: boolean
+  // The attempt that owns the event log while this drain runs. Set activity-side from the run id
+  // and attempt so it stays out of the workflow's deterministic input.
+  owner?: string
 }
 
 export type Activities = {
@@ -27,7 +38,7 @@ export function makeActivities(
         }
       }, 3000)
       try {
-        await drain(input, Context.current().cancellationSignal)
+        await drain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal)
       } finally {
         clearInterval(beat)
       }
@@ -44,6 +55,8 @@ export interface StepDrainInput {
   promotion: string | null
   first: boolean
   force: boolean
+  // Set activity-side (see ownerToken), not part of the workflow's deterministic input.
+  owner?: string
 }
 
 export interface StepDrainResult {
@@ -68,7 +81,7 @@ export function makeStepActivities(
         } catch {}
       }, 3000)
       try {
-        return await stepDrain(input, Context.current().cancellationSignal)
+        return await stepDrain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal)
       } finally {
         clearInterval(beat)
       }
