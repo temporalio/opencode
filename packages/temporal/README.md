@@ -147,14 +147,14 @@ later. Verified by `packages/core/test/session-runner-resume.test.ts`.
   `OPENCODE_SESSION_EXECUTION=temporal`.
 - Activity bounds: the 10s heartbeat is the liveness bound (worker death re-drives within seconds);
   `startToCloseTimeout` is a 12-hour backstop for a drain that hangs while its process stays alive.
-  Known limit: when an attempt is retried while the previous one is still alive (a network
-  partition, or the backstop firing), the old attempt keeps publishing for a few seconds until its
-  heartbeat is rejected and the AbortSignal interrupts it; the projector's status guards make
-  duplicate settlements no-ops in projection, but the overlap window is not fully fenced. The
-  fence design exists as a follow-up: `event_sequence.owner_id` and `claim()` are already in the
-  event store; claim the aggregate per attempt and reject stale-owner appends inside the per-event
-  transaction. It threads an owner through every publish (including compaction's), so it deserves
-  its own change.
+  When an attempt is retried while the previous one is still alive (a network partition, or the
+  backstop firing), the old attempt could briefly keep publishing until its heartbeat is rejected
+  and the AbortSignal interrupts it. That overlap is now fenced: each drain claims the event log
+  with an attempt token (`event_sequence.owner_id` via `claim()`), and a live durable append dies
+  if a newer attempt has since claimed the log (the check is in `event.ts`, gated by the
+  `EventOwner` context the drain provides). The owner is set activity-side from the run id and
+  attempt, so it stays out of the workflow's deterministic input; the local driver uses a
+  per-instance token. The projector's status guards still make any duplicate settlement a no-op.
 
 `scripts/resume-check.ts` verifies resume: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
@@ -244,10 +244,16 @@ distinct worker identities.
   The remote suite needs a server, so it runs only when `OPENCODE_LIBSQL_TEST_URL` is set (e.g.
   `turso dev --port 8899`, then `OPENCODE_LIBSQL_TEST_URL=http://127.0.0.1:8899`); it skips
   otherwise.
-- Known limit: every durable event is its own transaction, and the engine records text/reasoning
-  deltas as events, so a streaming turn against a REMOTE store pays one interactive transaction per
-  delta, serialized per process. Fine for a shared local file; expect reduced streaming throughput
-  over a network URL until delta events are batched for the remote backend.
+- Every durable event is its own interactive transaction, but streaming text and reasoning deltas
+  are live-only: they broadcast in memory and write no row (verified by `session-runner.test.ts`
+  "broadcasts provider ... deltas without storing projection rewrites", which streams 32 chunks and
+  asserts zero delta rows while the context still rebuilds from the log). So a streaming turn does
+  NOT pay a transaction per token. The durable cost of one step is the handful of boundary and tool
+  events (`Step.Started`, a `Text.Ended` per block, the `Tool.*` pair per call, `Step.Ended`), each
+  recorded as it settles. Over a remote store that is a small, bounded number of round trips per
+  step, not one per token. Coalescing them into a single commit at step end would cut round trips
+  further, but a mid-step crash would then lose the completed-tool records the resume path reuses,
+  so per-event durability is kept on purpose.
 
 ### What resumes cross-host, and what does not
 
