@@ -10,6 +10,44 @@ the **shipping** `opencode serve` over its HTTP API, for the agent-as-black-box 
 orchestration durable but cannot recover a partial turn. This change is the deeper one: durability
 inside the engine, so a crashed turn resumes mid-step instead of being re-attached to.
 
+## How it fits together
+
+One design decision carries the change: the session supervisor is written once, and durability is
+a choice of driver. Everything else here is a consequence of taking at-least-once execution
+seriously.
+
+The supervisor (`workflow-core.ts`) drives a session over six runtime primitives. The Temporal
+driver runs it as a per-session workflow with one activity per step; the in-process micro-driver
+(`local-driver.ts`) runs the same function over plain promises. One env var picks the driver, and
+the shared drain bodies keep turn semantics identical in both modes (see
+[Two modes, one supervisor](#two-modes-one-supervisor)).
+
+Taking durability seriously then forces six things:
+
+1. **State must be shareable.** Any worker resumes any session only if the event log is not
+   host-local: the libSQL backend, atomic remote writes, busy retry, serialized migrations
+   ([Shared, durable event store](#shared-durable-event-store-any-worker-resume)).
+2. **Re-drives must be safe.** A retried step reuses completed tool results, re-runs only tools
+   declared idempotent, and fails the rest for the model to redo. The step loop is bounded
+   (`loop-guard.ts`: a step ceiling plus a repeated-identical-call detector), because a runaway
+   turn would otherwise be a durable runaway turn
+   ([Two modes, one supervisor](#two-modes-one-supervisor)).
+3. **Two writers must be fenced.** A superseded attempt cannot keep appending to the log; each
+   drain claims the log with an attempt token ([Notes](#notes)).
+4. **The worktree must travel.** Snapshot trees ship as incremental git packs, and a worker
+   without the project tree rebuilds it before the run
+   ([What resumes cross-host](#what-resumes-cross-host-and-what-does-not),
+   [docs/worktree-portability.md](docs/worktree-portability.md)).
+5. **Human-in-the-loop must be durable.** A pending permission ask is a row in the shared store,
+   answerable from any process, adopted by re-drives, expired when abandoned
+   ([Durable permission asks](#durable-permission-asks)).
+6. **Errors must survive the boundary.** `resume` rejects with the exact tagged `RunError`
+   reconstructed from the failure details, and a user decline is non-retryable ([Notes](#notes)).
+
+Operationally, workers scale separately from the HTTP server
+([Running workers separately](#running-workers-separately)), and `active` is backed by Temporal
+visibility, so it survives restarts.
+
 ## A durable `SessionExecution` on the v2 engine
 
 opencode's v2 engine (`packages/core` + `packages/server`) is already event-sourced per session and
