@@ -3,8 +3,8 @@
 Some customers integrate Temporal into their agents and want the same agent loop to run without
 Temporal, e.g. shipped desktop software. This evaluates the candidate paths and recommends what to
 tell customers and what to build. It lives on this branch because the fork around it is first-hand
-evidence: one engine, three execution modes (in-process, one activity per turn, one per step),
-selected by an env var.
+evidence: one engine, two execution modes (in-process, one Temporal activity per step), selected
+by an env var.
 
 ## The requirement, sharpened
 
