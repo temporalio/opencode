@@ -10,6 +10,7 @@ import type { LocationError, LocationServices } from "../../location-services"
 import { SessionRunner } from "../runner"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
+import { SessionRunDeclinedError } from "../error"
 import type { SessionInput } from "../input"
 import { encodeRunError } from "./run-error-codec"
 import type { DrainInput, StepDrainInput, StepDrainResult } from "./temporal-activities"
@@ -43,10 +44,14 @@ export const makeDrains = ({ store, locations, ctx }: DrainDeps) => {
       // re-drives a turn the user explicitly stopped.
       if (signal.aborted)
         throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
+      const declined = encodeRunError(
+        new SessionRunDeclinedError({ sessionID: SessionSchema.ID.make(input.sessionID) }),
+      )
       throw ApplicationFailure.create({
         message: "session run halted (user declined)",
         type: "SessionRunDeclined",
         nonRetryable: true,
+        details: declined === undefined ? undefined : [declined],
       })
     }
     // A genuine run error is thrown non-retryable so Temporal surfaces it (to resume) rather than
@@ -89,10 +94,14 @@ export const makeDrains = ({ store, locations, ctx }: DrainDeps) => {
       // an internal user-decline halt is non-retryable.
       if (signal.aborted)
         throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
+      const declined = encodeRunError(
+        new SessionRunDeclinedError({ sessionID: SessionSchema.ID.make(input.sessionID) }),
+      )
       throw ApplicationFailure.create({
         message: "session run halted (user declined)",
         type: "SessionRunDeclined",
         nonRetryable: true,
+        details: declined === undefined ? undefined : [declined],
       })
     }
     const squashed = Cause.squash(cause) as { _tag?: string; message?: string }
