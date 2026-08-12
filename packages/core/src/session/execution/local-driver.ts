@@ -17,6 +17,7 @@ import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { SessionExecution } from "../execution"
 import { makeDrains } from "./drain"
+import { WorktreeMaterializer } from "./worktree"
 import { makeWorkflows, type WorkflowRuntime } from "./workflow-core"
 import { toRunError } from "./run-error-codec"
 
@@ -177,7 +178,8 @@ const layer = Layer.effect(
     const locations = yield* LocationServiceMap.Service
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
     const events = yield* EventV2.Service
-    const drains = makeDrains({ store, locations, ctx, events })
+    const worktrees = yield* WorktreeMaterializer.Service
+    const drains = makeDrains({ store, locations, ctx, events, worktrees })
     const drivers = new Map<SessionSchema.ID, SessionDriver>()
     // Read at layer build (not module load) so tests can set it before constructing the layer.
     // The idle override shortens the supervisor's 5-minute self-termination.
@@ -242,5 +244,5 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: SessionExecution.Service,
   layer,
-  deps: [SessionStore.node, LocationServiceMap.node, EventV2.node],
+  deps: [SessionStore.node, LocationServiceMap.node, EventV2.node, WorktreeMaterializer.node],
 })

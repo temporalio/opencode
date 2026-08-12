@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "69462d47-737f-4005-83ff-1f43cf647276",
+  "id": "c609b4b3-8061-4cef-a339-c44d54121462",
   "prevIds": [
-    "ef05c3dc-ecd1-4def-9573-6b872e58366e"
+    "69462d47-737f-4005-83ff-1f43cf647276"
   ],
   "ddl": [
     {
@@ -84,6 +84,10 @@
     },
     {
       "name": "session_share",
+      "entityType": "tables"
+    },
+    {
+      "name": "snapshot_pack",
       "entityType": "tables"
     },
     {
@@ -1567,6 +1571,86 @@
       "table": "session_share"
     },
     {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "snapshot_pack"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "snapshot_pack"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "worktree",
+      "entityType": "columns",
+      "table": "snapshot_pack"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "tree",
+      "entityType": "columns",
+      "table": "snapshot_pack"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "base",
+      "entityType": "columns",
+      "table": "snapshot_pack"
+    },
+    {
+      "type": "blob",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "pack",
+      "entityType": "columns",
+      "table": "snapshot_pack"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "snapshot_pack"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "snapshot_pack"
+    },
+    {
       "columns": [
         "project_id"
       ],
@@ -1946,6 +2030,15 @@
     },
     {
       "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "snapshot_pack_pk",
+      "table": "snapshot_pack",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         {
           "value": "aggregate_id",
           "isExpression": false
@@ -2285,6 +2378,42 @@
       "name": "todo_session_idx",
       "entityType": "indexes",
       "table": "todo"
+    },
+    {
+      "columns": [
+        {
+          "value": "directory",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "snapshot_pack_directory_idx",
+      "entityType": "indexes",
+      "table": "snapshot_pack"
+    },
+    {
+      "columns": [
+        {
+          "value": "worktree",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "snapshot_pack_worktree_idx",
+      "entityType": "indexes",
+      "table": "snapshot_pack"
     }
   ],
   "renames": []
