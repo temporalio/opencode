@@ -66,7 +66,12 @@ for (const item of targets) {
     entrypoints: ["./src/index.ts"],
     tsconfig: "./tsconfig.json",
     plugins: [plugin],
-    external: ["node-gyp"],
+    // lightningcss (via ui -> tailwind) has a conditional native-binding require the bundler
+    // cannot resolve; the TUI never runs that path, so it stays external. @temporalio/worker
+    // drags webpack and swc (it bundles the workflow from source at startup), which cannot ride
+    // a compiled binary; a packaged serve runs OPENCODE_TEMPORAL_ROLE=client next to standalone
+    // workers instead.
+    external: ["node-gyp", "lightningcss", "@temporalio/worker"],
     format: "esm",
     minify: true,
     sourcemap: sourcemapsFlag ? "linked" : "none",
