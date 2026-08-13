@@ -186,7 +186,13 @@ export const locationLayer = Layer.effect(
     const integrations = yield* Integration.Service
     return Service.of({
       resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session) {
-        // Location plugins populate and filter the catalog asynchronously during layer startup.
+        // Location plugins populate and filter the catalog asynchronously during layer startup, so
+        // a resolve that lands right after boot can observe an empty catalog and fail a healthy
+        // model as unavailable; that failure is non-retryable by design. Wait, bounded, while the
+        // catalog has no models at all. A populated catalog resolves with no delay.
+        for (let attempt = 0; attempt < 40 && (yield* catalog.model.all()).length === 0; attempt++) {
+          yield* Effect.sleep(250)
+        }
         const defaultModel = session.model ? undefined : yield* catalog.model.default()
         const selected = session.model
           ? (yield* catalog.model.available()).find(
