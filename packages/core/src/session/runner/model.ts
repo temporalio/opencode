@@ -184,6 +184,9 @@ export const locationLayer = Layer.effect(
   Effect.gen(function* () {
     const catalog = yield* Catalog.Service
     const integrations = yield* Integration.Service
+    // The auth wait below runs once per process: the integration state lag is a boot phenomenon,
+    // and a provider that genuinely has no connection must not pay the wait on every step.
+    let authSettled = false
     return Service.of({
       resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session) {
         // Location plugins populate and filter the catalog asynchronously during layer startup, so
@@ -208,9 +211,19 @@ export const locationLayer = Layer.effect(
           })
         if (!selected) return yield* new ModelNotSelectedError({ sessionID: session.id })
         const provider = yield* catalog.provider.get(selected.providerID)
-        const connection = yield* integrations.connection.active(
-          provider?.integrationID ?? Integration.ID.make(selected.providerID),
-        )
+        const integrationID = provider?.integrationID ?? Integration.ID.make(selected.providerID)
+        let connection = yield* integrations.connection.active(integrationID)
+        // The integration state (auth methods) can lag the catalog at boot: the model resolves,
+        // but the request would go out unauthenticated and fail the turn. When the model carries
+        // no key of its own and no connection is active yet, give the loaders the same bounded
+        // window, once.
+        if (!connection && !authSettled && typeof selected.request.body.apiKey !== "string") {
+          for (let attempt = 0; attempt < 20 && !connection; attempt++) {
+            yield* Effect.sleep(250)
+            connection = yield* integrations.connection.active(integrationID)
+          }
+        }
+        authSettled = true
         return yield* resolve(
           session,
           selected,

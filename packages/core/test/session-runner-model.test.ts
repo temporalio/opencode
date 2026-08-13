@@ -390,4 +390,67 @@ describe("SessionRunnerModel", () => {
       expect(resolved).toMatchObject({ id: "api-test-model", provider: "test-provider" })
     }),
   )
+
+  it.live("waits out the integration state's async population before sending without auth", () =>
+    Effect.gen(function* () {
+      // A keyless model: auth can only come from a connection, so a resolve that runs before the
+      // integration state settles would send an unauthenticated request.
+      const catalogModel = ModelV2.Info.make({
+        ...model({ type: "aisdk", package: "@ai-sdk/openai", url: "https://openai.example/v1" }),
+        request: { headers: {}, body: {} },
+      })
+      const catalogMock = Layer.mock(Catalog.Service, {
+        model: {
+          all: () => Effect.succeed([catalogModel]),
+          available: () => Effect.succeed([catalogModel]),
+          default: () => Effect.succeed(undefined),
+        },
+        provider: {
+          get: () => Effect.succeed(undefined),
+        },
+      } as unknown as Catalog.Interface)
+      // The connection lands a moment after the catalog, like plugins at boot.
+      let connection: { type: "env"; name: string } | undefined
+      const integrationMock = Layer.mock(Integration.Service, {
+        connection: {
+          active: () => Effect.sync(() => connection),
+          resolve: () => Effect.succeed(Credential.Key.make({ type: "key", key: "boot-race-key" })),
+        },
+      } as unknown as Integration.Interface)
+      const session = SessionV2.Info.make({
+        id: SessionV2.ID.make("ses_model_auth_race"),
+        projectID: ProjectV2.ID.global,
+        title: "test",
+        model: { id: catalogModel.id, providerID: catalogModel.providerID },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: DateTime.makeUnsafe(0), updated: DateTime.makeUnsafe(0) },
+        location: { directory: AbsolutePath.make("/project") },
+      })
+
+      const resolved = yield* Effect.gen(function* () {
+        const svc = yield* SessionRunnerModel.Service
+        yield* Effect.forkScoped(
+          Effect.sleep(400).pipe(
+            Effect.andThen(Effect.sync(() => (connection = { type: "env", name: "TEST_KEY" }))),
+          ),
+        )
+        return yield* svc.resolve(session)
+      }).pipe(
+        Effect.provide(
+          SessionRunnerModel.locationLayer.pipe(Layer.provide(catalogMock), Layer.provide(integrationMock)),
+        ),
+      )
+
+      const request = LLM.request({ model: resolved, prompt: "Hello" })
+      const headers = yield* resolved.route.auth.apply({
+        request,
+        method: "POST",
+        url: "https://openai.example/v1/responses",
+        body: "{}",
+        headers: Headers.empty,
+      })
+      expect(headers.authorization).toBe("Bearer boot-race-key")
+    }),
+  )
 })
