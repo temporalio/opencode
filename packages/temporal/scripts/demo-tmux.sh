@@ -61,6 +61,9 @@ print(("ENDED" if ended else "RUNNING") + "|" + " ".join(texts))
   echo "  curl -s $B/session/$SID/history -H 'Authorization: Basic $AUTH'"
   # start-dev puts the UI on the server port + 1000.
   echo "  UI: http://localhost:$((TPORT + 1000))"
+  echo
+  echo "driver done. serve and the Temporal server keep running in the other panes; the session"
+  echo "still accepts prompts. This pane is a normal shell now."
 }
 
 [ "${1:-}" = "--drive" ] && { drive; exit 0; }
