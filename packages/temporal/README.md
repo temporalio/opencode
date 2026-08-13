@@ -78,7 +78,9 @@ OPENAI_API_KEY=... OPENCODE_SESSION_EXECUTION=temporal TEMPORAL_ADDRESS=127.0.0.
 ```
 
 Create a session and prompt it against `POST /api/session` and `POST /api/session/:id/prompt`; each
-session runs as a Temporal workflow `session-exec-<sessionID>`.
+session runs as a Temporal workflow `session-exec-<sessionID>`. Or run the whole thing in one
+command: `packages/temporal/scripts/demo-tmux.sh` starts the dev server, serve, and a driver in
+tmux panes, prompts a session, and prints the reply with the workflow behind it.
 
 ### Verified
 
