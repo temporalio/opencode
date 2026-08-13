@@ -59,7 +59,8 @@ print(("ENDED" if ended else "RUNNING") + "|" + " ".join(texts))
   echo "poke further (copy-paste):"
   echo "  temporal workflow show --address 127.0.0.1:$TPORT --workflow-id session-exec-$SID"
   echo "  curl -s $B/session/$SID/history -H 'Authorization: Basic $AUTH'"
-  echo "  UI: http://localhost:8233"
+  # start-dev puts the UI on the server port + 1000.
+  echo "  UI: http://localhost:$((TPORT + 1000))"
 }
 
 [ "${1:-}" = "--drive" ] && { drive; exit 0; }
