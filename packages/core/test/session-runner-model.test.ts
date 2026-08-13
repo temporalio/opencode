@@ -1,8 +1,9 @@
 import { describe, expect } from "bun:test"
 import { LLM } from "@opencode-ai/llm"
 import { LLMClient } from "@opencode-ai/llm/route"
-import { DateTime, Effect } from "effect"
+import { DateTime, Effect, Layer } from "effect"
 import { Headers } from "effect/unstable/http"
+import { Catalog } from "@opencode-ai/core/catalog"
 import { Credential } from "@opencode-ai/core/credential"
 import { Integration } from "@opencode-ai/core/integration"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -342,6 +343,51 @@ describe("SessionRunnerModel", () => {
         ),
       ).toBe(false)
       expect(SessionRunnerModel.supported(model({ type: "native", settings: {} }))).toBe(false)
+    }),
+  )
+
+  it.live("waits out the catalog's async population instead of failing the model", () =>
+    Effect.gen(function* () {
+      const catalogModel = model({ type: "aisdk", package: "@ai-sdk/openai", url: "https://openai.example/v1" })
+      // Starts empty, like the catalog right after boot; plugins fill it a moment later.
+      const models: ModelV2.Info[] = []
+      const catalogMock = Layer.mock(Catalog.Service, {
+        model: {
+          all: () => Effect.sync(() => [...models]),
+          available: () => Effect.sync(() => [...models]),
+          default: () => Effect.succeed(undefined),
+        },
+        provider: {
+          get: () => Effect.succeed(undefined),
+        },
+      } as unknown as Catalog.Interface)
+      const integrationMock = Layer.mock(Integration.Service, {
+        connection: { active: () => Effect.succeed(undefined) },
+      } as unknown as Integration.Interface)
+      const session = SessionV2.Info.make({
+        id: SessionV2.ID.make("ses_model_boot_race"),
+        projectID: ProjectV2.ID.global,
+        title: "test",
+        model: { id: catalogModel.id, providerID: catalogModel.providerID },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: DateTime.makeUnsafe(0), updated: DateTime.makeUnsafe(0) },
+        location: { directory: AbsolutePath.make("/project") },
+      })
+
+      const resolved = yield* Effect.gen(function* () {
+        const svc = yield* SessionRunnerModel.Service
+        yield* Effect.forkScoped(
+          Effect.sleep(400).pipe(Effect.andThen(Effect.sync(() => models.push(catalogModel)))),
+        )
+        return yield* svc.resolve(session)
+      }).pipe(
+        Effect.provide(
+          SessionRunnerModel.locationLayer.pipe(Layer.provide(catalogMock), Layer.provide(integrationMock)),
+        ),
+      )
+
+      expect(resolved).toMatchObject({ id: "api-test-model", provider: "test-provider" })
     }),
   )
 })
