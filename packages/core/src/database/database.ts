@@ -2,7 +2,6 @@ export * as Database from "./database"
 
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "#sqlite"
-import { layer as libsqlLayer } from "./sqlite.libsql"
 import { Context, Effect, Layer } from "effect"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
@@ -55,7 +54,17 @@ export function layerFromPath(filename: string) {
 // so any worker can resume any session from the same log. Same SQLite dialect, so nothing in the
 // schema/migrations/queries changes.
 export function layerFromLibsql(url: string, authToken?: string) {
-  return makeServiceLayer(false).pipe(Layer.provide(libsqlLayer({ url, authToken })))
+  // Imported lazily: @libsql/client loads a platform native binding at import time, which a
+  // compiled binary cannot carry. The local-file backend must boot without it.
+  return makeServiceLayer(false).pipe(
+    Layer.provide(
+      Layer.unwrap(
+        Effect.promise(() => import("./sqlite.libsql")).pipe(
+          Effect.map((backend) => backend.layer({ url, authToken })),
+        ),
+      ),
+    ),
+  )
 }
 
 export function path() {

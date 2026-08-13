@@ -3,7 +3,9 @@ export * as SessionExecutionTemporal from "./temporal"
 import { fileURLToPath } from "node:url"
 import { Effect, Layer } from "effect"
 import { Client, Connection, WithStartWorkflowOperation } from "@temporalio/client"
-import { NativeConnection, Worker } from "@temporalio/worker"
+// Imported lazily inside the worker branch: the worker package drags webpack and swc (it bundles
+// the workflow from source at startup), which a compiled binary can neither bundle nor run. A
+// packaged serve runs OPENCODE_TEMPORAL_ROLE=client next to standalone workers instead.
 
 import { LocationServiceMap } from "../../location-service-map"
 import { EventV2 } from "../../event"
@@ -23,7 +25,8 @@ const TASK_QUEUE = process.env.OPENCODE_TEMPORAL_TASK_QUEUE ?? "opencode-session
 const workflowId = (id: string) => `session-exec-${id}`
 
 // One activity per step (the model call + its tools), with the step loop as workflow control flow.
-const WORKFLOW = WF.sessionTurn
+// Workflows start by the string type, never the function: a minified (packaged) client would
+// otherwise register the mangled function name as the type and no worker would match it.
 const WORKFLOW_TYPE = "sessionTurn"
 
 // Role split so the worker fleet can run separately from the HTTP server. `both` (default) hosts the
@@ -63,6 +66,16 @@ const layer = Layer.effect(
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
     if (HOST_WORKER) {
+      const { NativeConnection, Worker } = yield* Effect.tryPromise(
+        () => import("@temporalio/worker"),
+      ).pipe(
+        Effect.catch(() =>
+          Effect.die(
+            "The embedded Temporal worker is unavailable in this build. Run standalone workers " +
+              "(packages/server/src/worker.ts) and set OPENCODE_TEMPORAL_ROLE=client.",
+          ),
+        ),
+      )
       const nativeConn = yield* Effect.acquireRelease(
         Effect.promise(() => NativeConnection.connect({ address: ADDRESS })),
         (conn) => Effect.promise(() => conn.close().catch(() => {})),
@@ -112,7 +125,7 @@ const layer = Layer.effect(
 
     const drive = (id: SessionSchema.ID) =>
       Effect.promise(() =>
-        client.workflow.signalWithStart(WORKFLOW, {
+        client.workflow.signalWithStart(WORKFLOW_TYPE, {
           taskQueue: TASK_QUEUE,
           workflowId: workflowId(id),
           args: [id],
@@ -160,7 +173,7 @@ const layer = Layer.effect(
         Effect.tryPromise({
           try: async () => {
             const attempt = () => {
-              const startOp = new WithStartWorkflowOperation(WORKFLOW, {
+              const startOp = new WithStartWorkflowOperation(WORKFLOW_TYPE, {
                 taskQueue: TASK_QUEUE,
                 workflowId: workflowId(id),
                 args: [id],
