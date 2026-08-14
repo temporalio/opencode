@@ -1,8 +1,10 @@
-// Contract tests for the in-process micro-driver: the SAME supervisor function the Temporal
-// workflow runs (workflow-core.ts), driven with plain promises and no server. The contract is the
-// SessionExecution interface: wake drives a turn to settlement, resume surfaces the exact tagged
-// RunError (through the same encode/decode path the Temporal boundary uses), interrupt cancels an
-// in-flight turn, and an idle supervisor retires itself.
+// The SessionExecution driver-contract suite, run here against the in-process native coordinator
+// (local-driver.ts): a per-session async loop with no server. The suite is parameterized over the
+// driver factory (runContract) so the SAME behaviors can be asserted against the Temporal driver;
+// this is what guarantees the two modes agree now that they share only the drain, not one loop.
+// The contract: wake drives a turn to settlement then the idle coordinator retires, resume forces a
+// healthy turn to completion, resume surfaces the exact tagged RunError (through the same
+// encode/decode path the Temporal boundary uses), and interrupt cancels an in-flight turn.
 import { LLMClient, type LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Database } from "@opencode-ai/core/database/database"
@@ -140,71 +142,103 @@ const until = <A, E>(read: Effect.Effect<A, E>, predicate: (value: A) => boolean
     }
   })
 
-describe("SessionExecution local micro-driver", () => {
-  {
-    const { requests, stream } = countingModel()
-    const sessionID = SessionV2.ID.make("ses_driver_wake")
-    it.live("wake drives a turn to settlement, then the idle supervisor retires", () =>
-      Effect.gen(function* () {
-        const previousIdle = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
-        process.env.OPENCODE_SESSION_IDLE_TIMEOUT = "2 seconds"
-        yield* seedSession(sessionID)
-        yield* seedPrompt(sessionID)
-        const exec = Context.get(yield* Layer.build(makeExecution(stream)), SessionExecution.Service)
-        yield* exec.wake(sessionID)
-        const store = yield* SessionStore.Service
-        yield* until(store.context(sessionID), (context) => {
+// The SessionExecution contract, parameterized over the driver factory. `makeExec` builds a
+// SessionExecution graph the same way serve does, with the model/LLM mocked. Running the identical
+// suite against a second factory (e.g. a Temporal test-env node) is how the two modes are held to
+// one behavior now that they no longer share a single coordination loop -- only the drain.
+const runContract = (
+  label: string,
+  makeExec: (stream: LLMClientShape["stream"], models?: typeof okModels) => ReturnType<typeof makeExecution>,
+) => {
+  const slug = label.replace(/[^a-z0-9]+/gi, "_")
+  describe(`SessionExecution contract: ${label}`, () => {
+    {
+      const { requests, stream } = countingModel()
+      const sessionID = SessionV2.ID.make(`ses_${slug}_wake`)
+      it.live("wake drives a turn to settlement, then the idle coordinator retires", () =>
+        Effect.gen(function* () {
+          const previousIdle = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
+          process.env.OPENCODE_SESSION_IDLE_TIMEOUT = "2 seconds"
+          yield* seedSession(sessionID)
+          yield* seedPrompt(sessionID)
+          const exec = Context.get(yield* Layer.build(makeExec(stream)), SessionExecution.Service)
+          yield* exec.wake(sessionID)
+          const store = yield* SessionStore.Service
+          yield* until(store.context(sessionID), (context) => {
+            const assistant = context.findLast((message) => message.type === "assistant")
+            return assistant?.type === "assistant" && Boolean(assistant.time.completed)
+          })
+          expect(requests).toHaveLength(1)
+          expect((yield* exec.active).has(sessionID)).toBe(true)
+          // Idle self-termination: the coordinator retires without an interrupt.
+          yield* until(exec.active, (active) => !active.has(sessionID))
+          // Restore so later layer builds in this process get the real default.
+          if (previousIdle === undefined) delete process.env.OPENCODE_SESSION_IDLE_TIMEOUT
+          else process.env.OPENCODE_SESSION_IDLE_TIMEOUT = previousIdle
+        }),
+      )
+    }
+
+    {
+      const { requests, stream } = countingModel()
+      const sessionID = SessionV2.ID.make(`ses_${slug}_resume_ok`)
+      it.live("resume forces a healthy turn to completion and resolves", () =>
+        Effect.gen(function* () {
+          yield* seedSession(sessionID)
+          yield* seedPrompt(sessionID)
+          const exec = Context.get(yield* Layer.build(makeExec(stream)), SessionExecution.Service)
+          // resume is request/response: it awaits the forced drain and resolves on success.
+          const exit = yield* exec.resume(sessionID).pipe(Effect.exit)
+          expect(Exit.isSuccess(exit)).toBe(true)
+          expect(requests).toHaveLength(1)
+          const store = yield* SessionStore.Service
+          const context = yield* store.context(sessionID)
           const assistant = context.findLast((message) => message.type === "assistant")
-          return assistant?.type === "assistant" && Boolean(assistant.time.completed)
-        })
-        expect(requests).toHaveLength(1)
-        expect((yield* exec.active).has(sessionID)).toBe(true)
-        // Idle self-termination: the driver retires without an interrupt.
-        yield* until(exec.active, (active) => !active.has(sessionID))
-        // Restore so later layer builds in this process get the real default.
-        if (previousIdle === undefined) delete process.env.OPENCODE_SESSION_IDLE_TIMEOUT
-        else process.env.OPENCODE_SESSION_IDLE_TIMEOUT = previousIdle
-      }),
-    )
-  }
+          expect(assistant?.type === "assistant" && Boolean(assistant.time.completed)).toBe(true)
+        }),
+      )
+    }
 
-  {
-    const sessionID = SessionV2.ID.make("ses_driver_error")
-    const failingModels = SessionRunnerModel.layerWith(() =>
-      Effect.fail(new ModelNotSelectedError({ sessionID })),
-    )
-    it.live("resume surfaces the exact tagged RunError through the shared codec", () =>
-      Effect.gen(function* () {
-        yield* seedSession(sessionID)
-        const { stream } = countingModel()
-        const exec = Context.get(yield* Layer.build(makeExecution(stream, failingModels)), SessionExecution.Service)
-        const exit = yield* exec.resume(sessionID).pipe(Effect.exit)
-        expect(Exit.isFailure(exit)).toBe(true)
-        const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
-        // The same encode -> details -> decode path the Temporal boundary uses, so the caller gets
-        // the identical tagged instance in both modes.
-        expect(error).toBeInstanceOf(ModelNotSelectedError)
-      }),
-    )
-  }
+    {
+      const sessionID = SessionV2.ID.make(`ses_${slug}_error`)
+      const failingModels = SessionRunnerModel.layerWith(() =>
+        Effect.fail(new ModelNotSelectedError({ sessionID })),
+      )
+      it.live("resume surfaces the exact tagged RunError through the shared codec", () =>
+        Effect.gen(function* () {
+          yield* seedSession(sessionID)
+          const { stream } = countingModel()
+          const exec = Context.get(yield* Layer.build(makeExec(stream, failingModels)), SessionExecution.Service)
+          const exit = yield* exec.resume(sessionID).pipe(Effect.exit)
+          expect(Exit.isFailure(exit)).toBe(true)
+          const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+          // The same encode -> details -> decode path the Temporal boundary uses, so the caller gets
+          // the identical tagged instance in both modes.
+          expect(error).toBeInstanceOf(ModelNotSelectedError)
+        }),
+      )
+    }
 
-  {
-    const sessionID = SessionV2.ID.make("ses_driver_interrupt")
-    it.live("interrupt cancels an in-flight turn and the driver retires", () =>
-      Effect.gen(function* () {
-        yield* seedSession(sessionID)
-        yield* seedPrompt(sessionID)
-        // A model that never answers: the turn hangs until interrupted.
-        const exec = Context.get(
-          yield* Layer.build(makeExecution(() => Stream.never)),
-          SessionExecution.Service,
-        )
-        yield* exec.wake(sessionID)
-        yield* Effect.sleep(200)
-        expect((yield* exec.active).has(sessionID)).toBe(true)
-        yield* exec.interrupt(sessionID)
-        yield* until(exec.active, (active) => !active.has(sessionID), 4000)
-      }),
-    )
-  }
-})
+    {
+      const sessionID = SessionV2.ID.make(`ses_${slug}_interrupt`)
+      it.live("interrupt cancels an in-flight turn and the coordinator retires", () =>
+        Effect.gen(function* () {
+          yield* seedSession(sessionID)
+          yield* seedPrompt(sessionID)
+          // A model that never answers: the turn hangs until interrupted.
+          const exec = Context.get(
+            yield* Layer.build(makeExec(() => Stream.never)),
+            SessionExecution.Service,
+          )
+          yield* exec.wake(sessionID)
+          yield* Effect.sleep(200)
+          expect((yield* exec.active).has(sessionID)).toBe(true)
+          yield* exec.interrupt(sessionID)
+          yield* until(exec.active, (active) => !active.has(sessionID), 4000)
+        }),
+      )
+    }
+  })
+}
+
+runContract("local coordinator", makeExecution)
