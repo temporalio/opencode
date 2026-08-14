@@ -102,7 +102,6 @@
     "@opentelemetry/sdk-trace-base": "2.6.1",
     "@parcel/watcher": "2.5.1",
     "@silvia-odwyer/photon-node": "0.3.4",
-    "@openrouter/ai-sdk-provider": "2.9.0",
     "@temporalio/activity": "^1.21.0",
     "@temporalio/client": "^1.21.0",
     "@temporalio/worker": "^1.21.0",
