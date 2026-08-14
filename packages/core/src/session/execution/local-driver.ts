@@ -2,13 +2,15 @@ export * as SessionExecutionLocalDriver from "./local-driver"
 
 // The in-process driver for the session supervisor (workflow-core.ts). It runs the SAME supervisor
 // function the Temporal workflow runs, with the six runtime primitives implemented over plain
-// promises: `condition` is a polled waiter, signals and updates are method calls, the drains run
+// promises: `condition` is a waiter re-checked on every signal and update delivery, the drains run
 // directly (no activities), and cancellation is an AbortController whose reason satisfies the
 // drain's cancellation contract. No Temporal server, no worker, no ports; durability comes from
 // the engine's event log, exactly as in local coordinator mode. This is the "one supervisor, two
-// drivers" shape: the factory picks the driver, the supervisor is written once.
+// drivers" shape: the factory picks the driver, the supervisor is written once. The primitives
+// stay promise-shaped because the supervisor also runs inside a Temporal workflow, which cannot
+// carry effect's runtime.
 
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Layer } from "effect"
 import { randomUUID } from "node:crypto"
 import { LocationServiceMap } from "../../location-service-map"
 import { EventV2 } from "../../event"
@@ -21,25 +23,6 @@ import { WorktreeMaterializer } from "./worktree"
 import { makeWorkflows, type WorkflowRuntime } from "./workflow-core"
 import { toRunError } from "./run-error-codec"
 
-
-const UNITS: Record<string, number> = {
-  ms: 1,
-  millisecond: 1,
-  milliseconds: 1,
-  second: 1_000,
-  seconds: 1_000,
-  minute: 60_000,
-  minutes: 60_000,
-  hour: 3_600_000,
-  hours: 3_600_000,
-}
-
-const parseDuration = (value: string): number => {
-  const match = /^\s*([\d.]+)\s*([a-z]+)\s*$/i.exec(value)
-  const unit = match?.[2] ? UNITS[match[2].toLowerCase()] : undefined
-  if (!match?.[1] || unit === undefined) throw new Error(`Unsupported duration: ${value}`)
-  return Number(match[1]) * unit
-}
 
 class LocalCancellation extends Error {}
 
@@ -55,14 +38,15 @@ interface Waiter {
 type Drains = ReturnType<typeof makeDrains>
 
 // One driver per live session. Temporal re-evaluates workflow conditions on every activation; the
-// local equivalent is a short poll plus an immediate re-check after every signal/update delivery.
+// local equivalents are exactly the events that can change a predicate's inputs: signal delivery,
+// an update starting or settling, and a new condition registering. The supervisor is one
+// sequential coroutine, so nothing else mutates the state a predicate reads.
 class SessionDriver {
   readonly done: Promise<void>
   completed = false
   private readonly signalHandlers = new Map<string, () => void>()
   private readonly updateHandlers = new Map<string, () => Promise<void>>()
   private waiters: Waiter[] = []
-  private ticker: ReturnType<typeof setInterval> | undefined
   private cancelled = false
   private readonly abort = new AbortController()
   // One token per driver instance. A wake that lands after a driver finished starts a fresh driver
@@ -71,19 +55,19 @@ class SessionDriver {
 
   constructor(run: (rt: WorkflowRuntime) => Promise<void>, drains: Drains, onDone: () => void) {
     const rt: WorkflowRuntime = {
-      condition: (predicate, timeout) =>
-        new Promise<boolean>((resolve, reject) => {
-          if (this.cancelled) return reject(new LocalCancellation())
-          const waiter: Waiter = { predicate, resolve, reject }
-          if (timeout !== undefined)
-            waiter.timer = setTimeout(() => {
-              this.remove(waiter)
-              resolve(false)
-            }, parseDuration(timeout))
-          this.waiters.push(waiter)
-          this.tick()
-          this.ensureTicker()
-        }),
+      condition: (predicate, timeout) => {
+        if (this.cancelled) return Promise.reject(new LocalCancellation())
+        const { promise, resolve, reject } = Promise.withResolvers<boolean>()
+        const waiter: Waiter = { predicate, resolve, reject }
+        if (timeout !== undefined)
+          waiter.timer = setTimeout(() => {
+            this.remove(waiter)
+            resolve(false)
+          }, Duration.toMillis(Duration.fromInputUnsafe(timeout as Duration.Input)))
+        this.waiters.push(waiter)
+        this.tick()
+        return promise
+      },
       setSignalHandler: (name, handler) => this.signalHandlers.set(name, handler),
       setUpdateHandler: (name, handler) => this.updateHandlers.set(name, handler),
       // Same 12 h backstop as the Temporal activity: a hung tool must not hold `draining` forever.
@@ -95,7 +79,6 @@ class SessionDriver {
     }
     this.done = run(rt).finally(() => {
       this.completed = true
-      this.stopTicker()
       onDone()
     })
   }
@@ -109,7 +92,8 @@ class SessionDriver {
     const handler = this.updateHandlers.get(name)
     if (!handler) return Promise.reject(new Error(`Update handler not registered: ${name}`))
     const result = handler()
-    // Nudge parked conditions when the update settles; the poll covers everything in between.
+    // The handler's synchronous prefix may have changed predicate inputs; check again on settle.
+    this.tick()
     result.finally(() => this.tick()).catch(() => {})
     return result
   }
@@ -147,18 +131,6 @@ class SessionDriver {
       if (waiter.timer) clearTimeout(waiter.timer)
       waiter.resolve(true)
     }
-    if (this.waiters.length === 0) this.stopTicker()
-  }
-
-  private ensureTicker() {
-    if (this.ticker || this.waiters.length === 0) return
-    this.ticker = setInterval(() => this.tick(), 25)
-  }
-
-  private stopTicker() {
-    if (!this.ticker) return
-    clearInterval(this.ticker)
-    this.ticker = undefined
   }
 }
 
