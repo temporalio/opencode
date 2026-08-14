@@ -282,6 +282,7 @@ The ask is real, old, and largely unanswered publicly:
 
 | | A: language shim | B: rust-core shim | C: plugin pattern (incl. ADK-style fallback) | D: local dev server |
 |---|---|---|---|---|
+| What it is | reimplement the SDK API in the app's language so Temporal-shaped code runs with no server; the customer owns it | embed a real Temporal service in the SDK core behind `service_override`; one in-process backend under every language | the loop behind a small execution interface; a startup factory picks Temporal or in-process, same code both modes | bundle the real dev server binary next to the app, which starts and supervises it |
 | Durability (crash mid-turn) | partial: what the shim persists; faithful replay = reimplementing Temporal | full IF built (it IS an embedded service) | partial: checkpoint-file coarse; event-sourced local store near-full for one machine | full (with `--db-filename`; default is in-memory) |
 | Resource needs | lightest (in-process) | in-process; core carries matching+history | lightest (in-process; store is a file) | ~102-139 MB RSS second process, ~128 MiB disk (appliance archetype; not a desktop configuration) |
 | Signal/Update support | re-implemented, drift-prone | full IF built | the app's control surface (~a dozen verbs), honored identically by both modes | full |
