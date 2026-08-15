@@ -11,7 +11,7 @@ export * as SessionExecutionLocalDriver from "./local-driver"
 // shared drain and by the driver-contract test (session-execution-local-driver.test.ts), not by a
 // single shared loop. See packages/temporal/README.md "Two modes, one drain".
 
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Layer } from "effect"
 import { randomUUID } from "node:crypto"
 import { LocationServiceMap } from "../../location-service-map"
 import { EventV2 } from "../../event"
@@ -23,24 +23,7 @@ import { makeDrains } from "./drain"
 import { WorktreeMaterializer } from "./worktree"
 import { toRunError } from "./run-error-codec"
 
-const UNITS: Record<string, number> = {
-  ms: 1,
-  millisecond: 1,
-  milliseconds: 1,
-  second: 1_000,
-  seconds: 1_000,
-  minute: 60_000,
-  minutes: 60_000,
-  hour: 3_600_000,
-  hours: 3_600_000,
-}
-
-const parseDuration = (value: string): number => {
-  const match = /^\s*([\d.]+)\s*([a-z]+)\s*$/i.exec(value)
-  const unit = match?.[2] ? UNITS[match[2].toLowerCase()] : undefined
-  if (!match?.[1] || unit === undefined) throw new Error(`Unsupported duration: ${value}`)
-  return Number(match[1]) * unit
-}
+const parseDuration = (value: string): number => Duration.toMillis(Duration.fromInputUnsafe(value as Duration.Input))
 
 // A drain that is interrupted (by an explicit stop or the backstop) throws this. The drain body
 // rethrows the AbortSignal's reason on cancellation, so a cancelled drain and a stop both surface
