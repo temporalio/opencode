@@ -12,17 +12,16 @@ inside the engine, so a crashed turn resumes mid-step instead of being re-attach
 
 ## How it fits together
 
-One design decision carries the change: the step body -- where a bug would actually corrupt state
--- is written once, and each runtime gets a coordination loop written for it. Everything else here
-is a consequence of taking at-least-once execution seriously.
+One design decision carries the change: durability is a choice of executor behind the substitutable
+`SessionExecution` service, and both executors drive the same `SessionRunner` over the same durable
+event log. Everything else here is a consequence of taking at-least-once execution seriously.
 
-The shared drain (`drain.ts`) is one step of a turn: it claims the event log, ensures the worktree,
-runs `SessionRunner.runStep`, and encodes any failure faithfully. Two coordinators loop it. The
-Temporal driver (`workflow-core.ts` + `temporal-workflow.ts`) runs a per-session workflow with one
-activity per step. The default is a native in-process coordinator (`local-driver.ts`): a per-session
-async task over a mutex, a latch, and an AbortController -- no server, no worker, no ports. One env
-var picks the coordinator; the shared drain keeps turn semantics identical, and the driver-contract
-test keeps the two loops behaving alike (see [Two modes, one drain](#two-modes-one-drain)).
+One env var picks the executor. `temporal` runs each session as a per-session Temporal workflow with
+one activity per step (`workflow-core.ts` + `temporal.ts`). The default runs it in-process on the
+proven `SessionRunCoordinator` (`execution/local.ts`) -- the same lifecycle the v1 server uses -- with
+no server and no ports (see [Two modes, one runner](#two-modes-one-runner)). The coordinator owns the
+local wake/resume/interrupt lifecycle; the Temporal supervisor mirrors its semantics inside the
+workflow sandbox.
 
 That forces six things:
 
@@ -33,7 +32,7 @@ That forces six things:
    declared idempotent, and fails the rest for the model to redo. The step loop is bounded
    (`loop-guard.ts`: a step ceiling plus a repeated-identical-call detector), because a runaway
    turn would otherwise be a durable runaway turn
-   ([Two modes, one drain](#two-modes-one-drain)).
+   ([Two modes, one runner](#two-modes-one-runner)).
 3. **Two writers must be fenced.** A superseded attempt cannot keep appending to the log; each
    drain claims the log with an attempt token ([Notes](#notes)).
 4. **The worktree must travel.** Snapshot trees ship as incremental git packs, and a worker
@@ -90,28 +89,23 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
   the in-flight step activity (attempt 2), the run continues from the event log, and the workflow
   completes.
 
-### Two modes, one drain
+### Two modes, one runner
 
-The factory has exactly two modes. `OPENCODE_SESSION_EXECUTION=temporal` runs the Temporal
-supervisor (`workflow-core.ts`) on a worker; anything else (the default) runs a native in-process
-coordinator (`local-driver.ts`): no server, no worker, no ports, durability from the event log. The
-two are separate coordination loops written for their runtimes -- the local one is a per-session
-async task over a mutex, a latch, and an AbortController; the Temporal one is a workflow over the SDK
-primitives -- and they share exactly one thing: the step body (`drain.ts`). Local mode is its own
-product, not the Temporal loop behind a shim, because the loop is the low-risk half: the semantics
-that would corrupt state (log fencing, error encoding, tool re-drive) all live in the shared drain.
-Both loops drive the turn one **step** at a time: they loop a `runTurnStep` drain, so in temporal
-mode each step (one provider attempt + its tools) is its own activity with its own
-retry/timeout/visibility. Both reuse `SessionRunner.runStep` (one iteration of `run`'s loop), so the
-turn semantics are unchanged. Parity is enforced by the driver-contract suite
-(`packages/core/test/lib/session-execution-contract.ts`): one suite -- wake drives a turn then
-the idle coordinator retires, resume forces a healthy turn and surfaces the exact tagged RunError,
-interrupt cancels -- run against BOTH drivers. The local run is part of the normal test suite; the
-Temporal run is opt-in against a dev server (recipe in
-`packages/core/test/session-execution-temporal-contract.test.ts`) and passes the same four
-scenarios through real workflows. Verified: a create-then-read-then-reply turn recorded three `runTurnStep` activities
-under a `sessionTurn` workflow and completed. (Earlier whole-turn-per-activity, stock-coordinator, and
-shared-supervisor-via-shim modes were folded away.)
+The factory has exactly two modes, both driving the same `SessionRunner` over the same durable event
+log. `OPENCODE_SESSION_EXECUTION=temporal` runs each session as a per-session Temporal workflow: the
+`sessionTurn` supervisor (`workflow-core.ts`) loops a `runTurnStep` drain, so each step (one provider
+attempt + its tools) is its own activity with its own retry/timeout/visibility, reusing
+`SessionRunner.runStep` (one iteration of `run`'s loop). Anything else (the default) runs in-process
+on the proven `SessionRunCoordinator` (`execution/local.ts`) -- no server, no worker, no ports -- which
+drives whole turns with `SessionRunner.run` and owns the wake/resume/interrupt lifecycle. That
+coordinator is the same one the v1 server uses and has direct lifecycle tests
+(`session-run-coordinator.test.ts`), so the default path reuses well-exercised code rather than a
+second hand-written loop. The local integration wiring is covered by
+`session-execution-local.test.ts`, and Temporal crash recovery by the crash test (in the
+stacked scripts PR). Verified:
+a create-then-read-then-reply turn recorded three `runTurnStep` activities under a `sessionTurn`
+workflow and completed. (Earlier whole-turn-per-activity, stock-coordinator, and shared-supervisor
+local modes were folded away in favor of the coordinator for local.)
 
 A per-step re-drive resumes from the durable event log rather than re-running work. `runStep` closes
 any tool left dangling by an interrupted attempt on every entry, not just the first. Without that, a

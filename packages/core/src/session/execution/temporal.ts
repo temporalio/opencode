@@ -44,9 +44,10 @@ const HOST_CLIENT = ROLE !== "worker"
  *   - interrupt -> signal(interrupt)       (cancels the workflow's scope -> aborts the drain)
  *   - active    -> the set of sessions this process has started
  *
- * The drain itself (SessionRunner.run for the whole turn) is exactly the local coordinator's body,
- * run inside a Temporal activity. Because turn state lives in the durable event log, a worker crash
- * is recovered by re-running the activity: it re-reads recorded history and continues.
+ * The drain runs one step (SessionRunner.runStep) inside a Temporal activity, looped by the
+ * workflow. Because turn state lives in the durable event log, a worker crash is recovered by
+ * re-running the activity: it re-reads recorded history and continues. (Local mode instead drives
+ * whole turns with SessionRunner.run on the SessionRunCoordinator; both share SessionRunner.)
  */
 const layer = Layer.effect(
   SessionExecution.Service,
@@ -59,14 +60,9 @@ const layer = Layer.effect(
     const events = yield* EventV2.Service
     const worktrees = yield* WorktreeMaterializer.Service
 
-    // The drain bodies are shared with the native in-process coordinator (local-driver.ts), so turn
-    // semantics and error encoding cannot differ between modes even though the loops differ.
+    // The per-step drain (drain.ts) wraps SessionRunner.runStep for the activity boundary. Local
+    // mode runs whole turns through SessionRunner.run on the coordinator; both share SessionRunner.
     const { stepDrain } = makeDrains({ store, locations, ctx, events, worktrees })
-
-    // Same knob local mode honors. The workflow sandbox cannot read env, so the client forwards the
-    // override as a workflow argument. Read at layer build (not module load) so tests can set it
-    // before constructing the layer.
-    const IDLE_TIMEOUT = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
 
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
@@ -133,7 +129,7 @@ const layer = Layer.effect(
         client.workflow.signalWithStart(WORKFLOW_TYPE, {
           taskQueue: TASK_QUEUE,
           workflowId: workflowId(id),
-          args: [id, IDLE_TIMEOUT],
+          args: [id],
           signal: WF.wake,
           signalArgs: [],
         }),
@@ -181,7 +177,7 @@ const layer = Layer.effect(
               const startOp = new WithStartWorkflowOperation(WORKFLOW_TYPE, {
                 taskQueue: TASK_QUEUE,
                 workflowId: workflowId(id),
-                args: [id, IDLE_TIMEOUT],
+                args: [id],
                 workflowIdConflictPolicy: "USE_EXISTING",
               })
               return client.workflow.executeUpdateWithStart(WF.resume, {

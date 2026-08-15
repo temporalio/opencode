@@ -1,6 +1,8 @@
-// The drain body shared by both coordinators: the Temporal layer runs it inside an activity, the
-// native in-process coordinator (local-driver.ts) calls it directly. One implementation, so the
-// turn semantics and the error encoding cannot differ between modes even though the loops differ.
+// The per-step drain body for the Temporal layer: it runs inside the runTurnStep activity. It wraps
+// one SessionRunner.runStep, claims the event log for the attempt, ensures the worktree, and encodes
+// the error for the activity boundary. Local mode does not use this: it runs whole turns through
+// SessionRunner.run on the SessionRunCoordinator (execution/local.ts). Both modes go through the
+// same SessionRunner and the same durable event log.
 
 import { Cause, Context, Effect, Exit, type LayerMap } from "effect"
 import { ApplicationFailure } from "@temporalio/activity"
