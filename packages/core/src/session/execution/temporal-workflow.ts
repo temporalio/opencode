@@ -39,7 +39,9 @@ export const interrupt = defineSignal("interrupt")
 export const resume = defineUpdate<void>("resume")
 const signals = { wake, interrupt } as const
 
-const runtime: WorkflowRuntime = {
+// The runtime is built per invocation so a continue-as-new run keeps the same idle override; the
+// sandbox cannot read env, so the override arrives as a workflow argument from the client.
+const makeRuntime = (idleTimeout?: string): WorkflowRuntime => ({
   condition: async (predicate, timeout) => {
     if (timeout === undefined) {
       await condition(predicate)
@@ -53,11 +55,10 @@ const runtime: WorkflowRuntime = {
   runTurnStep,
   cancelCurrentScope: () => CancellationScope.current().cancel(),
   isCancellation,
-  continueAsNew: (sessionID) => continueAsNew<(id: string) => Promise<void>>(sessionID),
-}
+  continueAsNew: (sessionID) =>
+    continueAsNew<(id: string, idleTimeout?: string) => Promise<void>>(sessionID, idleTimeout),
+})
 
-const workflows = makeWorkflows(runtime)
-
-export async function sessionTurn(sessionID: string): Promise<void> {
-  return workflows.sessionTurn(sessionID)
+export async function sessionTurn(sessionID: string, idleTimeout?: string): Promise<void> {
+  return makeWorkflows(makeRuntime(idleTimeout), idleTimeout ? { idleTimeout } : undefined).sessionTurn(sessionID)
 }
