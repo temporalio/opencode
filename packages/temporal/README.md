@@ -79,15 +79,13 @@ OPENAI_API_KEY=... OPENCODE_SESSION_EXECUTION=temporal TEMPORAL_ADDRESS=127.0.0.
 ```
 
 Create a session and prompt it against `POST /api/session` and `POST /api/session/:id/prompt`; each
-session runs as a Temporal workflow `session-exec-<sessionID>`. Or run the whole thing in one
-command: `packages/temporal/scripts/demo-tmux.sh` starts the dev server, serve, and a driver in
-tmux panes, prompts a session, and prints the reply with the workflow behind it.
+session runs as a Temporal workflow `session-exec-<sessionID>`.
 
 ### Verified
 
 - With Temporal execution on, prompting a v2 session drove a full turn to completion (`step.ended`,
   `TEMPORAL_V2_OK`), recorded as a completed per-session workflow.
-- Engine-level crash recovery (`scripts/v2-crash-test.sh`): killing the whole server (with its
+- Engine-level crash recovery: killing the whole server (with its
   embedded worker) mid-turn, then restarting, still completes the turn. Temporal re-drives
   the in-flight step activity (attempt 2), the run continues from the event log, and the workflow
   completes.
@@ -151,7 +149,7 @@ later. Verified by `packages/core/test/session-runner-resume.test.ts`.
   attempt, so it stays out of the workflow's deterministic input; the local driver uses a
   per-instance token. The projector's status guards still make any duplicate settlement a no-op.
 
-`scripts/resume-check.ts` verifies resume: it resolves on a healthy session and rejects on a failing
+Resume is verified end to end: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
 
 ### Running workers separately
@@ -172,7 +170,7 @@ OPENCODE_TEMPORAL_ROLE=worker OPENCODE_SESSION_EXECUTION=temporal \
 
 `packages/server/src/worker.ts` builds the same application context serve uses (`createWorkerLayer`)
 without the HTTP API, so a worker resumes a session purely from the shared store.
-`scripts/standalone-worker-smoke.sh` verifies a worker comes up with no serve process and registers
+Verified: a worker comes up with no serve process and registers
 on the task queue. Caveat: file-touching tools run against the local working tree, so a worker must
 have the session's worktree present (see "What resumes cross-host").
 
@@ -210,7 +208,7 @@ and any worker resumes any session: Temporal load-balances `runTurnStep` across 
   `SqlClient` over `@libsql/client`; it speaks the same SQLite dialect, so the schema and all
   migrations are unchanged. Selection is one env check in `database.ts`.
 
-`scripts/shared-store-failover.sh` verifies it: worker A handles turn 1 (a code word), A is killed,
+Verified: worker A handles turn 1 (a code word), A is killed,
 and a fresh worker B (same queue, same store, never saw the session) handles turn 2 and recalls the
 code word, which it can only do by loading turn 1 from the shared store. The two turns run on two
 distinct worker identities.
