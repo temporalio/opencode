@@ -40,6 +40,16 @@
     }
   },
   "devDependencies": {
+    "@opencode-ai/http-recorder": "workspace:*",
+    "@parcel/watcher-darwin-arm64": "2.5.1",
+    "@parcel/watcher-darwin-x64": "2.5.1",
+    "@parcel/watcher-linux-arm64-glibc": "2.5.1",
+    "@parcel/watcher-linux-arm64-musl": "2.5.1",
+    "@parcel/watcher-linux-x64-glibc": "2.5.1",
+    "@parcel/watcher-linux-x64-musl": "2.5.1",
+    "@parcel/watcher-win32-arm64": "2.5.1",
+    "@parcel/watcher-win32-x64": "2.5.1",
+    "@temporalio/testing": "1.21.1",
     "@tsconfig/bun": "catalog:",
     "@types/bun": "catalog:",
     "@types/cross-spawn": "catalog:",
@@ -49,15 +59,6 @@
     "@types/semver": "catalog:",
     "@types/turndown": "5.0.5",
     "@types/which": "3.0.4",
-    "@parcel/watcher-darwin-arm64": "2.5.1",
-    "@parcel/watcher-darwin-x64": "2.5.1",
-    "@parcel/watcher-linux-arm64-glibc": "2.5.1",
-    "@parcel/watcher-linux-arm64-musl": "2.5.1",
-    "@parcel/watcher-linux-x64-glibc": "2.5.1",
-    "@parcel/watcher-linux-x64-musl": "2.5.1",
-    "@parcel/watcher-win32-arm64": "2.5.1",
-    "@parcel/watcher-win32-x64": "2.5.1",
-    "@opencode-ai/http-recorder": "workspace:*",
     "drizzle-kit": "catalog:"
   },
   "dependencies": {
