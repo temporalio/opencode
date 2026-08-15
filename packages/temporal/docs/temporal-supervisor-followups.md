@@ -1,83 +1,61 @@
-# Temporal supervisor: follow-ups
+# Temporal supervisor: status and follow-ups
 
-Independent review (Codex, several rounds) enumerated correctness issues in the Temporal-mode
-session supervisor (`packages/core/src/session/execution/workflow-core.ts` + `temporal.ts`). Local
-mode is unaffected: it runs the proven `SessionRunCoordinator` (`execution/local.ts`).
+Independent review (Codex, several rounds) enumerated correctness issues in the Temporal-mode session
+supervisor (`packages/core/src/session/execution/workflow-core.ts` + `temporal-workflow.ts` +
+`temporal.ts`). Local mode is unaffected: it runs the proven `SessionRunCoordinator`
+(`execution/local.ts`).
 
-A deterministic test harness now exists for this code
-(`packages/core/test/temporal-harness-smoke.test.ts`, `@temporalio/testing` time-skipping running the
-real workflow with a mock activity), plus fake-runtime unit tests of the supervisor loop. Every item
-below is reproducible/verifiable through one of those.
+A deterministic test harness now exists for this code: fake-runtime unit tests of the supervisor loop
+(`session-supervisor.test.ts`, `session-supervisor-rollover.test.ts`) and real-Temporal tests via
+`@temporalio/testing` (`temporal-harness-{smoke,interrupt,multiturn}.test.ts`). Every item below is
+reproducible/verifiable through one of those.
 
 ## Fixed
 
-- **Blocker: workflow never drained a turn.** On `@temporalio/workflow` 1.21, `condition(fn, timeout)`
-  with `fn` already true left the `CancellationScope` cancelled, so the next `condition()` threw and
-  the workflow completed with zero activities. Fixed by short-circuiting an already-true predicate in
-  the `condition` adapter (`temporal-workflow.ts`). This was the real cause of the "0 activities /
-  turn never runs" symptom (not the HTTP `steer` delivery).
+- **Blocker: the workflow never drained a turn (and a session could serve only one turn).** On
+  `@temporalio/workflow` 1.21, `condition(fn, timeout)` cancels its internal timer scope on resolve
+  and that cancellation LEAKS into the parent/root scope, so the next `condition()`/drain saw a
+  cancelled scope. The supervisor completed with zero activities, or (after the first turn) a second
+  turn's drain was born cancelled. Fixed by not using the SDK's timed `condition` at all: the adapter
+  short-circuits an already-true predicate and, for a real wait, races a no-timeout `condition`
+  against a bare `sleep` and abandons the loser -- cancelling no scope, so nothing leaks. (This, not
+  the HTTP `steer` delivery, was the real cause of the "0 activities" symptom.)
+- **Resume/wake lost at the interrupt boundary.** `interrupt` used to end the workflow, so a
+  resume/wake admitted in the interrupt→completion window (USE_EXISTING) attached to a doomed run.
+  Now `interrupt` cancels only the current turn's child cancellation scope (`runInDrainScope`); the
+  long-lived workflow keeps serving, and a later wake/resume drives a fresh turn on the same
+  workflow. Verified: `temporal-harness-interrupt.test.ts`.
+- **Concurrent resumes duplicated forced turns.** `drainTurn` serialized but did not JOIN. Now every
+  drain routes through one in-flight promise and resume joins it (no duplicate provider turns / tool
+  side effects), mirroring `SessionRunCoordinator.run`.
+- **Fresh-resume spurious drain.** Explicit start intent: `sessionTurn(sessionID, startWithWake)`,
+  resume-with-start passes `[id, false]`, and `pendingWake` is carried across `continueAsNew`, so a
+  fresh resume does exactly one drain.
+- **continue-as-new ignored resume drains / manufactured a wake.** Every drain now counts toward the
+  bound, the main loop rolls over on `rolloverPending`, a resume-driven rollover carries no spurious
+  wake, and completion/continue-as-new gate on `allHandlersFinished()` so an in-flight update result
+  is never abandoned.
+- **Real workflow (root) cancellation.** Detected via the root scope's `consideredCancelled`
+  (reliable now that the timed wait cancels no scope): a root cancellation stops the supervisor and
+  never keeps serving or continue-as-news; a per-turn interrupt (child scope) does not trip it.
 - **Owner-token collision (event-log fence).** Token was `runId#attempt`; activity attempts restart
   per step, so tokens repeated across steps and a zombie attempt could re-authorize. Now
   `runId:activityId:attempt` (`temporal-activities.ts`).
 - **Interrupt delivery failure reported as success.** A genuine signal failure was swallowed to
   `void`; now surfaced as a defect (`temporal.ts`, `classifyInterruptError`).
-- **continue-as-new ignored resume drains.** Only wake-loop drains counted toward the bound, so a
-  resume-heavy workflow grew history without rolling over. Now every drain counts and the main loop
-  rolls over on `rolloverPending` (`workflow-core.ts`).
 
-## Open (deep coordination pass — interlocking, do together)
+## Remaining follow-ups (not correctness bugs on a fresh deployment)
 
-These three entangle (start intent ↔ continue-as-new state ↔ resume join ↔ interrupt generations),
-so they are best done as one coherent supervisor pass, mirroring `SessionRunCoordinator`'s proven
-semantics, rather than piecemeal.
-
-### 1. Resume/wake lost at the interrupt boundary (critical)
-
-`interrupt` sets `stopping` and cancels the workflow's scope; `drainTurn` then returns without a
-successor, and the `resume` update handler ignores `stopping`. With `USE_EXISTING`, a resume admitted
-after the interrupt attaches to the doomed workflow and is cancelled/abandoned instead of awaiting a
-successor; a wake in the same window is dropped. Reference: `run-coordinator.ts` `run` (stopping
-branch awaits cleanup then starts a successor) and `settle` (a wake during cleanup starts a
-successor).
-
-Fix sketch: keep the workflow root alive and cancel a per-drain `CancellationScope` instead; model
-`running → stopping → retired` generations explicitly; a resume while stopping awaits cleanup then
-forces exactly one successor; a wake while stopping registers one non-forced successor. Consider
-making `interrupt` an Update so it acknowledges only after cleanup.
-
-Test: harness — start, `interrupt`, then `executeUpdateWithStart(resume)`; assert it runs on a
-successor rather than receiving cancellation.
-
-### 2. Concurrent resumes serialize into duplicate forced turns (critical)
-
-Each `resume` handler calls `drainTurn(true)` independently; `drainTurn` serializes on `draining` but
-does not JOIN the active drain. Two concurrent resumes (or a resume during a wake drain) therefore
-produce two forced drains, and a forced first step bypasses the "no eligible work" check
-(`runner/llm.ts`) and calls the provider anyway — duplicate provider turns, charges, transcript
-entries, tool side effects. Reference: `run-coordinator.ts` `run` joins the existing `done`.
-
-Fix sketch: route all drains through a single in-flight promise; resume joins it (or forces one only
-when idle). A wake that only joins a resume-started drain must still get one follow-up drain (the
-`joined` re-arm). Both were prototyped earlier and unit-tested with a fake runtime; fold into the
-generation pass.
-
-Test: harness — two concurrent `resume`s → assert exactly one `runTurnStep` activity.
-
-### 3. Fresh-resume spurious drain (medium)
-
-The supervisor always starts `pendingWake = true`, but a resume-with-start carries no wake, so a
-fresh resume does its forced drain AND a second, no-op wake drain (extra activity/history; not
-incorrect). Coupled to continue-as-new: the current `pendingWake = true` start is also what keeps a
-continued-as-new run from losing queued work, so fixing this needs explicit start intent threaded
-through the workflow args and `continueAsNew`.
-
-Fix sketch: start `pendingWake` from an explicit initial-intent arg (wake vs resume vs rollover);
-carry pending state across `continueAsNew` rather than manufacturing a wake every run.
-
-Test: harness — `executeUpdateWithStart(resume)` on a fresh workflow → assert exactly one drain.
-
-## Also noted (lower priority)
-
-- `active` (visibility query) reports an idle-but-parked workflow as running for the idle window; a
-  workflow query or search attribute exposing `pendingWake || draining || handlers > 0` would be
-  more accurate.
+- **Replay / versioning for rolling deploys.** This revision changes command-producing behavior
+  (single-flight resume, the timed wait no longer cancels a timer, `continueAsNew` carries a second
+  arg). A workflow already running under the OLD code can replay nondeterministically under the new
+  code. Before a rolling deploy, use Temporal Worker Versioning / patching or drain old executions. A
+  fresh deployment is unaffected.
+- **`active` reports idle-but-parked workflows.** The visibility query lists running `sessionTurn`
+  workflows, so a session that finished a turn but hasn't idled out yet still shows as active. A
+  workflow query or search attribute exposing `pendingWake || inFlight || resumers > 0` would be more
+  precise if the API needs it.
+- **Broader real-harness coverage.** The harness proves draining, idle retirement, interrupt
+  keep-serving, and park-then-wake. Concurrent real updates → one activity, resume-with-start → one
+  drain, and a real root-cancel-during-drain are covered at the fake-runtime level; promoting them to
+  the real harness would add belt-and-suspenders confidence.
