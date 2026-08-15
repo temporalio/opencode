@@ -38,8 +38,7 @@ That forces six things:
    drain claims the log with an attempt token ([Notes](#notes)).
 4. **The worktree must travel.** Snapshot trees ship as incremental git packs, and a worker
    without the project tree rebuilds it before the run
-   ([What resumes cross-host](#what-resumes-cross-host-and-what-does-not),
-   [docs/worktree-portability.md](docs/worktree-portability.md)).
+   ([What resumes cross-host](#what-resumes-cross-host-and-what-does-not)).
 5. **Human-in-the-loop must be durable.** A pending permission ask is a row in the shared store,
    answerable from any process, adopted by re-drives, expired when abandoned
    ([Durable permission asks](#durable-permission-asks)).
@@ -265,8 +264,8 @@ drain runs, a worker missing the session's directory rebuilds the worktree from 
 (`session/execution/worktree.ts`): uncommitted edits and untracked files included, checked out at
 the same absolute path it was captured at (a uniform fleet layout). Ignored files and dependencies
 are not captured, so a rebuilt tree may need an install step before `bash` behaves identically.
-[docs/worktree-portability.md](docs/worktree-portability.md) covers the design and the
-affinity/shared-volume alternatives that skip materialization latency on warm paths.
+Worker affinity or a shared volume skips the materialization latency on warm paths; the packs
+are the portable baseline that works with neither.
 
 Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
 
