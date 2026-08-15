@@ -53,9 +53,10 @@ export function createEmbeddedRoutes() {
 // Shared by the HTTP routes and the standalone worker entrypoint (src/worker.ts) so both build the
 // exact same context.
 export function createServiceLayer() {
-  // The factory: two modes, one supervisor (workflow-core.ts). "temporal" runs it on a Temporal
-  // worker (one activity per step); anything else runs it in-process with no server
-  // (local-driver.ts). The loop, the drains, and the error codec are the same code either way.
+  // The factory: two modes, one drain (drain.ts). "temporal" loops the step drain on a Temporal
+  // worker (one activity per step); anything else loops it in a native in-process coordinator with
+  // no server (local-driver.ts). The loops differ by runtime; the drain and the error codec are the
+  // same code either way, and the driver-contract test keeps the loops behaving alike.
   const executionNode =
     process.env.OPENCODE_SESSION_EXECUTION === "temporal"
       ? SessionExecutionTemporal.node

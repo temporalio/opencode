@@ -1,8 +1,8 @@
-// The Temporal driver for the session supervisor. The supervisor itself lives in workflow-core.ts
-// and is written once; this file adapts the real SDK's primitives (condition, signal/update
-// handlers, activity proxies, cancellation) to the WorkflowRuntime interface and exports the
-// workflow function the worker registers. The in-process driver (local-driver.ts) runs the SAME
-// supervisor with plain promises.
+// The Temporal driver for the session supervisor. The supervisor loop lives in workflow-core.ts;
+// this file adapts the real SDK's primitives (condition, signal/update handlers, activity proxies,
+// cancellation) to the WorkflowRuntime interface and exports the workflow function the worker
+// registers. Local mode is a separate native coordinator (local-driver.ts); the two loops share
+// only the drain body, and the driver-contract test keeps them behaving alike.
 //
 // MUST stay sandbox-safe: Temporal bundles this in an isolated context, so no `effect`, no
 // `@opencode-ai/core` runtime imports, no Node builtins.
