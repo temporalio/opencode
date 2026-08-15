@@ -63,6 +63,11 @@ const layer = Layer.effect(
     // semantics and error encoding cannot differ between modes even though the loops differ.
     const { stepDrain } = makeDrains({ store, locations, ctx, events, worktrees })
 
+    // Same knob local mode honors. The workflow sandbox cannot read env, so the client forwards the
+    // override as a workflow argument. Read at layer build (not module load) so tests can set it
+    // before constructing the layer.
+    const IDLE_TIMEOUT = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
+
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
     if (HOST_WORKER) {
@@ -128,7 +133,7 @@ const layer = Layer.effect(
         client.workflow.signalWithStart(WORKFLOW_TYPE, {
           taskQueue: TASK_QUEUE,
           workflowId: workflowId(id),
-          args: [id],
+          args: [id, IDLE_TIMEOUT],
           signal: WF.wake,
           signalArgs: [],
         }),
@@ -176,7 +181,7 @@ const layer = Layer.effect(
               const startOp = new WithStartWorkflowOperation(WORKFLOW_TYPE, {
                 taskQueue: TASK_QUEUE,
                 workflowId: workflowId(id),
-                args: [id],
+                args: [id, IDLE_TIMEOUT],
                 workflowIdConflictPolicy: "USE_EXISTING",
               })
               return client.workflow.executeUpdateWithStart(WF.resume, {
