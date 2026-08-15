@@ -52,6 +52,11 @@ export const makeWorkflows = (rt: WorkflowRuntime, options?: WorkflowOptions) =>
     let stopping = false
     let draining = false
     let handlers = 0
+    // Count EVERY drain (wake- and resume-driven) toward the continue-as-new bound. Counting only
+    // wake-loop drains let a resume-heavy session grow history without bound. `rolloverPending`
+    // lets the main loop trigger continue-as-new even when the drains came from resume handlers.
+    let drains = 0
+    let rolloverPending = false
 
     const drainTurn = async (force: boolean) => {
       // Serialize drains, like the coordinator (one owner fiber per session at a time). Re-check
@@ -63,6 +68,8 @@ export const makeWorkflows = (rt: WorkflowRuntime, options?: WorkflowOptions) =>
         if (!draining) break
       }
       draining = true
+      drains++
+      if (drains >= MAX_DRAINS_PER_RUN) rolloverPending = true
       try {
         let step = 1
         let promotion: string | null = null
@@ -99,11 +106,17 @@ export const makeWorkflows = (rt: WorkflowRuntime, options?: WorkflowOptions) =>
 
     // interrupt cancels the whole scope, so a cancellation can surface at the idle wait itself,
     // not just inside a drain; treat it as a normal stop rather than a failure.
-    let drains = 0
     try {
       for (;;) {
-        const gotWork = await rt.condition(() => pendingWake || stopping, IDLE_TIMEOUT)
+        // Wake on new work, a stop, OR a pending rollover (a resume drain may have crossed the
+        // bound while the main loop was parked). continue-as-new must be called from here, the
+        // workflow's main method -- never from an update handler.
+        const gotWork = await rt.condition(() => pendingWake || stopping || rolloverPending, IDLE_TIMEOUT)
         if (stopping) return
+        if (rt.continueAsNew && rolloverPending && !draining && handlers === 0) {
+          // A fresh run starts with a pending wake, so no queued work is lost across the boundary.
+          await rt.continueAsNew(sessionID)
+        }
         if (!gotWork) {
           // A wake can race the idle timer; without this re-check it would be dropped.
           if (pendingWake) continue
@@ -118,9 +131,6 @@ export const makeWorkflows = (rt: WorkflowRuntime, options?: WorkflowOptions) =>
           // wake tolerates run errors (the coordinator logs and moves on); only cancellation stops us.
           if (rt.isCancellation(e)) return
         }
-        drains++
-        if (rt.continueAsNew && drains >= MAX_DRAINS_PER_RUN && handlers === 0)
-          await rt.continueAsNew(sessionID)
       }
     } catch (e) {
       if (rt.isCancellation(e)) return
