@@ -9,7 +9,7 @@
 //   OPENCODE_CONTRACT_TEMPORAL=1 bun test --timeout 120000 test/session-execution-temporal-contract.test.ts
 //
 // Without the opt-in the file registers nothing, so a plain `bun test` stays server-free.
-import { makeExecutionFor, runContract } from "./lib/session-execution-contract"
+import { makeExecutionFor, runContract } from "@opencode-ai/core/session/execution/conformance"
 
 if (process.env.OPENCODE_CONTRACT_TEMPORAL === "1") {
   // One task queue per run: a stale worker from an earlier run against the same dev server would

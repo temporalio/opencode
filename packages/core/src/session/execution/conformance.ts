@@ -1,10 +1,10 @@
-// The SessionExecution driver-contract suite, parameterized over the driver factory. The Temporal
-// contract run (session-execution-temporal-contract.test.ts) registers these scenarios against real
-// workflows; local mode's SessionRunCoordinator wiring asserts the same verbs in its own suite
-// (session-execution-local.test.ts). The contract: wake drives a turn to settlement then the idle
-// executor retires, resume forces a healthy turn to completion, resume surfaces the exact tagged
-// RunError (through the same encode/decode path the Temporal boundary uses), and interrupt cancels
-// an in-flight turn and the session eventually leaves the active set.
+// The SessionExecution conformance suite: the executable definition of what an executor must do.
+// Any driver behind the SessionExecution seam registers the same scenarios through runContract; the
+// built-in local executor runs it in core's tests, and the Temporal executor runs it against real
+// workflows. The contract: wake drives a turn to settlement then the idle executor retires, resume
+// forces a healthy turn to completion, resume surfaces the exact tagged RunError (through the same
+// encode/decode path a process boundary uses), and interrupt cancels an in-flight turn and the
+// session eventually leaves the active set.
 import { LLMClient, type LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Database } from "@opencode-ai/core/database/database"
@@ -22,7 +22,7 @@ import { Snapshot } from "@opencode-ai/core/snapshot"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
-import type { SessionExecutionTemporal } from "@opencode-ai/core/session/execution/temporal"
+import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
 import { SessionRunnerModel, ModelNotSelectedError } from "@opencode-ai/core/session/runner/model"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { SessionTable } from "@opencode-ai/core/session/sql"
@@ -40,7 +40,7 @@ import { describe, expect } from "bun:test"
 import { realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { Cause, Context, DateTime, Effect, Exit, Layer, Stream } from "effect"
-import { testEffect } from "./effect"
+import { testEffect } from "../../testing/effect"
 
 // The per-location service build resolves the session directory on disk, so it must exist.
 const WORKSPACE = AbsolutePath.make(realpathSync(tmpdir()))
@@ -78,7 +78,7 @@ const countingModel = () => {
 // serve process builds it), with the model/LLM mocked. Any SessionExecution node with the standard
 // dependency set (the local coordinator, the Temporal driver) plugs in here.
 export const makeExecutionFor =
-  (node: typeof SessionExecutionTemporal.node) =>
+  (node: typeof SessionExecutionLocal.node) =>
   (stream: LLMClientShape["stream"], models = okModels) =>
     AppNodeBuilder.build(node, [
       [LayerNodePlatform.llmClient, mockClient(stream)],
@@ -188,11 +188,14 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
               return assistant?.type === "assistant" && Boolean(assistant.time.completed)
             })
             expect(requests).toHaveLength(1)
-            yield* until(exec.active, (active) => active.has(sessionID))
-            // Idle self-termination: the executor retires without an interrupt.
+            // Idle self-termination: the executor retires without an interrupt. How long a settled
+            // session lingers in `active` is the executor's business (the local coordinator retires
+            // on settlement, the Temporal workflow serves until its idle timeout); the contract only
+            // demands it eventually leaves.
             yield* until(exec.active, (active) => !active.has(sessionID))
           }),
         ),
+        60000,
       )
     }
 
@@ -213,6 +216,7 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
           const assistant = context.findLast((message) => message.type === "assistant")
           expect(assistant?.type === "assistant" && Boolean(assistant.time.completed)).toBe(true)
         }),
+        60000,
       )
     }
 
@@ -231,6 +235,7 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
           // the identical tagged instance in both modes.
           expect(error).toBeInstanceOf(ModelNotSelectedError)
         }),
+        60000,
       )
     }
 
@@ -252,6 +257,7 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
             yield* until(exec.active, (active) => !active.has(sessionID))
           }),
         ),
+        60000,
       )
     }
   })
