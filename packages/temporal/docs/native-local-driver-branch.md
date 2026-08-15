@@ -94,6 +94,10 @@ deployment.
 - **Rolling deploys need Temporal versioning/patching or draining old executions**, because the
   Temporal workflow's command sequence changed. Fresh deployments are unaffected. See the follow-ups
   doc.
-- The full HTTP-stack end-to-end (create + prompt via `opencode serve`) has an unrelated `steer`
-  prompt-delivery quirk in this checkout that predates the branch; it does not affect the automated
-  tests, which drive the engine directly.
+There is NO "steer prompt delivery" problem, contrary to an earlier mistaken note. `POST
+/api/session/:id/prompt` without an explicit `delivery` defaults to `"steer"` (`session.ts:366`);
+`steer` is a valid delivery that `SessionRunner.run` handles (`llm.ts:425`, it interjects into / leads
+the current turn, versus `queue` which waits for the next turn). The "0 activities / turn never runs"
+symptom seen end-to-end was entirely the `condition(fn, timeout)` leak described above, not the
+delivery mode. With that fixed, a default (`steer`) prompt drives a turn to completion in Temporal
+mode (verified live: assistant reply recorded, one `runTurnStep` activity).
