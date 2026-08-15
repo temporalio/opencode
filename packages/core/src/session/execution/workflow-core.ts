@@ -1,8 +1,9 @@
-// The session supervisor, written ONCE, over a six-primitive runtime interface. Two drivers
-// execute it: the Temporal workflow adapter (temporal-workflow.ts; the real SDK provides the
-// primitives, activities carry the drains) and the in-process micro-driver (local-driver.ts; plain
-// promises provide the primitives, the drains run directly). The supervisor cannot drift between
-// modes because there is only one of it.
+// The Temporal driver's session supervisor, expressed over a six-primitive runtime interface so it
+// can be unit-tested off a live cluster. The Temporal workflow adapter (temporal-workflow.ts) is
+// the only caller: the real SDK provides the primitives and activities carry the drains. Local mode
+// does NOT run this loop -- it is a native coordinator (local-driver.ts) that shares only the drain
+// body (drain.ts). The two loops are held to one behavior by the driver-contract test, not by being
+// one function; see packages/temporal/README.md "Two modes, one drain".
 //
 // MUST stay pure: the Temporal driver bundles this into the workflow sandbox, so no `effect`, no
 // `@opencode-ai/core` runtime imports, no Node builtins. Type-only imports are erased and safe.

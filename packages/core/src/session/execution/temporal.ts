@@ -59,8 +59,8 @@ const layer = Layer.effect(
     const events = yield* EventV2.Service
     const worktrees = yield* WorktreeMaterializer.Service
 
-    // The drain bodies are shared with the in-process micro-driver (drain.ts), so turn semantics
-    // and error encoding cannot differ between drivers.
+    // The drain bodies are shared with the native in-process coordinator (local-driver.ts), so turn
+    // semantics and error encoding cannot differ between modes even though the loops differ.
     const { stepDrain } = makeDrains({ store, locations, ctx, events, worktrees })
 
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in

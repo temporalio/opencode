@@ -12,15 +12,17 @@ inside the engine, so a crashed turn resumes mid-step instead of being re-attach
 
 ## How it fits together
 
-One design decision carries the change: the session supervisor is written once, and durability is
-a choice of driver. Everything else here is a consequence of taking at-least-once execution
-seriously.
+One design decision carries the change: the step body -- where a bug would actually corrupt state
+-- is written once, and each runtime gets a coordination loop written for it. Everything else here
+is a consequence of taking at-least-once execution seriously.
 
-The supervisor (`workflow-core.ts`) drives a session over six runtime primitives. The Temporal
-driver runs it as a per-session workflow with one activity per step; the in-process micro-driver
-(`local-driver.ts`) runs the same function over plain promises. One env var picks the driver, and
-the shared drain bodies keep turn semantics identical in both modes (see
-[Two modes, one supervisor](#two-modes-one-supervisor)).
+The shared drain (`drain.ts`) is one step of a turn: it claims the event log, ensures the worktree,
+runs `SessionRunner.runStep`, and encodes any failure faithfully. Two coordinators loop it. The
+Temporal driver (`workflow-core.ts` + `temporal-workflow.ts`) runs a per-session workflow with one
+activity per step. The default is a native in-process coordinator (`local-driver.ts`): a per-session
+async task over a mutex, a latch, and an AbortController -- no server, no worker, no ports. One env
+var picks the coordinator; the shared drain keeps turn semantics identical, and the driver-contract
+test keeps the two loops behaving alike (see [Two modes, one drain](#two-modes-one-drain)).
 
 That forces six things:
 
@@ -31,7 +33,7 @@ That forces six things:
    declared idempotent, and fails the rest for the model to redo. The step loop is bounded
    (`loop-guard.ts`: a step ceiling plus a repeated-identical-call detector), because a runaway
    turn would otherwise be a durable runaway turn
-   ([Two modes, one supervisor](#two-modes-one-supervisor)).
+   ([Two modes, one drain](#two-modes-one-drain)).
 3. **Two writers must be fenced.** A superseded attempt cannot keep appending to the log; each
    drain claims the log with an attempt token ([Notes](#notes)).
 4. **The worktree must travel.** Snapshot trees ship as incremental git packs, and a worker
@@ -91,18 +93,26 @@ tmux panes, prompts a session, and prints the reply with the workflow behind it.
   the in-flight step activity (attempt 2), the run continues from the event log, and the workflow
   completes.
 
-### Two modes, one supervisor
+### Two modes, one drain
 
-The factory has exactly two modes. `OPENCODE_SESSION_EXECUTION=temporal` runs the session
-supervisor on a Temporal worker; anything else (the default) runs the SAME supervisor in-process
-with the micro-driver (`workflow-core.ts` + `local-driver.ts`): no server, no worker, no ports,
-durability from the event log. Both modes drive the turn one **step** at a time: the `sessionTurn`
-supervisor loops a `runTurnStep` drain, so in temporal mode each step (one provider attempt + its
-tools) is its own activity with its own retry/timeout/visibility. It reuses `SessionRunner.runStep`
-(one iteration of `run`'s loop), so the turn semantics are unchanged. Verified: a
-create-then-read-then-reply turn recorded three `runTurnStep` activities under a `sessionTurn`
-workflow and completed. (Earlier whole-turn-per-activity and stock-coordinator modes were folded
-away.)
+The factory has exactly two modes. `OPENCODE_SESSION_EXECUTION=temporal` runs the Temporal
+supervisor (`workflow-core.ts`) on a worker; anything else (the default) runs a native in-process
+coordinator (`local-driver.ts`): no server, no worker, no ports, durability from the event log. The
+two are separate coordination loops written for their runtimes -- the local one is a per-session
+async task over a mutex, a latch, and an AbortController; the Temporal one is a workflow over the SDK
+primitives -- and they share exactly one thing: the step body (`drain.ts`). Local mode is its own
+product, not the Temporal loop behind a shim, because the loop is the low-risk half: the semantics
+that would corrupt state (log fencing, error encoding, tool re-drive) all live in the shared drain.
+Both loops drive the turn one **step** at a time: they loop a `runTurnStep` drain, so in temporal
+mode each step (one provider attempt + its tools) is its own activity with its own
+retry/timeout/visibility. Both reuse `SessionRunner.runStep` (one iteration of `run`'s loop), so the
+turn semantics are unchanged. Parity is enforced by the driver-contract test
+(`packages/core/test/session-execution-local-driver.test.ts`): one suite -- wake drives a turn then
+the idle coordinator retires, resume forces a healthy turn and surfaces the exact tagged RunError,
+interrupt cancels -- parameterized over the coordinator factory so the same behaviors can be asserted
+against Temporal. Verified: a create-then-read-then-reply turn recorded three `runTurnStep` activities
+under a `sessionTurn` workflow and completed. (Earlier whole-turn-per-activity, stock-coordinator, and
+shared-supervisor-via-shim modes were folded away.)
 
 A per-step re-drive resumes from the durable event log rather than re-running work. `runStep` closes
 any tool left dangling by an interrupted attempt on every entry, not just the first. Without that, a
