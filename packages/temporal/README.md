@@ -106,11 +106,13 @@ that would corrupt state (log fencing, error encoding, tool re-drive) all live i
 Both loops drive the turn one **step** at a time: they loop a `runTurnStep` drain, so in temporal
 mode each step (one provider attempt + its tools) is its own activity with its own
 retry/timeout/visibility. Both reuse `SessionRunner.runStep` (one iteration of `run`'s loop), so the
-turn semantics are unchanged. Parity is enforced by the driver-contract test
-(`packages/core/test/session-execution-local-driver.test.ts`): one suite -- wake drives a turn then
+turn semantics are unchanged. Parity is enforced by the driver-contract suite
+(`packages/core/test/lib/session-execution-contract.ts`): one suite -- wake drives a turn then
 the idle coordinator retires, resume forces a healthy turn and surfaces the exact tagged RunError,
-interrupt cancels -- parameterized over the coordinator factory so the same behaviors can be asserted
-against Temporal. Verified: a create-then-read-then-reply turn recorded three `runTurnStep` activities
+interrupt cancels -- run against BOTH drivers. The local run is part of the normal test suite; the
+Temporal run is opt-in against a dev server (recipe in
+`packages/core/test/session-execution-temporal-contract.test.ts`) and passes the same four
+scenarios through real workflows. Verified: a create-then-read-then-reply turn recorded three `runTurnStep` activities
 under a `sessionTurn` workflow and completed. (Earlier whole-turn-per-activity, stock-coordinator, and
 shared-supervisor-via-shim modes were folded away.)
 
