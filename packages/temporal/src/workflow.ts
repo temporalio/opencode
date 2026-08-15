@@ -20,6 +20,7 @@ import {
   allHandlersFinished,
 } from "@temporalio/workflow"
 import type { StepActivities } from "./activities"
+import { SIGNALS, RESUME_UPDATE } from "./protocol"
 import { makeWorkflows, type WorkflowRuntime } from "./supervisor"
 
 const activityOptions = {
@@ -36,9 +37,9 @@ const activityOptions = {
 
 const { runTurnStep } = proxyActivities<StepActivities>(activityOptions)
 
-export const wake = defineSignal("wake")
-export const interrupt = defineSignal("interrupt")
-export const resume = defineUpdate<void>("resume")
+export const wake = defineSignal(SIGNALS.wake)
+export const interrupt = defineSignal(SIGNALS.interrupt)
+export const resume = defineUpdate<void>(RESUME_UPDATE)
 const signals = { wake, interrupt } as const
 
 const runtime: WorkflowRuntime = {
