@@ -54,7 +54,8 @@ export function createEmbeddedRoutes() {
 // exact same context.
 export function createServiceLayer() {
   // The factory: two modes. "temporal" runs each session as a per-step Temporal workflow
-  // (execution/temporal.ts); anything else runs it in-process on the proven SessionRunCoordinator
+  // (@opencode-ai/temporal, wired here as one dependency); anything else runs it in-process on the
+  // proven SessionRunCoordinator
   // (execution/local.ts) -- no server, no ports. Both drive SessionRunner over the same durable
   // event log; the local coordinator owns the wake/resume/interrupt lifecycle and is shared with
   // the v1 server path, so it is the well-exercised default.
