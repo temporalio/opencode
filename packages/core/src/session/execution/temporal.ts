@@ -47,10 +47,11 @@ const HOST_CLIENT = ROLE !== "worker"
 
 /**
  * A Temporal-backed SessionExecution. It makes each session a durable workflow:
- *   - wake      -> signalWithStart(wake)   (start while idle, or coalesce into the running run)
- *   - resume    -> signalWithStart(force)  (force one drain even with no eligible input)
- *   - interrupt -> signal(interrupt)       (cancels the workflow's scope -> aborts the drain)
- *   - active    -> the set of sessions this process has started
+ *   - wake      -> signalWithStart(wake)             (start while idle, or coalesce into the run)
+ *   - resume    -> executeUpdateWithStart(resume)    (force one drain and await its result)
+ *   - interrupt -> signal(interrupt)                 (cancels the current turn's drain scope; the
+ *                                                      workflow keeps serving later wakes/resumes)
+ *   - active    -> the running per-session workflows (visibility-backed)
  *
  * The drain runs one step (SessionRunner.runStep) inside a Temporal activity, looped by the
  * workflow. Because turn state lives in the durable event log, a worker crash is recovered by
@@ -185,7 +186,10 @@ const layer = Layer.effect(
               const startOp = new WithStartWorkflowOperation(WORKFLOW_TYPE, {
                 taskQueue: TASK_QUEUE,
                 workflowId: workflowId(id),
-                args: [id],
+                // startWithWake=false: a fresh resume-with-start must not manufacture a wake drain;
+                // its forced drain comes from the resume update. Ignored when USE_EXISTING joins a
+                // running workflow (which keeps its own state).
+                args: [id, false],
                 workflowIdConflictPolicy: "USE_EXISTING",
               })
               return client.workflow.executeUpdateWithStart(WF.resume, {
