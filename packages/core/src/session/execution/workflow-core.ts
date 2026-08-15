@@ -1,9 +1,8 @@
-// The Temporal driver's session supervisor, expressed over a six-primitive runtime interface so it
-// can be unit-tested off a live cluster. The Temporal workflow adapter (temporal-workflow.ts) is
-// the only caller: the real SDK provides the primitives and activities carry the drains. Local mode
-// does NOT run this loop -- it is a native coordinator (local-driver.ts) that shares only the drain
-// body (drain.ts). The two loops are held to one behavior by the driver-contract test, not by being
-// one function; see packages/temporal/README.md "Two modes, one drain".
+// The Temporal driver's per-session supervisor, expressed over a six-primitive runtime interface so
+// the SDK's condition/signals/updates/activities plug in (temporal-workflow.ts) and it can be
+// unit-tested off a live cluster. Local mode does NOT run this loop: it uses the proven
+// SessionRunCoordinator directly (execution/local.ts). The two modes share SessionRunner and the
+// durable event log, not this supervisor.
 //
 // MUST stay pure: the Temporal driver bundles this into the workflow sandbox, so no `effect`, no
 // `@opencode-ai/core` runtime imports, no Node builtins. Type-only imports are erased and safe.

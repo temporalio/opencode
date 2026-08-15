@@ -1,8 +1,8 @@
 // The Temporal driver for the session supervisor. The supervisor loop lives in workflow-core.ts;
 // this file adapts the real SDK's primitives (condition, signal/update handlers, activity proxies,
 // cancellation) to the WorkflowRuntime interface and exports the workflow function the worker
-// registers. Local mode is a separate native coordinator (local-driver.ts); the two loops share
-// only the drain body, and the driver-contract test keeps them behaving alike.
+// registers. Local mode does not use this loop -- it runs the proven SessionRunCoordinator directly
+// (execution/local.ts); the two modes share SessionRunner and the durable event log.
 //
 // MUST stay sandbox-safe: Temporal bundles this in an isolated context, so no `effect`, no
 // `@opencode-ai/core` runtime imports, no Node builtins.
@@ -39,9 +39,7 @@ export const interrupt = defineSignal("interrupt")
 export const resume = defineUpdate<void>("resume")
 const signals = { wake, interrupt } as const
 
-// The runtime is built per invocation so a continue-as-new run keeps the same idle override; the
-// sandbox cannot read env, so the override arrives as a workflow argument from the client.
-const makeRuntime = (idleTimeout?: string): WorkflowRuntime => ({
+const runtime: WorkflowRuntime = {
   condition: async (predicate, timeout) => {
     if (timeout === undefined) {
       await condition(predicate)
@@ -55,10 +53,11 @@ const makeRuntime = (idleTimeout?: string): WorkflowRuntime => ({
   runTurnStep,
   cancelCurrentScope: () => CancellationScope.current().cancel(),
   isCancellation,
-  continueAsNew: (sessionID) =>
-    continueAsNew<(id: string, idleTimeout?: string) => Promise<void>>(sessionID, idleTimeout),
-})
+  continueAsNew: (sessionID) => continueAsNew<(id: string) => Promise<void>>(sessionID),
+}
 
-export async function sessionTurn(sessionID: string, idleTimeout?: string): Promise<void> {
-  return makeWorkflows(makeRuntime(idleTimeout), idleTimeout ? { idleTimeout } : undefined).sessionTurn(sessionID)
+const workflows = makeWorkflows(runtime)
+
+export async function sessionTurn(sessionID: string): Promise<void> {
+  return workflows.sessionTurn(sessionID)
 }
