@@ -1,7 +1,7 @@
-// #4 regression: the continue-as-new bound must count EVERY drain, including resume-driven ones.
-// Counting only wake-loop drains let a resume-heavy workflow accumulate history without ever rolling
-// over. Driven with a fake WorkflowRuntime (no Temporal): a resume drain that crosses
-// maxDrainsPerRun must trigger continueAsNew from the main loop.
+// #4 regression: continue-as-new must count EVERY drain, including resume-driven ones (counting only
+// wake-loop drains let a resume-heavy workflow grow history without rolling over). Plus the fix for
+// the rollover-manufactures-a-wake bug: a rollover triggered by a resume drain must carry
+// startWithWake=false into the successor, not re-arm a spurious wake. Driven by a fake runtime.
 import { describe, it, expect } from "bun:test"
 import { makeWorkflows, type WorkflowRuntime } from "@opencode-ai/core/session/execution/workflow-core"
 import type { StepDrainResult } from "@opencode-ai/core/session/execution/temporal-activities"
@@ -13,6 +13,7 @@ const settle = () => new Promise((r) => setTimeout(r, 0))
 class FakeRuntime implements WorkflowRuntime {
   steps = 0
   continued = 0
+  continuedWith: boolean | undefined
   private waiters: { predicate: () => boolean; resolve: (b: boolean) => void }[] = []
   private updates = new Map<string, () => Promise<void>>()
 
@@ -27,10 +28,13 @@ class FakeRuntime implements WorkflowRuntime {
     this.steps++
     return DONE
   }
+  runInDrainScope = <A>(fn: () => Promise<A>) => fn()
   cancelCurrentScope = () => {}
   isCancellation = () => false // no interrupts in this test; continueAsNew propagates out
-  continueAsNew = async (): Promise<never> => {
+  isRootCancelled = () => false
+  continueAsNew = async (_sessionID: string, startWithWake: boolean): Promise<never> => {
     this.continued++
+    this.continuedWith = startWithWake
     throw new ContinuedAsNew()
   }
 
@@ -50,7 +54,7 @@ class FakeRuntime implements WorkflowRuntime {
 }
 
 describe("supervisor continue-as-new counting", () => {
-  it("counts a resume-driven drain toward the bound and rolls over from the main loop", async () => {
+  it("counts a resume-driven drain toward the bound and rolls over carrying no spurious wake", async () => {
     const rt = new FakeRuntime()
     // Bound of 2: the initial wake drain is #1; a single resume drain is #2 and must roll over.
     const supervisor = makeWorkflows(rt, { maxDrainsPerRun: 2 }).sessionTurn("ses_rollover")
@@ -66,6 +70,7 @@ describe("supervisor continue-as-new counting", () => {
     await settle()
     expect(rt.steps).toBe(2)
     expect(rt.continued).toBe(1) // continue-as-new fired because the resume drain was counted
+    expect(rt.continuedWith).toBe(false) // no wake was pending, so none is carried (no spurious drain)
     expect(ended).toBe(true)
   })
 })
