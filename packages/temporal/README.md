@@ -273,6 +273,21 @@ Host-local state that does NOT ride the DB, so it is not reconstructed on a diff
   the file. They only affect the diff/restore/revert features and full-output viewing. Point `${data}`
   (the XDG data dir) at shared storage to make them portable.
 
+## Verification scripts
+
+Runnable reproductions of the claims above, in `packages/temporal/scripts/`:
+
+- `demo-tmux.sh`: the whole demo in one command. It starts the dev server, serve, and a driver in
+  tmux panes, prompts a session, and prints the reply with the workflow behind it.
+- `v2-crash-test.sh`: kills the server (embedded worker included) mid-turn and shows the restart
+  completing the turn from the event log.
+- `resume-check.ts`: resume resolves on a healthy session and rejects on a failing one with the
+  original tagged error reconstructed across the boundary.
+- `standalone-worker-smoke.sh`: a worker comes up with no serve process and registers on the
+  task queue.
+- `shared-store-failover.sh`: worker A handles turn 1, dies, and a fresh worker B recalls turn 1's
+  code word, which it can only do by loading it from the shared store.
+
 ## Porting this pattern
 
 The shape transfers to any agent engine; Temporal is one executor behind a seam the engine owns.
