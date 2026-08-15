@@ -1,9 +1,10 @@
-// The SessionExecution driver-contract suite, parameterized over the driver factory. Each driver
-// (the in-process native coordinator, the Temporal workflow) registers the SAME scenarios through
-// runContract; this is what guarantees the modes agree now that they share only the drain, not one
-// loop. The contract: wake drives a turn to settlement then the idle coordinator retires, resume
-// forces a healthy turn to completion, resume surfaces the exact tagged RunError (through the same
-// encode/decode path the Temporal boundary uses), and interrupt cancels an in-flight turn.
+// The SessionExecution driver-contract suite, parameterized over the driver factory. The Temporal
+// contract run (session-execution-temporal-contract.test.ts) registers these scenarios against real
+// workflows; local mode's SessionRunCoordinator wiring asserts the same verbs in its own suite
+// (session-execution-local.test.ts). The contract: wake drives a turn to settlement then the idle
+// executor retires, resume forces a healthy turn to completion, resume surfaces the exact tagged
+// RunError (through the same encode/decode path the Temporal boundary uses), and interrupt cancels
+// an in-flight turn and the session eventually leaves the active set.
 import { LLMClient, type LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Database } from "@opencode-ai/core/database/database"
@@ -21,7 +22,7 @@ import { Snapshot } from "@opencode-ai/core/snapshot"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
-import { SessionExecutionLocalDriver } from "@opencode-ai/core/session/execution/local-driver"
+import type { SessionExecutionTemporal } from "@opencode-ai/core/session/execution/temporal"
 import { SessionRunnerModel, ModelNotSelectedError } from "@opencode-ai/core/session/runner/model"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { SessionTable } from "@opencode-ai/core/session/sql"
@@ -77,7 +78,7 @@ const countingModel = () => {
 // serve process builds it), with the model/LLM mocked. Any SessionExecution node with the standard
 // dependency set (the local coordinator, the Temporal driver) plugs in here.
 export const makeExecutionFor =
-  (node: typeof SessionExecutionLocalDriver.node) =>
+  (node: typeof SessionExecutionTemporal.node) =>
   (stream: LLMClientShape["stream"], models = okModels) =>
     AppNodeBuilder.build(node, [
       [LayerNodePlatform.llmClient, mockClient(stream)],
@@ -146,24 +147,37 @@ const until = <A, E>(read: Effect.Effect<A, E>, predicate: (value: A) => boolean
     }
   })
 
+// The idle override is read at the executor's layer build (the Temporal client forwards it as a
+// workflow argument), so it must be set before makeExec's layer is built and restored afterwards so
+// later layer builds in this process get the real default.
+const withIdleOverride = <A, E, R>(body: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const previous = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
+    process.env.OPENCODE_SESSION_IDLE_TIMEOUT = "2 seconds"
+    try {
+      return yield* body
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_SESSION_IDLE_TIMEOUT
+      else process.env.OPENCODE_SESSION_IDLE_TIMEOUT = previous
+    }
+  })
+
 // The SessionExecution contract, parameterized over the driver factory. `makeExec` builds a
 // SessionExecution graph the same way serve does, with the model/LLM mocked. Running the identical
 // suite against a second factory is how the two modes are held to one behavior now that they no
 // longer share a single coordination loop -- only the drain.
 export const runContract = (label: string, makeExec: ReturnType<typeof makeExecutionFor>) => {
-  const slug = label.replace(/[^a-z0-9]+/gi, "_")
+  // The nonce keeps workflow ids unique across runs: the Temporal driver derives durable workflow
+  // ids from session ids, and on a shared dev server USE_EXISTING would otherwise route this run's
+  // updates to a leftover workflow from an earlier one, parked on a task queue nobody polls.
+  const slug = `${label.replace(/[^a-z0-9]+/gi, "_")}_${crypto.randomUUID().slice(0, 8)}`
   describe(`SessionExecution contract: ${label}`, () => {
     {
       const { requests, stream } = countingModel()
       const sessionID = SessionV2.ID.make(`ses_${slug}_wake`)
-      it.live("wake drives a turn to settlement, then the idle coordinator retires", () =>
-        Effect.gen(function* () {
-          // Both drivers read this at layer build: the local coordinator directly, the Temporal
-          // client to forward it as a workflow argument. Restore it so later layer builds in this
-          // process get the real default.
-          const previousIdle = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
-          process.env.OPENCODE_SESSION_IDLE_TIMEOUT = "2 seconds"
-          try {
+      it.live("wake drives a turn to settlement, then the idle executor retires", () =>
+        withIdleOverride(
+          Effect.gen(function* () {
             yield* seedSession(sessionID)
             yield* seedPrompt(sessionID)
             const exec = Context.get(yield* Layer.build(makeExec(stream)), SessionExecution.Service)
@@ -175,13 +189,10 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
             })
             expect(requests).toHaveLength(1)
             yield* until(exec.active, (active) => active.has(sessionID))
-            // Idle self-termination: the coordinator retires without an interrupt.
+            // Idle self-termination: the executor retires without an interrupt.
             yield* until(exec.active, (active) => !active.has(sessionID))
-          } finally {
-            if (previousIdle === undefined) delete process.env.OPENCODE_SESSION_IDLE_TIMEOUT
-            else process.env.OPENCODE_SESSION_IDLE_TIMEOUT = previousIdle
-          }
-        }),
+          }),
+        ),
       )
     }
 
@@ -225,18 +236,22 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
 
     {
       const sessionID = SessionV2.ID.make(`ses_${slug}_interrupt`)
-      it.live("interrupt cancels an in-flight turn and the coordinator retires", () =>
-        Effect.gen(function* () {
-          yield* seedSession(sessionID)
-          yield* seedPrompt(sessionID)
-          // A model that never answers: the turn hangs until interrupted.
-          const exec = Context.get(yield* Layer.build(makeExec(() => Stream.never)), SessionExecution.Service)
-          yield* exec.wake(sessionID)
-          yield* Effect.sleep(200)
-          yield* until(exec.active, (active) => active.has(sessionID))
-          yield* exec.interrupt(sessionID)
-          yield* until(exec.active, (active) => !active.has(sessionID))
-        }),
+      it.live("interrupt cancels an in-flight turn and the session leaves the active set", () =>
+        withIdleOverride(
+          Effect.gen(function* () {
+            yield* seedSession(sessionID)
+            yield* seedPrompt(sessionID)
+            // A model that never answers: the turn hangs until interrupted.
+            const exec = Context.get(yield* Layer.build(makeExec(() => Stream.never)), SessionExecution.Service)
+            yield* exec.wake(sessionID)
+            yield* Effect.sleep(200)
+            yield* until(exec.active, (active) => active.has(sessionID))
+            yield* exec.interrupt(sessionID)
+            // The Temporal supervisor keeps serving after an interrupt (a racing wake/resume must
+            // not be lost); with nothing else queued it leaves the active set via idle retirement.
+            yield* until(exec.active, (active) => !active.has(sessionID))
+          }),
+        ),
       )
     }
   })

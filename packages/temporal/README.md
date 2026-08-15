@@ -102,7 +102,9 @@ coordinator is the same one the v1 server uses and has direct lifecycle tests
 (`session-run-coordinator.test.ts`), so the default path reuses well-exercised code rather than a
 second hand-written loop. The local integration wiring is covered by
 `session-execution-local.test.ts`, and Temporal crash recovery by the crash test (in the
-stacked scripts PR). Verified:
+stacked scripts PR). The same wake/resume/interrupt contract also runs against the Temporal driver
+through real workflows via the opt-in suite (`session-execution-temporal-contract.test.ts`).
+Verified:
 a create-then-read-then-reply turn recorded three `runTurnStep` activities under a `sessionTurn`
 workflow and completed. (Earlier whole-turn-per-activity, stock-coordinator, and shared-supervisor
 local modes were folded away in favor of the coordinator for local.)
