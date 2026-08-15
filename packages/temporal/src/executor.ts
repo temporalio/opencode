@@ -1,7 +1,7 @@
 export * as SessionExecutionTemporal from "./executor"
 
 import { fileURLToPath } from "node:url"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Option } from "effect"
 import { Client, Connection, WithStartWorkflowOperation } from "@temporalio/client"
 // Imported lazily inside the worker branch: the worker package drags webpack and swc (it bundles
 // the workflow from source at startup), which a compiled binary can neither bundle nor run. A
@@ -18,6 +18,8 @@ import { makeDrains } from "./drain"
 import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktree"
 import { toRunError } from "@opencode-ai/core/session/execution/run-error-codec"
 import * as WF from "./workflow"
+import { TemporalConfig } from "./config"
+import { WORKFLOW_TYPE, WORKFLOW_ID_PREFIX, workflowId } from "./protocol"
 
 // Classify an interrupt-signal delivery error. "already completed"/"not found" means an idle
 // session's workflow has already closed -- nothing to interrupt, a no-op. Anything else is a genuine
@@ -26,24 +28,6 @@ export function classifyInterruptError(e: unknown): "ignore" | "fail" {
   const message = String((e as { message?: unknown })?.message ?? e)
   return /already completed|not found/i.test(message) ? "ignore" : "fail"
 }
-
-const ADDRESS = process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7237"
-const NAMESPACE = process.env.TEMPORAL_NAMESPACE ?? "default"
-const TASK_QUEUE = process.env.OPENCODE_TEMPORAL_TASK_QUEUE ?? "opencode-session-exec"
-const workflowId = (id: string) => `session-exec-${id}`
-
-// One activity per step (the model call + its tools), with the step loop as workflow control flow.
-// Workflows start by the string type, never the function: a minified (packaged) client would
-// otherwise register the mangled function name as the type and no worker would match it.
-const WORKFLOW_TYPE = "sessionTurn"
-
-// Role split so the worker fleet can run separately from the HTTP server. `both` (default) hosts the
-// activity worker AND the workflow client in one process (the serve process). `client` makes serve
-// drive workflows without hosting a worker; `worker` runs a standalone activity worker with no HTTP
-// surface (see packages/server/src/worker.ts).
-const ROLE = process.env.OPENCODE_TEMPORAL_ROLE ?? "both"
-const HOST_WORKER = ROLE !== "client"
-const HOST_CLIENT = ROLE !== "worker"
 
 /**
  * A Temporal-backed SessionExecution. It makes each session a durable workflow:
@@ -66,10 +50,14 @@ const layer = Layer.effect(
     // The app context the local drain runs in: providing it, then the per-location layer, supplies
     // SessionRunner and all of its dependencies.
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
-    // Same knob local mode honors. The workflow sandbox cannot read env, so the client forwards the
-    // override as a workflow argument. Read at layer build (not module load) so tests can set it
-    // before constructing the layer.
-    const IDLE_TIMEOUT = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
+    // Provided by an embedder or a test, env otherwise; nothing is read at module load.
+    const config = Option.getOrElse(yield* Effect.serviceOption(TemporalConfig.Service), TemporalConfig.fromEnv)
+    const { address: ADDRESS, namespace: NAMESPACE, taskQueue: TASK_QUEUE } = config
+    const HOST_WORKER = config.role !== "client"
+    const HOST_CLIENT = config.role !== "worker"
+    // Same knob local mode honors; the workflow sandbox cannot read env, so the client forwards the
+    // override as a workflow argument.
+    const IDLE_TIMEOUT = config.idleTimeout
     const events = yield* EventV2.Service
     const worktrees = yield* WorktreeMaterializer.Service
 
@@ -113,13 +101,12 @@ const layer = Layer.effect(
       )
     }
 
-    const SESSION_PREFIX = "session-exec-"
 
     // Worker-only process: it hosts activities but drives no workflows, so the client methods are
     // unused. Return a service whose driving methods fail loudly if something unexpectedly calls them.
     if (!HOST_CLIENT) {
       yield* Effect.logInfo("SessionExecutionTemporal worker ready").pipe(
-        Effect.annotateLogs({ address: ADDRESS, taskQueue: TASK_QUEUE, workflow: WORKFLOW_TYPE, role: ROLE }),
+        Effect.annotateLogs({ address: ADDRESS, taskQueue: TASK_QUEUE, workflow: WORKFLOW_TYPE, role: config.role }),
       )
       const clientOnly = Effect.die("SessionExecution client is not hosted when OPENCODE_TEMPORAL_ROLE=worker")
       return SessionExecution.Service.of({
@@ -165,8 +152,8 @@ const layer = Layer.effect(
           for await (const wf of client.workflow.list({
             query: `WorkflowType = 'sessionTurn' AND ExecutionStatus = 'Running'`,
           })) {
-            if (wf.workflowId.startsWith(SESSION_PREFIX)) {
-              ids.push(SessionSchema.ID.make(wf.workflowId.slice(SESSION_PREFIX.length)))
+            if (wf.workflowId.startsWith(WORKFLOW_ID_PREFIX)) {
+              ids.push(SessionSchema.ID.make(wf.workflowId.slice(WORKFLOW_ID_PREFIX.length)))
             }
           }
           return ids
