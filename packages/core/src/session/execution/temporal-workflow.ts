@@ -40,7 +40,13 @@ export const resume = defineUpdate<void>("resume")
 const signals = { wake, interrupt } as const
 
 const runtime: WorkflowRuntime = {
+  // Short-circuit when the predicate already holds. Besides saving a round trip, this avoids a real
+  // breakage: on @temporalio/workflow 1.21, calling condition(fn, timeout) when fn is already true
+  // leaves the current CancellationScope cancelled, so the NEXT condition() throws CancelledFailure
+  // -- which the supervisor reads as an interrupt and the workflow completes without ever draining a
+  // turn. Checking fn() first keeps the timeout timer (and its scope) out of the already-true path.
   condition: async (predicate, timeout) => {
+    if (predicate()) return true
     if (timeout === undefined) {
       await condition(predicate)
       return true
