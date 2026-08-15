@@ -9,7 +9,7 @@ import { PtyTicket } from "@opencode-ai/core/pty/ticket"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
-import { SessionExecutionLocalDriver } from "@opencode-ai/core/session/execution/local-driver"
+import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
 import { SessionExecutionTemporal } from "@opencode-ai/core/session/execution/temporal"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
@@ -53,14 +53,15 @@ export function createEmbeddedRoutes() {
 // Shared by the HTTP routes and the standalone worker entrypoint (src/worker.ts) so both build the
 // exact same context.
 export function createServiceLayer() {
-  // The factory: two modes, one drain (drain.ts). "temporal" loops the step drain on a Temporal
-  // worker (one activity per step); anything else loops it in a native in-process coordinator with
-  // no server (local-driver.ts). The loops differ by runtime; the drain and the error codec are the
-  // same code either way, and the driver-contract test keeps the loops behaving alike.
+  // The factory: two modes. "temporal" runs each session as a per-step Temporal workflow
+  // (execution/temporal.ts); anything else runs it in-process on the proven SessionRunCoordinator
+  // (execution/local.ts) -- no server, no ports. Both drive SessionRunner over the same durable
+  // event log; the local coordinator owns the wake/resume/interrupt lifecycle and is shared with
+  // the v1 server path, so it is the well-exercised default.
   const executionNode =
     process.env.OPENCODE_SESSION_EXECUTION === "temporal"
       ? SessionExecutionTemporal.node
-      : SessionExecutionLocalDriver.node
+      : SessionExecutionLocal.node
   return AppNodeBuilder.build(applicationServices, [[SessionExecution.node, executionNode]])
 }
 
