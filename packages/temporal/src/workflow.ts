@@ -92,7 +92,7 @@ const runtime: WorkflowRuntime = {
   isRootCancelled: () => rootScope?.consideredCancelled ?? false,
   allHandlersFinished,
   continueAsNew: (sessionID, startWithWake) =>
-    continueAsNew<(id: string, startWithWake: boolean) => Promise<void>>(sessionID, startWithWake),
+    continueAsNew<typeof sessionTurn>(sessionID, { startWithWake }),
 }
 
 // The scope of the drain currently running, so an interrupt signal can cancel exactly that turn.
@@ -102,24 +102,24 @@ let rootScope: CancellationScope | undefined
 
 const workflows = makeWorkflows(runtime)
 
-// The sandbox cannot read env, so the idle override arrives as a workflow argument (the client
-// reads the same variable local mode honors) and a continue-as-new run keeps it.
-export async function sessionTurn(
-  sessionID: string,
-  startWithWake: boolean = true,
-  idleTimeout?: string,
-): Promise<void> {
+// One evolvable input record instead of positional arguments: new settings ride along without a
+// signature change, and a continue-as-new run carries the record forward. The sandbox cannot read
+// env, so the idle override arrives here from the client (which reads the same variable local mode
+// honors).
+export interface SessionTurnOptions {
+  readonly startWithWake?: boolean
+  readonly idleTimeout?: string
+}
+
+export async function sessionTurn(sessionID: string, options?: SessionTurnOptions): Promise<void> {
   rootScope = CancellationScope.current()
+  const startWithWake = options?.startWithWake ?? true
+  const idleTimeout = options?.idleTimeout
   if (!idleTimeout) return workflows.sessionTurn(sessionID, startWithWake)
   return makeWorkflows(
     {
       ...runtime,
-      continueAsNew: (id, wake) =>
-        continueAsNew<(id: string, startWithWake: boolean, idleTimeout?: string) => Promise<void>>(
-          id,
-          wake,
-          idleTimeout,
-        ),
+      continueAsNew: (id, wake) => continueAsNew<typeof sessionTurn>(id, { startWithWake: wake, idleTimeout }),
     },
     { idleTimeout },
   ).sessionTurn(sessionID, startWithWake)

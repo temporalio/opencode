@@ -129,7 +129,7 @@ const layer = Layer.effect(
         client.workflow.signalWithStart(WORKFLOW_TYPE, {
           taskQueue: TASK_QUEUE,
           workflowId: workflowId(id),
-          args: [id, true, IDLE_TIMEOUT],
+          args: [id, { startWithWake: true, idleTimeout: IDLE_TIMEOUT } satisfies WF.SessionTurnOptions],
           signal: WF.wake,
           signalArgs: [],
         }),
@@ -180,7 +180,7 @@ const layer = Layer.effect(
                 // startWithWake=false: a fresh resume-with-start must not manufacture a wake drain;
                 // its forced drain comes from the resume update. Ignored when USE_EXISTING joins a
                 // running workflow (which keeps its own state).
-                args: [id, false, IDLE_TIMEOUT],
+                args: [id, { startWithWake: false, idleTimeout: IDLE_TIMEOUT } satisfies WF.SessionTurnOptions],
                 workflowIdConflictPolicy: "USE_EXISTING",
               })
               return client.workflow.executeUpdateWithStart(WF.resume, {
