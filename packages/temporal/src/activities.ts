@@ -25,25 +25,10 @@ function ownerToken(): string {
   return ownerTokenFrom(run, info.activityId, info.attempt)
 }
 
-// The workflow loops runTurnStep, so each step is its own activity with its own
-// retry/timeout/visibility. `promotion` is null (not undefined) so it serializes cleanly.
-export interface StepDrainInput {
-  sessionID: string
-  step: number
-  promotion: string | null
-  first: boolean
-  force: boolean
-  // The attempt that owns the event log while this drain runs. Set activity-side (see
-  // ownerToken), so it stays out of the workflow's deterministic input.
-  owner?: string
-}
-
-export interface StepDrainResult {
-  ran: boolean
-  continue: boolean
-  step: number
-  promotion: string | null
-}
+// The step contract lives with the drain in core; re-exported here so the workflow and its tests
+// keep one import site inside this package.
+import type { StepDrainInput, StepDrainResult } from "./drain"
+export type { StepDrainInput, StepDrainResult }
 
 export type StepActivities = {
   runTurnStep(input: StepDrainInput): Promise<StepDrainResult>

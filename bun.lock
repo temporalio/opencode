@@ -333,10 +333,6 @@
         "@opentelemetry/sdk-trace-base": "2.6.1",
         "@parcel/watcher": "2.5.1",
         "@silvia-odwyer/photon-node": "0.3.4",
-        "@temporalio/activity": "^1.21.0",
-        "@temporalio/client": "^1.21.0",
-        "@temporalio/worker": "^1.21.0",
-        "@temporalio/workflow": "^1.21.0",
         "ai-gateway-provider": "3.2.0",
         "bun-pty": "0.4.8",
         "cross-spawn": "catalog:",
@@ -372,7 +368,6 @@
         "@parcel/watcher-linux-x64-musl": "2.5.1",
         "@parcel/watcher-win32-arm64": "2.5.1",
         "@parcel/watcher-win32-x64": "2.5.1",
-        "@temporalio/testing": "1.21.1",
         "@tsconfig/bun": "catalog:",
         "@types/bun": "catalog:",
         "@types/cross-spawn": "catalog:",
@@ -791,6 +786,7 @@
       "dependencies": {
         "@opencode-ai/core": "workspace:*",
         "@opencode-ai/protocol": "workspace:*",
+        "@opencode-ai/temporal": "workspace:*",
         "drizzle-orm": "catalog:",
         "effect": "catalog:",
       },
@@ -946,6 +942,21 @@
         "storybook-solidjs-vite": "^10.0.9",
         "typescript": "catalog:",
         "vite": "catalog:",
+      },
+    },
+    "packages/temporal": {
+      "name": "@opencode-ai/temporal",
+      "version": "0.0.1",
+      "dependencies": {
+        "@opencode-ai/core": "workspace:*",
+        "@temporalio/activity": "^1.21.0",
+        "@temporalio/client": "^1.21.0",
+        "@temporalio/worker": "^1.21.0",
+        "@temporalio/workflow": "^1.21.0",
+        "effect": "catalog:",
+      },
+      "devDependencies": {
+        "@temporalio/testing": "1.21.1",
       },
     },
     "packages/tui": {
@@ -2074,6 +2085,8 @@
     "@opencode-ai/stats-server": ["@opencode-ai/stats-server@workspace:packages/stats/server"],
 
     "@opencode-ai/storybook": ["@opencode-ai/storybook@workspace:packages/storybook"],
+
+    "@opencode-ai/temporal": ["@opencode-ai/temporal@workspace:packages/temporal"],
 
     "@opencode-ai/tui": ["@opencode-ai/tui@workspace:packages/tui"],
 

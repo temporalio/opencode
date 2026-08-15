@@ -16,6 +16,6 @@ if (process.env.OPENCODE_CONTRACT_TEMPORAL === "1") {
   // otherwise steal activities and answer with its own (differently mocked) graph.
   process.env.OPENCODE_TEMPORAL_TASK_QUEUE ??= `contract-${crypto.randomUUID()}`
   // Imported dynamically because the driver reads its connection config at module load.
-  const { SessionExecutionTemporal } = await import("@opencode-ai/core/session/execution/temporal")
+  const { SessionExecutionTemporal } = await import("@opencode-ai/temporal/executor")
   runContract("temporal driver", makeExecutionFor(SessionExecutionTemporal.node))
 }

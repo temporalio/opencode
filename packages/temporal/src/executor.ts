@@ -1,4 +1,4 @@
-export * as SessionExecutionTemporal from "./temporal"
+export * as SessionExecutionTemporal from "./executor"
 
 import { fileURLToPath } from "node:url"
 import { Effect, Layer } from "effect"
@@ -7,17 +7,17 @@ import { Client, Connection, WithStartWorkflowOperation } from "@temporalio/clie
 // the workflow from source at startup), which a compiled binary can neither bundle nor run. A
 // packaged serve runs OPENCODE_TEMPORAL_ROLE=client next to standalone workers instead.
 
-import { LocationServiceMap } from "../../location-service-map"
-import { EventV2 } from "../../event"
-import { makeGlobalNode } from "../../effect/app-node"
-import { SessionSchema } from "../schema"
-import { SessionStore } from "../store"
-import { SessionExecution } from "../execution"
-import { makeStepActivities } from "./temporal-activities"
+import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
+import { EventV2 } from "@opencode-ai/core/event"
+import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionStore } from "@opencode-ai/core/session/store"
+import { SessionExecution } from "@opencode-ai/core/session/execution"
+import { makeStepActivities } from "./activities"
 import { makeDrains } from "./drain"
-import { WorktreeMaterializer } from "./worktree"
-import { toRunError } from "./run-error-codec"
-import * as WF from "./temporal-workflow"
+import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktree"
+import { toRunError } from "@opencode-ai/core/session/execution/run-error-codec"
+import * as WF from "./workflow"
 
 // Classify an interrupt-signal delivery error. "already completed"/"not found" means an idle
 // session's workflow has already closed -- nothing to interrupt, a no-op. Anything else is a genuine

@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url"
 import { TestWorkflowEnvironment } from "@temporalio/testing"
 import { Worker } from "@temporalio/worker"
 
-const WORKFLOW = fileURLToPath(new URL("../src/session/execution/temporal-workflow.ts", import.meta.url))
+const WORKFLOW = fileURLToPath(new URL("../src/workflow.ts", import.meta.url))
 const poll = async (fn: () => boolean, ms = 20_000) => {
   const deadline = Date.now() + ms
   while (!fn()) {
