@@ -1,5 +1,5 @@
 // A real Temporal test harness for the session workflow: it runs the ACTUAL sessionTurn workflow
-// (temporal-workflow.ts + workflow-core.ts) against @temporalio/testing's time-skipping server with
+// (workflow.ts + supervisor.ts) against @temporalio/testing's time-skipping server with
 // a mock runTurnStep activity, entirely in-process -- no dev server, no provider, deterministic time.
 // This is the harness for validating the Temporal supervisor's real behavior (draining, idle
 // retirement, and -- as the suite grows -- interrupt/resume/join/continue-as-new).

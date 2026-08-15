@@ -3,14 +3,14 @@
 // the rollover-manufactures-a-wake bug: a rollover triggered by a resume drain must carry
 // startWithWake=false into the successor, not re-arm a spurious wake. Driven by a fake runtime.
 import { describe, it, expect } from "bun:test"
-import { makeWorkflows, type WorkflowRuntime } from "../src/supervisor"
+import { makeSupervisor, type SupervisorRuntime } from "../src/supervisor"
 import type { StepDrainResult } from "../src/activities"
 
 class ContinuedAsNew extends Error {}
 const DONE: StepDrainResult = { ran: true, continue: false, step: 1, promotion: null }
 const settle = () => new Promise((r) => setTimeout(r, 0))
 
-class FakeRuntime implements WorkflowRuntime {
+class FakeRuntime implements SupervisorRuntime {
   steps = 0
   continued = 0
   continuedWith: boolean | undefined
@@ -57,7 +57,7 @@ describe("supervisor continue-as-new counting", () => {
   it("counts a resume-driven drain toward the bound and rolls over carrying no spurious wake", async () => {
     const rt = new FakeRuntime()
     // Bound of 2: the initial wake drain is #1; a single resume drain is #2 and must roll over.
-    const supervisor = makeWorkflows(rt, { maxDrainsPerRun: 2 }).sessionTurn("ses_rollover")
+    const supervisor = makeSupervisor(rt, { maxDrainsPerRun: 2 }).sessionTurn("ses_rollover")
     let ended = false
     supervisor.then(
       () => (ended = true),

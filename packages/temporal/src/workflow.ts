@@ -1,6 +1,6 @@
-// The Temporal driver for the session supervisor. The supervisor loop lives in workflow-core.ts;
+// The Temporal driver for the session supervisor. The supervisor loop lives in supervisor.ts;
 // this file adapts the real SDK's primitives (condition, signal/update handlers, activity proxies,
-// cancellation) to the WorkflowRuntime interface and exports the workflow function the worker
+// cancellation) to the SupervisorRuntime interface and exports the workflow function the worker
 // registers. Local mode does not use this loop -- it runs the proven SessionRunCoordinator directly
 // (execution/local.ts); the two modes share SessionRunner and the durable event log.
 //
@@ -21,7 +21,7 @@ import {
 } from "@temporalio/workflow"
 import type { StepActivities } from "./activities"
 import { SIGNALS, RESUME_UPDATE } from "./protocol"
-import { makeWorkflows, type WorkflowRuntime } from "./supervisor"
+import { makeSupervisor, type SupervisorRuntime } from "./supervisor"
 
 const activityOptions = {
   // The heartbeat is the liveness bound (it stops within seconds of a worker death and Temporal
@@ -42,7 +42,7 @@ export const interrupt = defineSignal(SIGNALS.interrupt)
 export const resume = defineUpdate<void>(RESUME_UPDATE)
 const signals = { wake, interrupt } as const
 
-const runtime: WorkflowRuntime = {
+const runtime: SupervisorRuntime = {
   // Short-circuit when the predicate already holds. Besides saving a round trip, this avoids a real
   // breakage: on @temporalio/workflow 1.21, calling condition(fn, timeout) when fn is already true
   // leaves the current CancellationScope cancelled, so the NEXT condition() throws CancelledFailure
@@ -100,7 +100,7 @@ let activeDrainScope: CancellationScope | undefined
 // The workflow's root scope, captured at entry, to detect a whole-run cancellation.
 let rootScope: CancellationScope | undefined
 
-const workflows = makeWorkflows(runtime)
+const workflows = makeSupervisor(runtime)
 
 // One evolvable input record instead of positional arguments: new settings ride along without a
 // signature change, and a continue-as-new run carries the record forward. The sandbox cannot read
@@ -116,7 +116,7 @@ export async function sessionTurn(sessionID: string, options?: SessionTurnOption
   const startWithWake = options?.startWithWake ?? true
   const idleTimeout = options?.idleTimeout
   if (!idleTimeout) return workflows.sessionTurn(sessionID, startWithWake)
-  return makeWorkflows(
+  return makeSupervisor(
     {
       ...runtime,
       continueAsNew: (id, wake) => continueAsNew<typeof sessionTurn>(id, { startWithWake: wake, idleTimeout }),
