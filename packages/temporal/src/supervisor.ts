@@ -1,5 +1,5 @@
 // The Temporal driver's per-session supervisor, expressed over a runtime interface so the SDK's
-// condition/signals/updates/activities/cancellation plug in (temporal-workflow.ts) and it stays
+// condition/signals/updates/activities/cancellation plug in (workflow.ts) and it stays
 // unit-testable off a live cluster (a fake runtime). Local mode does NOT run this loop: it uses the
 // proven SessionRunCoordinator directly (execution/local.ts). The two modes share SessionRunner and
 // the durable event log, not this supervisor.
@@ -15,7 +15,7 @@
 import type { StepDrainInput, StepDrainResult } from "./activities"
 
 /** What a driver must provide; everything else is supervisor logic. */
-export interface WorkflowRuntime {
+export interface SupervisorRuntime {
   /** Wait until the predicate is true. With a timeout, resolve false when it expires first. */
   readonly condition: (predicate: () => boolean, timeout?: string) => Promise<boolean>
   readonly setSignalHandler: (name: "wake" | "interrupt", handler: () => void) => void
@@ -54,7 +54,7 @@ export interface WorkflowOptions {
   readonly maxDrainsPerRun?: number
 }
 
-export const makeWorkflows = (rt: WorkflowRuntime, options?: WorkflowOptions) => {
+export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions) => {
   const IDLE_TIMEOUT = options?.idleTimeout ?? "5 minutes"
   // A continuously busy session never hits the idle return, so without a bound its history grows
   // until Temporal terminates the workflow. continue-as-new carries the pending-wake state, so no

@@ -1,10 +1,10 @@
-// Deterministic unit tests for the Temporal supervisor (execution/workflow-core.ts) driven by a fake
-// WorkflowRuntime -- no Temporal, no DB. Covers the coordination redesign: resume joins the single
+// Deterministic unit tests for the Temporal supervisor (execution/supervisor.ts) driven by a fake
+// SupervisorRuntime -- no Temporal, no DB. Covers the coordination redesign: resume joins the single
 // in-flight drain (never a second forced drain), a wake that only joins a resume drain still gets a
 // follow-up, an interrupt stops the current turn but the supervisor keeps serving, and a fresh
 // resume-with-start (startWithWake=false) does exactly one drain (no spurious wake drain).
 import { describe, it, expect } from "bun:test"
-import { makeWorkflows, type WorkflowRuntime } from "../src/supervisor"
+import { makeSupervisor, type SupervisorRuntime } from "../src/supervisor"
 import type { StepDrainResult } from "../src/activities"
 
 class FakeCancel extends Error {}
@@ -14,7 +14,7 @@ const settle = () => new Promise((r) => setTimeout(r, 0))
 // runTurnStep either resolves immediately (ungated) or parks until released (gated), so a turn can
 // be held in flight while resumes/wakes/interrupts are delivered. cancelCurrentScope rejects the
 // in-flight step with FakeCancel, modelling an interrupt aborting the active drain's scope.
-class FakeRuntime implements WorkflowRuntime {
+class FakeRuntime implements SupervisorRuntime {
   steps = 0
   gated = false
   private waiters: { predicate: () => boolean; resolve: (b: boolean) => void; isTimeout: boolean }[] = []
@@ -75,7 +75,7 @@ class FakeRuntime implements WorkflowRuntime {
 
 const start = (rt: FakeRuntime, startWithWake = true) => {
   let ended = false
-  makeWorkflows(rt)
+  makeSupervisor(rt)
     .sessionTurn("ses_test", startWithWake)
     .then(
       () => (ended = true),
@@ -84,7 +84,7 @@ const start = (rt: FakeRuntime, startWithWake = true) => {
   return { isDone: () => ended }
 }
 
-describe("Temporal supervisor (workflow-core)", () => {
+describe("Temporal supervisor", () => {
   it("concurrent resumes join a single drain (no duplicate forced turns)", async () => {
     const rt = new FakeRuntime()
     rt.gated = true

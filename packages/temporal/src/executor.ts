@@ -87,7 +87,7 @@ const layer = Layer.effect(
           connection: nativeConn,
           namespace: NAMESPACE,
           taskQueue: TASK_QUEUE,
-          workflowsPath: fileURLToPath(new URL("./temporal-workflow.ts", import.meta.url)),
+          workflowsPath: fileURLToPath(new URL("./workflow.ts", import.meta.url)),
           activities: makeStepActivities(stepDrain),
         }),
       )
