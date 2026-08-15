@@ -13,9 +13,11 @@ import {
   defineUpdate,
   setHandler,
   condition,
+  sleep,
   continueAsNew,
   CancellationScope,
   isCancellation,
+  allHandlersFinished,
 } from "@temporalio/workflow"
 import type { StepActivities } from "./temporal-activities"
 import { makeWorkflows, type WorkflowRuntime } from "./workflow-core"
@@ -45,25 +47,61 @@ const runtime: WorkflowRuntime = {
   // leaves the current CancellationScope cancelled, so the NEXT condition() throws CancelledFailure
   // -- which the supervisor reads as an interrupt and the workflow completes without ever draining a
   // turn. Checking fn() first keeps the timeout timer (and its scope) out of the already-true path.
+  // A timed wait that does NOT use the SDK's condition(fn, timeout). On @temporalio/workflow 1.21
+  // that variant cancels its internal timer scope on resolve and the cancellation LEAKS into the
+  // parent (root) scope, so the next drain's child scope is born cancelled and the turn never runs
+  // (a session could serve only one turn). Instead: short-circuit an already-true predicate; for a
+  // real wait, race a no-timeout condition against a bare timer and abandon the loser. Nothing here
+  // cancels a scope, so nothing leaks; an unfired timer / unresolved condition is harmless and a
+  // pending timer is cleaned up when the workflow closes.
   condition: async (predicate, timeout) => {
     if (predicate()) return true
     if (timeout === undefined) {
       await condition(predicate)
       return true
     }
-    // The runtime interface uses plain strings; the SDK's Duration is a branded string template.
-    return condition(predicate, timeout as never)
+    let timedOut = false
+    const timer = sleep(timeout as never).then(() => {
+      timedOut = true
+    })
+    timer.catch(() => {})
+    await Promise.race([condition(() => predicate() || timedOut), timer])
+    return predicate()
   },
   setSignalHandler: (name, handler) => setHandler(signals[name], handler),
   setUpdateHandler: (_name, handler) => setHandler(resume, handler),
   runTurnStep,
-  cancelCurrentScope: () => CancellationScope.current().cancel(),
+  // Run the turn's drain inside its own cancellable scope, tracked as the active one. An interrupt
+  // cancels this scope (aborting the in-flight activity) without touching the workflow root, so the
+  // supervisor survives to serve later turns.
+  runInDrainScope: (fn) =>
+    CancellationScope.cancellable(async () => {
+      activeDrainScope = CancellationScope.current()
+      try {
+        return await fn()
+      } finally {
+        activeDrainScope = undefined
+      }
+    }),
+  cancelCurrentScope: () => activeDrainScope?.cancel(),
   isCancellation,
-  continueAsNew: (sessionID) => continueAsNew<(id: string) => Promise<void>>(sessionID),
+  // A per-turn interrupt cancels only the child drain scope; a real workflow cancellation cancels
+  // the root. Reliable now that the timed wait no longer cancels any scope (nothing contaminates the
+  // root's consideredCancelled).
+  isRootCancelled: () => rootScope?.consideredCancelled ?? false,
+  allHandlersFinished,
+  continueAsNew: (sessionID, startWithWake) =>
+    continueAsNew<(id: string, startWithWake: boolean) => Promise<void>>(sessionID, startWithWake),
 }
+
+// The scope of the drain currently running, so an interrupt signal can cancel exactly that turn.
+let activeDrainScope: CancellationScope | undefined
+// The workflow's root scope, captured at entry, to detect a whole-run cancellation.
+let rootScope: CancellationScope | undefined
 
 const workflows = makeWorkflows(runtime)
 
-export async function sessionTurn(sessionID: string): Promise<void> {
-  return workflows.sessionTurn(sessionID)
+export async function sessionTurn(sessionID: string, startWithWake: boolean = true): Promise<void> {
+  rootScope = CancellationScope.current()
+  return workflows.sessionTurn(sessionID, startWithWake)
 }
