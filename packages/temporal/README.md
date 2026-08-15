@@ -1,9 +1,11 @@
 # @opencode-ai/temporal
 
-A Temporal durable-execution layer for opencode. It makes an opencode **session** a durable
-Temporal workflow, so a coding session survives worker loss, can run detached or in the
-background, and can be driven from anywhere by signal. It is a drop-in layer: opencode's loop,
-tools, model, storage, and HTTP API are untouched.
+The Temporal executor for opencode's `SessionExecution` seam, packaged as a plugin: core carries
+the seam, the built-in local executor, and the executor-agnostic toolkit; this package is one
+dependency that makes an opencode **session** a durable Temporal workflow. A coding session
+survives worker loss, can run detached or in the background, and can be driven from anywhere by
+signal. opencode's loop, tools, model, storage, and HTTP API are untouched, and nothing Temporal
+exists in core.
 
 A lighter increment exists as its own change: the `2026/08/opencode-temporal-http` branch wraps
 the **shipping** `opencode serve` over its HTTP API, for the agent-as-black-box case. It makes the
@@ -16,12 +18,14 @@ One design decision carries the change: durability is a choice of executor behin
 `SessionExecution` service, and both executors drive the same `SessionRunner` over the same durable
 event log. Everything else here is a consequence of taking at-least-once execution seriously.
 
-One env var picks the executor. `temporal` runs each session as a per-session Temporal workflow with
-one activity per step (`workflow-core.ts` + `temporal.ts`). The default runs it in-process on the
-proven `SessionRunCoordinator` (`execution/local.ts`) -- the same lifecycle the v1 server uses -- with
-no server and no ports (see [Two modes, one runner](#two-modes-one-runner)). The coordinator owns the
-local wake/resume/interrupt lifecycle; the Temporal supervisor mirrors its semantics inside the
-workflow sandbox.
+One env var picks the executor. `temporal` runs each session as a per-session Temporal workflow
+with one activity per step (this package: `executor.ts` wires the client and worker, `supervisor.ts`
+is the loop, `workflow.ts` adapts it to the sandbox, `drain.ts` is the step body). The default runs
+in-process on the proven `SessionRunCoordinator` (core's `execution/local.ts`), the same lifecycle
+the v1 server uses, with no server and no ports (see [Two modes, one runner](#two-modes-one-runner)).
+What an executor must do is defined executably: core's conformance suite
+(`session/execution/conformance.ts`) runs the same wake/resume/interrupt scenarios against the local
+executor in core's tests and against this package through real workflows.
 
 That forces six things:
 
@@ -93,7 +97,7 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
 
 The factory has exactly two modes, both driving the same `SessionRunner` over the same durable event
 log. `OPENCODE_SESSION_EXECUTION=temporal` runs each session as a per-session Temporal workflow: the
-`sessionTurn` supervisor (`workflow-core.ts`) loops a `runTurnStep` drain, so each step (one provider
+`sessionTurn` supervisor (`supervisor.ts`) loops a `runTurnStep` drain, so each step (one provider
 attempt + its tools) is its own activity with its own retry/timeout/visibility, reusing
 `SessionRunner.runStep` (one iteration of `run`'s loop). Anything else (the default) runs in-process
 on the proven `SessionRunCoordinator` (`execution/local.ts`) -- no server, no worker, no ports -- which
@@ -268,3 +272,18 @@ Host-local state that does NOT ride the DB, so it is not reconstructed on a diff
   best-effort (`Effect.catch` to `undefined`), and the model sees the bounded tool-output preview, not
   the file. They only affect the diff/restore/revert features and full-output viewing. Point `${data}`
   (the XDG data dir) at shared storage to make them portable.
+
+## Porting this pattern
+
+The shape transfers to any agent engine; Temporal is one executor behind a seam the engine owns.
+
+1. Find the engine's coordination seam and name it: here, four verbs (`active`, `wake`, `resume`,
+   `interrupt`) behind one substitutable service, with the in-process coordinator as the default.
+2. Make the turn body an idempotent, fenced step function: claim the log with an owner token,
+   reuse recorded results on re-drive, encode errors so they survive a process boundary.
+3. Write the executor as a thin workflow that loops the step as activities; keep the loop free of
+   engine imports so it stays deterministic and sandbox-safe.
+4. Forward settings as one evolvable input record; read configuration at layer build, never at
+   module load.
+5. Hold every executor to one conformance suite. Parity between the default and the durable path
+   is a test, not a promise.
