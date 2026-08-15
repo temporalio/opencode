@@ -4,8 +4,8 @@
 // follow-up, an interrupt stops the current turn but the supervisor keeps serving, and a fresh
 // resume-with-start (startWithWake=false) does exactly one drain (no spurious wake drain).
 import { describe, it, expect } from "bun:test"
-import { makeWorkflows, type WorkflowRuntime } from "@opencode-ai/core/session/execution/workflow-core"
-import type { StepDrainResult } from "@opencode-ai/core/session/execution/temporal-activities"
+import { makeWorkflows, type WorkflowRuntime } from "../src/supervisor"
+import type { StepDrainResult } from "../src/activities"
 
 class FakeCancel extends Error {}
 const DONE: StepDrainResult = { ran: true, continue: false, step: 1, promotion: null }

@@ -19,8 +19,8 @@ import {
   isCancellation,
   allHandlersFinished,
 } from "@temporalio/workflow"
-import type { StepActivities } from "./temporal-activities"
-import { makeWorkflows, type WorkflowRuntime } from "./workflow-core"
+import type { StepActivities } from "./activities"
+import { makeWorkflows, type WorkflowRuntime } from "./supervisor"
 
 const activityOptions = {
   // The heartbeat is the liveness bound (it stops within seconds of a worker death and Temporal
