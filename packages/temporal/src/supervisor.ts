@@ -12,7 +12,7 @@
 // idle) and surfaces its result; `interrupt` stops the CURRENT turn (not the session) and the
 // long-lived supervisor keeps serving later wakes/resumes, terminating only after an idle period.
 
-import type { StepDrainInput, StepDrainResult } from "./temporal-activities"
+import type { StepDrainInput, StepDrainResult } from "./activities"
 
 /** What a driver must provide; everything else is supervisor logic. */
 export interface WorkflowRuntime {

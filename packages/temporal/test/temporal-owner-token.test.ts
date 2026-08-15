@@ -2,7 +2,7 @@
 // step, so a run-id+attempt token repeats across steps and lets a zombie attempt from an earlier
 // step re-match the current owner. The token must be unique per activity execution.
 import { describe, it, expect } from "bun:test"
-import { ownerTokenFrom } from "@opencode-ai/core/session/execution/temporal-activities"
+import { ownerTokenFrom } from "../src/activities"
 
 describe("temporal event-log owner token", () => {
   const run = "run-1"

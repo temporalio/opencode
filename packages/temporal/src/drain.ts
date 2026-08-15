@@ -6,18 +6,35 @@
 
 import { Cause, Context, Effect, Exit, type LayerMap } from "effect"
 import { ApplicationFailure } from "@temporalio/activity"
-import type { LocationServiceMap } from "../../location-service-map"
-import type { Location } from "../../location"
-import type { LocationError, LocationServices } from "../../location-services"
-import { EventV2 } from "../../event"
-import { WorktreeMaterializer } from "./worktree"
-import { SessionRunner } from "../runner"
-import { SessionSchema } from "../schema"
-import { SessionStore } from "../store"
-import { SessionRunDeclinedError } from "../error"
-import type { SessionInput } from "../input"
-import { encodeRunError } from "./run-error-codec"
-import type { StepDrainInput, StepDrainResult } from "./temporal-activities"
+import type { LocationServiceMap } from "@opencode-ai/core/location-service-map"
+import type { Location } from "@opencode-ai/core/location"
+import type { LocationError, LocationServices } from "@opencode-ai/core/location-services"
+import { EventV2 } from "@opencode-ai/core/event"
+import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktree"
+import { SessionRunner } from "@opencode-ai/core/session/runner"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
+import { SessionStore } from "@opencode-ai/core/session/store"
+import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
+import type { SessionInput } from "@opencode-ai/core/session/input"
+import { encodeRunError } from "@opencode-ai/core/session/execution/run-error-codec"
+// One step of a turn, as any executor drives it. `promotion` is null (not undefined) so it
+// serializes cleanly across an executor's process boundary.
+export interface StepDrainInput {
+  sessionID: string
+  step: number
+  promotion: string | null
+  first: boolean
+  force: boolean
+  /** The attempt that owns the event log while this drain runs; set by the executor. */
+  owner?: string
+}
+
+export interface StepDrainResult {
+  ran: boolean
+  continue: boolean
+  step: number
+  promotion: string | null
+}
 
 export interface DrainDeps {
   readonly store: SessionStore.Interface

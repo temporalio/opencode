@@ -1,7 +1,7 @@
 // The interrupt path must not report a genuine signal-delivery failure as success. Only an already
 // closed workflow ("already completed"/"not found") is a benign no-op; everything else must fail.
 import { describe, it, expect } from "bun:test"
-import { SessionExecutionTemporal } from "@opencode-ai/core/session/execution/temporal"
+import { SessionExecutionTemporal } from "../src/executor"
 
 const classify = SessionExecutionTemporal.classifyInterruptError
 

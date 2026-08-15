@@ -3,8 +3,8 @@
 // the rollover-manufactures-a-wake bug: a rollover triggered by a resume drain must carry
 // startWithWake=false into the successor, not re-arm a spurious wake. Driven by a fake runtime.
 import { describe, it, expect } from "bun:test"
-import { makeWorkflows, type WorkflowRuntime } from "@opencode-ai/core/session/execution/workflow-core"
-import type { StepDrainResult } from "@opencode-ai/core/session/execution/temporal-activities"
+import { makeWorkflows, type WorkflowRuntime } from "../src/supervisor"
+import type { StepDrainResult } from "../src/activities"
 
 class ContinuedAsNew extends Error {}
 const DONE: StepDrainResult = { ran: true, continue: false, step: 1, promotion: null }
