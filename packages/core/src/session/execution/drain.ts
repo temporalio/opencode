@@ -1,6 +1,6 @@
-// The drain body shared by every durable executor: the Temporal layer runs it inside an activity,
-// the in-process micro-driver calls it directly. One implementation, so the turn semantics and
-// the error encoding cannot differ between drivers.
+// The drain body shared by both coordinators: the Temporal layer runs it inside an activity, the
+// native in-process coordinator (local-driver.ts) calls it directly. One implementation, so the
+// turn semantics and the error encoding cannot differ between modes even though the loops differ.
 
 import { Cause, Context, Effect, Exit, type LayerMap } from "effect"
 import { ApplicationFailure } from "@temporalio/activity"
