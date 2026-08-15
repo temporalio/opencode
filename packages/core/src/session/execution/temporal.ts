@@ -66,6 +66,10 @@ const layer = Layer.effect(
     // The app context the local drain runs in: providing it, then the per-location layer, supplies
     // SessionRunner and all of its dependencies.
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
+    // Same knob local mode honors. The workflow sandbox cannot read env, so the client forwards the
+    // override as a workflow argument. Read at layer build (not module load) so tests can set it
+    // before constructing the layer.
+    const IDLE_TIMEOUT = process.env.OPENCODE_SESSION_IDLE_TIMEOUT
     const events = yield* EventV2.Service
     const worktrees = yield* WorktreeMaterializer.Service
 
@@ -138,7 +142,7 @@ const layer = Layer.effect(
         client.workflow.signalWithStart(WORKFLOW_TYPE, {
           taskQueue: TASK_QUEUE,
           workflowId: workflowId(id),
-          args: [id],
+          args: [id, true, IDLE_TIMEOUT],
           signal: WF.wake,
           signalArgs: [],
         }),
@@ -189,7 +193,7 @@ const layer = Layer.effect(
                 // startWithWake=false: a fresh resume-with-start must not manufacture a wake drain;
                 // its forced drain comes from the resume update. Ignored when USE_EXISTING joins a
                 // running workflow (which keeps its own state).
-                args: [id, false],
+                args: [id, false, IDLE_TIMEOUT],
                 workflowIdConflictPolicy: "USE_EXISTING",
               })
               return client.workflow.executeUpdateWithStart(WF.resume, {

@@ -101,7 +101,25 @@ let rootScope: CancellationScope | undefined
 
 const workflows = makeWorkflows(runtime)
 
-export async function sessionTurn(sessionID: string, startWithWake: boolean = true): Promise<void> {
+// The sandbox cannot read env, so the idle override arrives as a workflow argument (the client
+// reads the same variable local mode honors) and a continue-as-new run keeps it.
+export async function sessionTurn(
+  sessionID: string,
+  startWithWake: boolean = true,
+  idleTimeout?: string,
+): Promise<void> {
   rootScope = CancellationScope.current()
-  return workflows.sessionTurn(sessionID, startWithWake)
+  if (!idleTimeout) return workflows.sessionTurn(sessionID, startWithWake)
+  return makeWorkflows(
+    {
+      ...runtime,
+      continueAsNew: (id, wake) =>
+        continueAsNew<(id: string, startWithWake: boolean, idleTimeout?: string) => Promise<void>>(
+          id,
+          wake,
+          idleTimeout,
+        ),
+    },
+    { idleTimeout },
+  ).sessionTurn(sessionID, startWithWake)
 }
