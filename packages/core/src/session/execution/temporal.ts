@@ -19,6 +19,14 @@ import { WorktreeMaterializer } from "./worktree"
 import { toRunError } from "./run-error-codec"
 import * as WF from "./temporal-workflow"
 
+// Classify an interrupt-signal delivery error. "already completed"/"not found" means an idle
+// session's workflow has already closed -- nothing to interrupt, a no-op. Anything else is a genuine
+// control-plane failure: the user's stop was not delivered, and it must NOT be reported as success.
+export function classifyInterruptError(e: unknown): "ignore" | "fail" {
+  const message = String((e as { message?: unknown })?.message ?? e)
+  return /already completed|not found/i.test(message) ? "ignore" : "fail"
+}
+
 const ADDRESS = process.env.TEMPORAL_ADDRESS ?? "127.0.0.1:7237"
 const NAMESPACE = process.env.TEMPORAL_NAMESPACE ?? "default"
 const TASK_QUEUE = process.env.OPENCODE_TEMPORAL_TASK_QUEUE ?? "opencode-session-exec"
@@ -204,12 +212,14 @@ const layer = Layer.effect(
           catch: (e) => e,
         }).pipe(
           Effect.catch((e) => {
+            // An idle session's workflow has already completed; nothing to interrupt is fine.
+            if (classifyInterruptError(e) === "ignore") return Effect.void
+            // A genuine delivery failure must not read as success: the stop did not happen. The
+            // interface has no error channel, so surface it as a defect rather than a false success.
             const message = String((e as { message?: unknown })?.message ?? e)
-            // An idle session's workflow has already completed; nothing to interrupt is fine. A
-            // genuine delivery failure must not be silent: the user asked for a stop.
-            if (/already completed|not found/i.test(message)) return Effect.void
-            return Effect.logWarning("session interrupt signal failed").pipe(
+            return Effect.logError("session interrupt signal failed").pipe(
               Effect.annotateLogs({ sessionID: id, error: message }),
+              Effect.andThen(Effect.die(`session interrupt delivery failed for ${id}: ${message}`)),
             )
           }),
         ),
