@@ -45,8 +45,11 @@ import { testEffect } from "../../testing/effect"
 // The per-location service build resolves the session directory on disk, so it must exist.
 const WORKSPACE = AbsolutePath.make(realpathSync(tmpdir()))
 
+// Inert fixture data: the suite replaces LLMClient.Service with an injected stream, so nothing
+// dials this endpoint or sends this token. The runner only needs a well-formed model descriptor
+// to select and record; the .invalid TLD (RFC 2606) makes the inertness visible.
 const model = OpenAIChat.route
-  .with({ endpoint: { baseURL: "https://api.openai.com/v1" }, auth: Auth.bearer("fixture") })
+  .with({ endpoint: { baseURL: "https://llm.fixture.invalid/v1" }, auth: Auth.bearer("fixture") })
   .model({ id: "gpt-4o-mini" })
 const okModels = SessionRunnerModel.layerWith(() => Effect.succeed(model))
 const systemContext = AppNodeBuilder.build(SystemContextRegistry.node)
