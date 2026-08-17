@@ -455,8 +455,18 @@ async function globalEventStream(origin: string, directory: string | null, heade
 // its session.next.* stream into them: admissions and text deltas map directly for low latency,
 // and every other session.next.* event schedules a debounced re-read of the session so the store
 // converges on what the daemon persisted (tools, reasoning, tokens, titles).
+//
+// Cross-process turns stream nothing here: with OPENCODE_TEMPORAL_ROLE=client the turn runs in a
+// separate worker process, and its session.next.* events live on that process's bus. The only
+// locally observable moment is this daemon's own admission, so a followed session keeps re-reading
+// until its latest assistant message settles; without that, a reply would only render when the
+// NEXT local event happened to trigger a re-read.
 function createSessionProjector(origin: string, headers: HeadersInit | undefined, emit: (dir: string, payload: unknown) => void) {
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
+  const FOLLOW_INTERVAL = 1200
+  // A turn longer than this stops refreshing a cross-process TUI until the next admission.
+  const FOLLOW_DEADLINE = 15 * 60 * 1000
+  const follows = new Map<string, number>()
   // The SDK validates every frame against the event schema; a nonconforming frame kills the
   // stream, so synthetic events carry the required id and full property sets.
   let counter = 0
@@ -465,26 +475,38 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
     type,
     properties,
   })
-  const resync = (sessionID: string, dir: string) => {
+  const resync = (sessionID: string, dir: string, delay = 250) => {
     clearTimeout(timers.get(sessionID))
     timers.set(
       sessionID,
       setTimeout(async () => {
         timers.delete(sessionID)
+        let settled = false
         try {
           const [info, items] = await Promise.all([
             v2(origin, `/api/session/${sessionID}`, null, headers),
             v2(origin, `/api/session/${sessionID}/message`, null, headers),
           ])
           emit(dir, legacyEvent("session.updated", { sessionID, info: v1Session(info) }))
-          for (const message of v1Messages(sessionID, items as any[])) {
+          const messages = v1Messages(sessionID, items as any[])
+          for (const message of messages) {
             emit(dir, legacyEvent("message.updated", { sessionID, info: message.info }))
             for (const part of message.parts)
               emit(dir, legacyEvent("message.part.updated", { sessionID, part, time: Date.now() }))
           }
+          const latest = messages.at(-1)?.info
+          settled = latest?.role === "assistant" && Boolean(latest.time?.completed)
         } catch {}
-      }, 250),
+        const deadline = follows.get(sessionID)
+        if (deadline === undefined) return
+        if (settled || Date.now() > deadline) follows.delete(sessionID)
+        else resync(sessionID, dir, FOLLOW_INTERVAL)
+      }, delay),
     )
+  }
+  const follow = (sessionID: string, dir: string) => {
+    follows.set(sessionID, Date.now() + FOLLOW_DEADLINE)
+    resync(sessionID, dir)
   }
   const handle = (event: any) => {
     const type = event?.type
@@ -517,6 +539,7 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
           time: Date.now(),
         }),
       )
+      follow(sessionID, dir)
       return
     }
     if (type === "session.next.step.started" && data.assistantMessageID) {
@@ -557,12 +580,13 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
       )
       return
     }
-    resync(sessionID, dir)
+    follow(sessionID, dir)
   }
   return Object.assign(handle, {
     dispose() {
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
+      follows.clear()
     },
   })
 }
