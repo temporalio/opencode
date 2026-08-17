@@ -25,7 +25,7 @@ semantics (`SessionRunCoordinator`, `session/run-coordinator.ts`).
 `local-driver.ts` supervisor path was removed. Local mode is now the well-exercised default and its
 correctness comes from reused, tested code rather than a second coordination loop.
 
-`workflow-core.ts` is therefore Temporal-only.
+That supervisor is therefore Temporal-only; it now lives at `packages/temporal/src/supervisor.ts`.
 
 ### 2. A Temporal test harness, and a Temporal-mode correctness pass
 
