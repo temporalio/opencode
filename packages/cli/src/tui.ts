@@ -475,6 +475,10 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
   // Part ids emitted per message, so a settled rewrite that coalesces parts under new ids also
   // removes the stale ones from the store instead of leaving duplicated text.
   const emittedParts = new Map<string, Map<string, Set<string>>>()
+  // Question ids surfaced per session. A question raised inside a cross-process activity publishes
+  // its asked event on the worker's bus, never here, so the dialog would never open. The durable
+  // row is readable from this daemon, so poll it and project the asked/answered lifecycle.
+  const questionSeen = new Map<string, Set<string>>()
   // The SDK validates every frame against the event schema; a nonconforming frame kills the
   // stream, so synthetic events carry the required id and full property sets.
   let counter = 0
@@ -491,6 +495,7 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
         timers.delete(sessionID)
         let settled = false
         let signature = ""
+        let pendingQuestions = 0
         try {
           const [info, items] = await Promise.all([
             v2(origin, `/api/session/${sessionID}`, null, headers),
@@ -522,13 +527,31 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
             .map((m) => `${m.info.id}:${m.parts.map((part) => `${part.id}=${part.text?.length ?? part.state?.status ?? ""}`).join(",")}`)
             .join(";")
         } catch {}
+        try {
+          const pending = (await v2(origin, `/api/session/${sessionID}/question`, null, headers)) as any[]
+          const seen = questionSeen.get(sessionID) ?? new Set<string>()
+          const current = new Set<string>()
+          for (const question of pending) {
+            current.add(question.id)
+            emit(dir, legacyEvent("question.v2.asked", { id: question.id, sessionID, questions: question.questions, tool: question.tool }))
+          }
+          // A question that left the list was answered or rejected elsewhere; clear it from the store.
+          for (const stale of seen) {
+            if (!current.has(stale))
+              emit(dir, legacyEvent("question.v2.replied", { sessionID, requestID: stale, answers: [] }))
+          }
+          questionSeen.set(sessionID, current)
+          pendingQuestions = current.size
+        } catch {}
         const follow = follows.get(sessionID)
         if (follow === undefined) return
         if (Date.now() > follow.deadline) {
           follows.delete(sessionID)
           return
         }
-        if (settled && follow.confirmed === signature) {
+        // A pending question keeps the follow alive even once the assistant message looks settled:
+        // the turn is blocked on the answer, so the next change only lands after the user replies.
+        if (settled && follow.confirmed === signature && pendingQuestions === 0) {
           follows.delete(sessionID)
           return
         }
