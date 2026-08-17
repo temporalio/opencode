@@ -47,17 +47,18 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
 
   function submit() {
     const answers = questions().map((_, i) => store.answers[i] ?? [])
-    void sdk.client.question.reply({
+    // The v2 daemon only serves the session-scoped question routes.
+    void sdk.client.v2.session.question.reply({
+      sessionID: props.request.sessionID,
       requestID: props.request.id,
-      directory: props.directory,
-      answers,
+      questionV2Reply: { answers },
     })
   }
 
   function reject() {
-    void sdk.client.question.reject({
+    void sdk.client.v2.session.question.reject({
+      sessionID: props.request.sessionID,
       requestID: props.request.id,
-      directory: props.directory,
     })
   }
 
@@ -71,10 +72,10 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
       setStore("custom", inputs)
     }
     if (single()) {
-      void sdk.client.question.reply({
+      void sdk.client.v2.session.question.reply({
+        sessionID: props.request.sessionID,
         requestID: props.request.id,
-        directory: props.directory,
-        answers: [[answer]],
+        questionV2Reply: { answers: [[answer]] },
       })
       return
     }
