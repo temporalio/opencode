@@ -468,7 +468,13 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
   const FOLLOW_INTERVAL = 1200
   // A turn longer than this stops refreshing a cross-process TUI until the next admission.
   const FOLLOW_DEADLINE = 15 * 60 * 1000
-  const follows = new Map<string, number>()
+  // deadline plus the signature of the last settled read: the read model can show the completed
+  // flag before the settled row's rewritten content, so a follow only stops after two identical
+  // settled reads.
+  const follows = new Map<string, { deadline: number; confirmed: string | null }>()
+  // Part ids emitted per message, so a settled rewrite that coalesces parts under new ids also
+  // removes the stale ones from the store instead of leaving duplicated text.
+  const emittedParts = new Map<string, Map<string, Set<string>>>()
   // The SDK validates every frame against the event schema; a nonconforming frame kills the
   // stream, so synthetic events carry the required id and full property sets.
   let counter = 0
@@ -484,6 +490,7 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
       setTimeout(async () => {
         timers.delete(sessionID)
         let settled = false
+        let signature = ""
         try {
           const [info, items] = await Promise.all([
             v2(origin, `/api/session/${sessionID}`, null, headers),
@@ -491,23 +498,47 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
           ])
           emit(dir, legacyEvent("session.updated", { sessionID, info: v1Session(info) }))
           const messages = v1Messages(sessionID, items as any[])
+          const seen = emittedParts.get(sessionID) ?? new Map<string, Set<string>>()
+          emittedParts.set(sessionID, seen)
           for (const message of messages) {
             emit(dir, legacyEvent("message.updated", { sessionID, info: message.info }))
-            for (const part of message.parts)
+            const ids = new Set<string>()
+            for (const part of message.parts) {
+              ids.add(part.id)
               emit(dir, legacyEvent("message.part.updated", { sessionID, part, time: Date.now() }))
+            }
+            for (const stale of seen.get(message.info.id) ?? []) {
+              if (!ids.has(stale))
+                emit(
+                  dir,
+                  legacyEvent("message.part.removed", { sessionID, messageID: message.info.id, partID: stale }),
+                )
+            }
+            seen.set(message.info.id, ids)
           }
           const latest = messages.at(-1)?.info
           settled = latest?.role === "assistant" && Boolean(latest.time?.completed)
+          signature = messages
+            .map((m) => `${m.info.id}:${m.parts.map((part) => `${part.id}=${part.text?.length ?? part.state?.status ?? ""}`).join(",")}`)
+            .join(";")
         } catch {}
-        const deadline = follows.get(sessionID)
-        if (deadline === undefined) return
-        if (settled || Date.now() > deadline) follows.delete(sessionID)
-        else resync(sessionID, dir, FOLLOW_INTERVAL)
+        const follow = follows.get(sessionID)
+        if (follow === undefined) return
+        if (Date.now() > follow.deadline) {
+          follows.delete(sessionID)
+          return
+        }
+        if (settled && follow.confirmed === signature) {
+          follows.delete(sessionID)
+          return
+        }
+        follow.confirmed = settled ? signature : null
+        resync(sessionID, dir, FOLLOW_INTERVAL)
       }, delay),
     )
   }
   const follow = (sessionID: string, dir: string) => {
-    follows.set(sessionID, Date.now() + FOLLOW_DEADLINE)
+    follows.set(sessionID, { deadline: Date.now() + FOLLOW_DEADLINE, confirmed: null })
     resync(sessionID, dir)
   }
   const handle = (event: any) => {
@@ -589,6 +620,7 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
       follows.clear()
+      emittedParts.clear()
     },
   })
 }
