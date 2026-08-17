@@ -213,13 +213,15 @@ function v1AssistantInfo(sessionID: string, item: any) {
 }
 
 function v1UserInfo(sessionID: string, item: any) {
+  // No fabricated agent or model: the prompt bar syncs its selection from the last user message,
+  // so an invented value would clobber the user's choice (and an empty model renders a
+  // "Model / is not valid" toast). An empty agent short-circuits that sync.
   return {
     id: item.id,
     sessionID,
     role: "user",
     time: { created: epoch(item.time?.created) },
-    agent: "build",
-    model: { providerID: "", modelID: "" },
+    agent: "",
   }
 }
 
