@@ -137,6 +137,17 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`question_request\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`payload\` text NOT NULL,
+          \`status\` text DEFAULT 'pending' NOT NULL,
+          \`answers\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`message\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
@@ -269,6 +280,10 @@ export default {
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )
+      yield* tx.run(
+        `CREATE INDEX \`question_request_session_status_idx\` ON \`question_request\` (\`session_id\`,\`status\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`question_request_status_idx\` ON \`question_request\` (\`status\`);`)
       yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
