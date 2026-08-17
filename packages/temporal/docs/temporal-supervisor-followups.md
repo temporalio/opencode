@@ -1,8 +1,8 @@
 # Temporal supervisor: status and follow-ups
 
 Independent review (Codex, several rounds) enumerated correctness issues in the Temporal-mode session
-supervisor (`packages/core/src/session/execution/workflow-core.ts` + `temporal-workflow.ts` +
-`temporal.ts`). Local mode is unaffected: it runs the proven `SessionRunCoordinator`
+supervisor (now `packages/temporal/src/supervisor.ts` + `workflow.ts` + `executor.ts`).
+Local mode is unaffected: it runs the proven `SessionRunCoordinator`
 (`execution/local.ts`).
 
 A deterministic test harness now exists for this code: fake-runtime unit tests of the supervisor loop
