@@ -22,3 +22,16 @@ export class ContextSnapshotDecodeError extends Schema.TaggedErrorClass<ContextS
     return `Failed to decode context snapshot for session ${this.sessionID}: ${this.details}`
   }
 }
+
+// The user stopped the run (declined a permission, rejected a question). Distinct from a decode
+// failure so callers across the durable boundary can tell a deliberate halt from a fault.
+export class SessionRunDeclinedError extends Schema.TaggedErrorClass<SessionRunDeclinedError>()(
+  "Session.SessionRunDeclinedError",
+  {
+    sessionID: SessionSchema.ID,
+  },
+) {
+  override get message() {
+    return `Session run halted by the user: ${this.sessionID}`
+  }
+}

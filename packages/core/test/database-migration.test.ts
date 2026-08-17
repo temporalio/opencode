@@ -50,6 +50,30 @@ describe("DatabaseMigration", () => {
       ),
     )
   })
+
+  test(
+    "serializes concurrent migration across processes on one path",
+    async () => {
+      await using tmp = await tmpdir()
+      const file = path.join(tmp.path, "cross-process.sqlite")
+      const script = fileURLToPath(new URL("../script/migrate-once.ts", import.meta.url))
+      // Independent processes (not sharing the module-level semaphore) racing the same fresh file:
+      // the BEGIN IMMEDIATE transaction must serialize them so none errors on a duplicate CREATE or
+      // migration insert.
+      const runs = await Promise.all(
+        Array.from({ length: 5 }, () => $`bun ${script} ${file}`.quiet().nothrow()),
+      )
+      for (const result of runs) expect(result.exitCode, result.stderr.toString()).toBe(0)
+
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const { db } = yield* Database.Service
+          expect(yield* db.get(sql`SELECT count(*) as count FROM migration`)).toEqual({ count: migrations.length })
+        }).pipe(Effect.provide(Database.layerFromPath(file)), Effect.scoped),
+      )
+    },
+    60_000,
+  )
   if (process.platform === "linux") {
     test("declared schema has no ungenerated migrations", async () => {
       const result = await $`bun ${fileURLToPath(new URL("../script/migration.ts", import.meta.url))} --check`

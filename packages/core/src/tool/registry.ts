@@ -9,7 +9,15 @@ import { SessionSchema } from "../session/schema"
 import { ToolOutputStore } from "../tool-output-store"
 import { Wildcard } from "../util/wildcard"
 import { ApplicationTools } from "./application-tools"
-import { definition, permission, settle, validateName, type AnyTool, type RegistrationError } from "./tool"
+import {
+  definition,
+  idempotent as toolIdempotent,
+  permission,
+  settle,
+  validateName,
+  type AnyTool,
+  type RegistrationError,
+} from "./tool"
 import { Tools } from "./tools"
 import { makeLocationNode } from "../effect/app-node"
 
@@ -29,6 +37,8 @@ export interface Interface {
 export interface Materialization {
   readonly definitions: ReadonlyArray<ToolDefinition>
   readonly settle: (input: ExecuteInput) => Effect.Effect<Settlement, ToolOutputStore.Error>
+  /** Whether a tool declared itself side-effect-free (safe to re-run on a crash resume). */
+  readonly idempotent: (name: string) => boolean
 }
 
 export interface Settlement {
@@ -117,6 +127,10 @@ const registryLayer = Layer.effect(
             const registration = registrations.get(input.call.name)
             if (registration) return settleWith(input, registration.identity)
             return Effect.succeed({ result: { type: "error", value: `Unknown tool: ${input.call.name}` } })
+          },
+          idempotent: (name) => {
+            const registration = registrations.get(name)
+            return registration ? toolIdempotent(registration.tool) : false
           },
         }
       }),

@@ -224,8 +224,11 @@ export const {
           break
         }
 
+        // The v2 engine publishes the versioned names; the unversioned ones are the v1 vocabulary.
         case "question.replied":
-        case "question.rejected": {
+        case "question.rejected":
+        case "question.v2.replied":
+        case "question.v2.rejected": {
           const requests = store.question[event.properties.sessionID]
           if (!requests) break
           const match = search(requests, event.properties.requestID, (r) => r.id)
@@ -240,7 +243,8 @@ export const {
           break
         }
 
-        case "question.asked": {
+        case "question.asked":
+        case "question.v2.asked": {
           const request = event.properties
           const requests = store.question[request.sessionID]
           if (!requests) {

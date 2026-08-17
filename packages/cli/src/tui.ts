@@ -213,13 +213,15 @@ function v1AssistantInfo(sessionID: string, item: any) {
 }
 
 function v1UserInfo(sessionID: string, item: any) {
+  // No fabricated agent or model: the prompt bar syncs its selection from the last user message,
+  // so an invented value would clobber the user's choice (and an empty model renders a
+  // "Model / is not valid" toast). An empty agent short-circuits that sync.
   return {
     id: item.id,
     sessionID,
     role: "user",
     time: { created: epoch(item.time?.created) },
-    agent: "build",
-    model: { providerID: "", modelID: "" },
+    agent: "",
   }
 }
 
@@ -455,8 +457,28 @@ async function globalEventStream(origin: string, directory: string | null, heade
 // its session.next.* stream into them: admissions and text deltas map directly for low latency,
 // and every other session.next.* event schedules a debounced re-read of the session so the store
 // converges on what the daemon persisted (tools, reasoning, tokens, titles).
+//
+// Cross-process turns stream nothing here: with OPENCODE_TEMPORAL_ROLE=client the turn runs in a
+// separate worker process, and its session.next.* events live on that process's bus. The only
+// locally observable moment is this daemon's own admission, so a followed session keeps re-reading
+// until its latest assistant message settles; without that, a reply would only render when the
+// NEXT local event happened to trigger a re-read.
 function createSessionProjector(origin: string, headers: HeadersInit | undefined, emit: (dir: string, payload: unknown) => void) {
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
+  const FOLLOW_INTERVAL = 1200
+  // A turn longer than this stops refreshing a cross-process TUI until the next admission.
+  const FOLLOW_DEADLINE = 15 * 60 * 1000
+  // deadline plus the signature of the last settled read: the read model can show the completed
+  // flag before the settled row's rewritten content, so a follow only stops after two identical
+  // settled reads.
+  const follows = new Map<string, { deadline: number; confirmed: string | null }>()
+  // Part ids emitted per message, so a settled rewrite that coalesces parts under new ids also
+  // removes the stale ones from the store instead of leaving duplicated text.
+  const emittedParts = new Map<string, Map<string, Set<string>>>()
+  // Question ids surfaced per session. A question raised inside a cross-process activity publishes
+  // its asked event on the worker's bus, never here, so the dialog would never open. The durable
+  // row is readable from this daemon, so poll it and project the asked/answered lifecycle.
+  const questionSeen = new Map<string, Set<string>>()
   // The SDK validates every frame against the event schema; a nonconforming frame kills the
   // stream, so synthetic events carry the required id and full property sets.
   let counter = 0
@@ -465,26 +487,82 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
     type,
     properties,
   })
-  const resync = (sessionID: string, dir: string) => {
+  const resync = (sessionID: string, dir: string, delay = 250) => {
     clearTimeout(timers.get(sessionID))
     timers.set(
       sessionID,
       setTimeout(async () => {
         timers.delete(sessionID)
+        let settled = false
+        let signature = ""
+        let pendingQuestions = 0
         try {
           const [info, items] = await Promise.all([
             v2(origin, `/api/session/${sessionID}`, null, headers),
             v2(origin, `/api/session/${sessionID}/message`, null, headers),
           ])
           emit(dir, legacyEvent("session.updated", { sessionID, info: v1Session(info) }))
-          for (const message of v1Messages(sessionID, items as any[])) {
+          const messages = v1Messages(sessionID, items as any[])
+          const seen = emittedParts.get(sessionID) ?? new Map<string, Set<string>>()
+          emittedParts.set(sessionID, seen)
+          for (const message of messages) {
             emit(dir, legacyEvent("message.updated", { sessionID, info: message.info }))
-            for (const part of message.parts)
+            const ids = new Set<string>()
+            for (const part of message.parts) {
+              ids.add(part.id)
               emit(dir, legacyEvent("message.part.updated", { sessionID, part, time: Date.now() }))
+            }
+            for (const stale of seen.get(message.info.id) ?? []) {
+              if (!ids.has(stale))
+                emit(
+                  dir,
+                  legacyEvent("message.part.removed", { sessionID, messageID: message.info.id, partID: stale }),
+                )
+            }
+            seen.set(message.info.id, ids)
           }
+          const latest = messages.at(-1)?.info
+          settled = latest?.role === "assistant" && Boolean(latest.time?.completed)
+          signature = messages
+            .map((m) => `${m.info.id}:${m.parts.map((part) => `${part.id}=${part.text?.length ?? part.state?.status ?? ""}`).join(",")}`)
+            .join(";")
         } catch {}
-      }, 250),
+        try {
+          const pending = (await v2(origin, `/api/session/${sessionID}/question`, null, headers)) as any[]
+          const seen = questionSeen.get(sessionID) ?? new Set<string>()
+          const current = new Set<string>()
+          for (const question of pending) {
+            current.add(question.id)
+            emit(dir, legacyEvent("question.v2.asked", { id: question.id, sessionID, questions: question.questions, tool: question.tool }))
+          }
+          // A question that left the list was answered or rejected elsewhere; clear it from the store.
+          for (const stale of seen) {
+            if (!current.has(stale))
+              emit(dir, legacyEvent("question.v2.replied", { sessionID, requestID: stale, answers: [] }))
+          }
+          questionSeen.set(sessionID, current)
+          pendingQuestions = current.size
+        } catch {}
+        const follow = follows.get(sessionID)
+        if (follow === undefined) return
+        if (Date.now() > follow.deadline) {
+          follows.delete(sessionID)
+          return
+        }
+        // A pending question keeps the follow alive even once the assistant message looks settled:
+        // the turn is blocked on the answer, so the next change only lands after the user replies.
+        if (settled && follow.confirmed === signature && pendingQuestions === 0) {
+          follows.delete(sessionID)
+          return
+        }
+        follow.confirmed = settled ? signature : null
+        resync(sessionID, dir, FOLLOW_INTERVAL)
+      }, delay),
     )
+  }
+  const follow = (sessionID: string, dir: string) => {
+    follows.set(sessionID, { deadline: Date.now() + FOLLOW_DEADLINE, confirmed: null })
+    resync(sessionID, dir)
   }
   const handle = (event: any) => {
     const type = event?.type
@@ -517,6 +595,7 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
           time: Date.now(),
         }),
       )
+      follow(sessionID, dir)
       return
     }
     if (type === "session.next.step.started" && data.assistantMessageID) {
@@ -557,12 +636,14 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
       )
       return
     }
-    resync(sessionID, dir)
+    follow(sessionID, dir)
   }
   return Object.assign(handle, {
     dispose() {
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
+      follows.clear()
+      emittedParts.clear()
     },
   })
 }
