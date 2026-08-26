@@ -127,10 +127,45 @@ Two things are load-bearing and easy to get wrong:
   retry only a tool declaring `idempotent` runs again; anything else is reported to the model as an
   unknown outcome. This is the rule the crash-resume path already followed.
 
-What it costs: a whole-step activity starts each tool the moment the model asks for it, while the
-stream is still going. Here the attempt has to return before any tool starts, because a workflow
-cannot consume a stream. The tools of one step still run concurrently with each other; the overlap
-between the model and its own tools is what is lost.
+#### What it costs, measured
+
+Two separate costs, and only one of them is usually real.
+
+**The lost overlap.** A whole-step activity starts each tool the moment the model asks for it, while
+the stream is still going. Here the attempt has to return before any tool starts, because a workflow
+cannot consume a stream. `packages/core/test/step-overlap-bench.test.ts` dials a mock model's stream
+tail and a sleeping tool, so the number is the overlap and nothing else:
+
+| stream tail after 1st call | tool | whole step | split step | loss | `min(tail, tool)` |
+|---:|---:|---:|---:|---:|---:|
+| 1 ms | 1500 ms | 1534 ms | 1519 ms | **-15 ms** | 1 ms |
+| 200 ms | 1500 ms | 1538 ms | 1734 ms | **196 ms** | 200 ms |
+| 1500 ms | 200 ms | 1534 ms | 1743 ms | **209 ms** | 200 ms |
+| 1500 ms | 1500 ms | 1536 ms | 3045 ms | **1509 ms** | 1500 ms |
+| 3000 ms | 1500 ms | 3038 ms | 4542 ms | **1504 ms** | 1500 ms |
+
+So the loss per step is `min(stream tail after the first tool call, tool duration)`, within about
+10 ms every time. It is **zero when the tool call is the last thing in the stream**, which is the
+common shape: the model asks and stops. It only bites when the model keeps generating after asking,
+and even then the tool's own duration caps it.
+
+**The extra round trips.** Three activities per step instead of one means two more hand-offs.
+Measured from workflow history on a loopback dev server (mean of four, one turn):
+
+```
+done runModelCall -> sched runToolCall   10 ms
+done runToolCall  -> sched sealStep       3 ms
+done sealStep     -> sched runModelCall   4 ms
+done runModelCall -> sched sealStep       3 ms
+```
+
+About 5 ms per hand-off, so ~10 ms per step, against model calls of 1.2 s and 3.2 s in the same run.
+Per-step Temporal overhead tracks worker-to-namespace distance, so this is the floor: it grows with
+placement, and a laptop driving a remote namespace pays it many times over. Put workers next to the
+namespace and the split is close to free.
+
+Wall-clock totals are deliberately not quoted here. Model latency dominates and varies more between
+two runs of the same cell than the effect being measured.
 
 #### Verified
 
