@@ -1170,6 +1170,31 @@ describe("EventV2", () => {
     }),
   )
 
+  it.live("tails events another writer appended, which no in-process wake can announce", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
+
+      // A second service over the SAME database with its OWN pubsub: exactly what a standalone
+      // worker is to the HTTP server. Its commits cannot reach this process's wake map, so if the
+      // tail only listened for wakes it would sit on the seed forever.
+      const other = yield* EventV2.Service.pipe(Effect.provide(EventV2.layerWith()))
+
+      const tail = yield* events
+        .durable({ aggregateID, after: -1 })
+        .pipe(Stream.take(2), Stream.runCollect, Effect.forkScoped)
+      yield* Effect.sleep("100 millis")
+      yield* other.publish(DurableMessage, durableData(aggregateID, "from-elsewhere"))
+
+      const collected = yield* Fiber.join(tail).pipe(Effect.timeout("10 seconds"))
+      expect(collected.map((event) => (event.data as { messageID: string }).messageID)).toEqual([
+        durableData(aggregateID, "seed").messageID,
+        durableData(aggregateID, "from-elsewhere").messageID,
+      ])
+    }),
+  )
+
   it.effect("never fences a publish made outside a drain", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

@@ -251,20 +251,22 @@ another process with no publisher, searched the projection, found nothing, and l
 forever. The fix carries the assistant message id out of the attempt the same way the tool call ids
 are carried.
 
-#### Live streaming does not cross a process boundary
+#### Live streaming across a process boundary
 
 Worth stating separately, because it is **not** specific to stepped mode: it is a property of
 running a standalone worker at all, and the mechanism is in `event.ts`.
 
-Split into `OPENCODE_TEMPORAL_ROLE=client` serve plus a standalone worker, a stepped turn ran
-correctly end to end and its whole log is intact: `GET /api/session/:id/event?after=0` replays all
-28 events. But a client subscribed *live* to that endpoint saw exactly one, `prompt.admitted`, the
-only event the serve process itself writes. Everything the worker wrote never arrived.
+`commitDurableEvent` publishes its wake in-process and `subscribeDurable` registers in that same
+process's map, so a commit in another process cannot wake a tail. Split into
+`OPENCODE_TEMPORAL_ROLE=client` serve plus a standalone worker, a turn ran correctly and its log was
+complete, but a client subscribed *live* saw exactly one event, `prompt.admitted`, the only one the
+serve process writes itself. A UI attached to serve saw a prompt admitted and then silence.
 
-`commitDurableEvent` publishes the wake in-process, and `subscribeDurable` registers into that same
-process's map, so a commit in another process cannot wake a tail. A UI attached to serve therefore
-sees a prompt admitted and then silence until it re-reads. Correctness is unaffected; the durable
-log is the source of truth and it is complete.
+The durable tail now also re-reads on a tick (`LayerOptions.livePollInterval`, default one second,
+0 to disable). In-process commits still wake it instantly, so latency is unchanged where it already
+worked; the tick only catches what the wake cannot see. An idle subscriber costs one indexed read
+per period, and a tick with nothing new emits nothing. The same split now delivers the worker's
+`step.started`, `tool.called`, `tool.success` and `step.ended` to a live subscriber.
 
 ### Two modes, one runner
 
