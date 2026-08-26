@@ -1131,6 +1131,45 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("admits every writer holding the claimed token, concurrently", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      // One step's writers share the token its model attempt claimed: the model call, each tool
+      // call, and the seal. They run as separate activities, so the fence has to admit all of them
+      // while still rejecting the attempt they superseded.
+      const step = "run-1:model-1:1"
+      const superseded = "run-1:model-1:0"
+
+      yield* events.claim(aggregateID, step)
+      yield* Effect.all(
+        ["model", "tool-a", "tool-b", "seal"].map((writer) =>
+          events
+            .publish(DurableMessage, durableData(aggregateID, writer))
+            .pipe(Effect.provideService(EventV2.EventOwner, step)),
+        ),
+        { concurrency: "unbounded" },
+      )
+      const stale = yield* events
+        .publish(DurableMessage, durableData(aggregateID, "zombie"))
+        .pipe(Effect.provideService(EventV2.EventOwner, superseded), Effect.exit)
+
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(String(stale)).toContain("Owner fence")
+      expect(rows.map((row) => row.seq)).toEqual([0, 1, 2, 3])
+      expect(rows.map((row) => (row.data as { messageID: string }).messageID).sort()).toEqual(
+        ["model", "tool-a", "tool-b", "seal"].map((writer) => durableData(aggregateID, writer).messageID).sort(),
+      )
+    }),
+  )
+
   it.effect("never fences a publish made outside a drain", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
