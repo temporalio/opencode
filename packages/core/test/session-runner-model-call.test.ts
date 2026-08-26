@@ -10,6 +10,7 @@
 import { LLMClient, type LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -42,6 +43,7 @@ import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { Auth } from "@opencode-ai/llm/route"
 import { describe, expect } from "bun:test"
 import { Effect, Layer, Schema, Stream } from "effect"
+import { eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
 const model = OpenAIChat.route
@@ -357,6 +359,111 @@ describe("SessionRunner tool dispatch", () => {
       expect(ran.read).toBe(1)
       const part = toolPart(yield* store.context(sessionID), "call_probe")
       expect(part?.type === "tool" ? part.state.status : undefined).toBe("completed")
+    }),
+  )
+})
+
+// Closing the step after its calls have been dispatched. This is the piece that cannot stay in the
+// provider attempt: the end snapshot and the file diff have to be taken after the tools have run,
+// and in a durable executor that is a different process.
+describe("SessionRunner step seal", () => {
+  const stepEndedCount = Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const rows = yield* db
+      .select({ type: EventTable.type })
+      .from(EventTable)
+      .where(eq(EventTable.aggregate_id, sessionID))
+      .all()
+      .pipe(Effect.orDie)
+    return rows.filter((row) => row.type.includes("step.ended")).length
+  })
+
+  const deferOneCall = Effect.gen(function* () {
+    const runner = yield* SessionRunner.Service
+    const result = yield* runner.runModelCall({
+      sessionID,
+      step: 2,
+      promotion: undefined,
+      first: false,
+      force: false,
+    })
+    if (result.kind !== "called") throw new Error("expected a deferred step")
+    return result
+  })
+
+  harness(callsTool).effect("closes a dispatched step and keeps the turn going", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const model = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+      yield* runner.runToolCall({ sessionID, call: model.calls[0]!, retry: false })
+
+      const result = yield* runner.sealStep({ sessionID, step: 2, settlement: model.settlement })
+
+      // Local tool calls mean the model has results to look at, so the turn continues.
+      expect(result.continue).toBe(true)
+      expect(result.step).toBe(3)
+      const message = assistant(yield* store.context(sessionID))
+      expect(message?.type === "assistant" ? Boolean(message.time.completed) : false).toBe(true)
+      expect(yield* stepEndedCount).toBe(1)
+    }),
+  )
+
+  harness(textOnly).effect("closes a text-only step and ends the turn", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const model = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+
+      const result = yield* runner.sealStep({ sessionID, step: 2, settlement: model.settlement })
+
+      expect(result.continue).toBe(false)
+      const message = assistant(yield* store.context(sessionID))
+      expect(message?.type === "assistant" ? Boolean(message.time.completed) : false).toBe(true)
+    }),
+  )
+
+  harness(callsTool).effect("seals once and answers the same on a repeat", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const model = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+      yield* runner.runToolCall({ sessionID, call: model.calls[0]!, retry: false })
+
+      const first = yield* runner.sealStep({ sessionID, step: 2, settlement: model.settlement })
+      // A seal that published Step.Ended and then died is retried. The loop decision has to survive
+      // that, or the turn would stop one step early.
+      const second = yield* runner.sealStep({ sessionID, step: 2, settlement: model.settlement })
+
+      expect(second).toEqual(first)
+      expect(yield* stepEndedCount).toBe(1)
+    }),
+  )
+
+  harness(callsTool).effect("closes a call the dispatcher never settled", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const model = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+
+      // The tool activity exhausted its retries and never published a result. Sealing has to close
+      // the call anyway: a request carrying a tool_use with no tool_result is rejected outright, so
+      // leaving it open would poison every later attempt.
+      const result = yield* runner.sealStep({ sessionID, step: 2, settlement: model.settlement })
+
+      expect(result.continue).toBe(true)
+      const part = toolPart(yield* store.context(sessionID), "call_probe")
+      expect(part?.type === "tool" ? part.state.status : undefined).toBe("error")
+      expect(ran.write).toBe(0)
     }),
   )
 })

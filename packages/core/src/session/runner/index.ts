@@ -46,6 +46,15 @@ export interface DeferredToolCall {
   readonly assistantMessageID: string
 }
 
+/** Closing one step whose tools have been dispatched. */
+export interface SealStepInput {
+  readonly sessionID: SessionSchema.ID
+  readonly step: number
+  /** The provider's finish reason and token counts, from the attempt that opened this step. They
+   * live only in that process's memory, so they have to be carried here rather than read back. */
+  readonly settlement?: StepSettlement
+}
+
 /** One recorded tool call, to run on its own. */
 export interface ToolCallInput {
   readonly sessionID: SessionSchema.ID
@@ -104,6 +113,10 @@ export interface Interface {
   /** Run one recorded tool call and publish its result. Safe to call twice for the same call: the
    * second sees the settled result and does nothing. */
   readonly runToolCall: (input: ToolCallInput) => Effect.Effect<ToolCallResult, RunError>
+  /** Close a step once its calls have been dispatched: snapshot, file diff, Step.Ended, and the loop
+   * decision. Safe to call twice: the second sees the step already closed and returns the same
+   * answer without publishing again. */
+  readonly sealStep: (input: SealStepInput) => Effect.Effect<StepResult, RunError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionRunner") {}

@@ -36,6 +36,7 @@ import {
   type DeferredToolCall,
   type ModelCallResult,
   type RunError,
+  type SealStepInput,
   type StepInput,
   type ToolCallInput,
   type ToolCallResult,
@@ -560,15 +561,8 @@ const layer = Layer.effect(
         snapshot: endSnapshot,
         files,
       })
-      // Mirror runStep's continuation tail: a step with local tool calls continues so the model sees
-      // the (reused or failed) results.
-      let needsContinuation = localTools
-      if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
-      if (needsContinuation)
-        return { ran: true, continue: true, step: input.step + 1, promotion: "steer" as SessionInput.Delivery }
-      const moreQueue = yield* SessionInput.hasPending(db, input.sessionID, "queue")
-      if (moreQueue) return { ran: true, continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
-      return { ran: true, continue: false, step: input.step + 1, promotion: undefined }
+      // A step with local tool calls continues so the model sees the (reused or failed) results.
+      return yield* stepContinuation(input.sessionID, localTools, input.step)
     })
 
     // One iteration of `run`'s loop, exposed so a Temporal workflow can drive the turn one step at
@@ -626,6 +620,50 @@ const layer = Layer.effect(
       const moreQueue = yield* SessionInput.hasPending(db, sessionID, "queue")
       if (moreQueue) return { ran: true, continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
       return { ran: true, continue: false, step: step + 1, promotion: undefined }
+    })
+
+    const sealStep = Effect.fn("SessionRunner.sealStep")(function* (input: SealStepInput) {
+      const context = yield* getContext(input.sessionID)
+      const inFlight = context.findLast(
+        (message): message is SessionMessage.Assistant => message.type === "assistant" && !message.time.completed,
+      )
+      // On a retry that lands after Step.Ended was published there is nothing open, but the loop
+      // decision still has to come out the same, so it is read off the step we just closed.
+      const target =
+        inFlight ??
+        context.findLast((message): message is SessionMessage.Assistant => message.type === "assistant")
+      if (!target) return yield* stepContinuation(input.sessionID, false, input.step)
+      const toolParts = target.content.filter((part): part is SessionMessage.AssistantTool => part.type === "tool")
+      // A step continues so the model can see its tool results. Provider-executed calls need no
+      // follow-up turn, so a step holding only those finalizes as a plain stop.
+      const localTools = toolParts.some((part) => part.provider?.executed !== true)
+      if (!inFlight) return yield* stepContinuation(input.sessionID, localTools, input.step)
+      // A dispatch that failed outright leaves its call open. Close it here, or the next attempt
+      // sends a request carrying a tool_use with no tool_result and the provider rejects it.
+      yield* failInterruptedTools(input.sessionID, context)
+      const startSnapshot = target.snapshot?.start
+      const endSnapshot = yield* snapshots.capture()
+      // Ship the post-step tree: this is the state a later step on another host needs.
+      if (endSnapshot) yield* snapshotSync.push(endSnapshot)
+      const files =
+        startSnapshot && endSnapshot
+          ? yield* snapshots
+              .files({ from: Snapshot.ID.make(startSnapshot), to: endSnapshot })
+              .pipe(Effect.catch(() => Effect.succeed(undefined)))
+          : undefined
+      yield* events.publish(SessionEvent.Step.Ended, {
+        sessionID: input.sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID: target.id,
+        // The attempt's own settlement when the caller carried it; otherwise the same fallback the
+        // crash-resume path uses, which costs only the metering on that step.
+        finish: input.settlement?.finish ?? (localTools ? "tool-calls" : "stop"),
+        cost: 0,
+        tokens: input.settlement?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        snapshot: endSnapshot,
+        files,
+      })
+      return yield* stepContinuation(input.sessionID, localTools, input.step)
     })
 
     const toolPartOf = (messages: ReadonlyArray<SessionMessage.Message>, callID: string) => {
@@ -707,6 +745,7 @@ const layer = Layer.effect(
       runStep,
       runModelCall,
       runToolCall,
+      sealStep,
     })
   }),
 )
