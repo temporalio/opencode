@@ -199,6 +199,50 @@ Live against a dev server and `gpt-5-mini`, with `OPENCODE_SESSION_EXECUTION=tem
   line (the settled tool was not re-run), the interrupted call reached the model as "The outcome of
   this tool call is unknown", and the turn ran on to its answer.
 
+#### What has been exercised, and what has not
+
+Verified live (dev server, `gpt-5-mini`, stepped mode on):
+
+- **A step's calls fan out and share one log owner.** Four `read` calls in one step became four
+  concurrent `runToolCall` activities, started within 2 ms of each other and overlapping, all four
+  results durable, zero activity failures. A fenced write would have died and shown as a failed
+  activity, so this is the owner-token design holding under real concurrency, which is the thing it
+  exists for.
+- **Interrupt stops the turn, not the session.** With `sleep 90` in flight, `POST /interrupt`
+  returned 204, the child process died, the call was closed as `Tool execution interrupted` so the
+  next attempt is not a poisoned request, the workflow stayed RUNNING, and the next prompt answered
+  normally.
+- **An approval holds only the tool that is waiting.** Reading a `*.env` file parks on the default
+  agent's `ask` rule. While the human deliberated, `runModelCall` was **completed** and
+  `runToolCall` was the only outstanding activity. Replying `once` completed the tool and the turn.
+  Under the whole-step mode the entire step, model call included, sits in one activity for the whole
+  of that wait.
+
+Not covered, stated plainly:
+
+- **Compaction.** The `deferTools` flag is threaded through both `ContinueAfterCompaction`
+  recursions (a first version dropped it, which would have silently run tools inline on a compacting
+  step). There is no test: forcing compaction needs a model route that declares `limits.context`,
+  and the route used live does not. A regression test was written, found to pass with the bug
+  deliberately reintroduced, and deleted rather than left as a false assurance.
+- **Two hosts.** Tool activities can be scheduled on any worker and file tools need the project
+  tree. `worktrees.ensure` rebuilds it from snapshot packs, but this has only ever run on one host.
+
+#### Live streaming does not cross a process boundary
+
+Worth stating separately, because it is **not** specific to stepped mode: it is a property of
+running a standalone worker at all, and the mechanism is in `event.ts`.
+
+Split into `OPENCODE_TEMPORAL_ROLE=client` serve plus a standalone worker, a stepped turn ran
+correctly end to end and its whole log is intact: `GET /api/session/:id/event?after=0` replays all
+28 events. But a client subscribed *live* to that endpoint saw exactly one, `prompt.admitted`, the
+only event the serve process itself writes. Everything the worker wrote never arrived.
+
+`commitDurableEvent` publishes the wake in-process, and `subscribeDurable` registers into that same
+process's map, so a commit in another process cannot wake a tail. A UI attached to serve therefore
+sees a prompt admitted and then silence until it re-reads. Correctness is unaffected; the durable
+log is the source of truth and it is complete.
+
 ### Two modes, one runner
 
 The factory has exactly two modes, both driving the same `SessionRunner` over the same durable event
