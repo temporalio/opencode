@@ -71,6 +71,13 @@ const callsTool: LLMClientShape["stream"] = () =>
     LLMEvent.toolCall({ id: "call_probe", name: "probe_write", input: {} }),
     LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
   ])
+// The same, for the tool that declares itself repeatable.
+const callsIdempotentTool: LLMClientShape["stream"] = () =>
+  Stream.fromIterable([
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolCall({ id: "call_probe", name: "probe_read", input: {} }),
+    LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+  ])
 // An answer and no tool call: the step is over as soon as the stream is, but the seal still has to
 // happen, and there is a real assistant message for it to complete.
 const textOnly: LLMClientShape["stream"] = () =>
@@ -134,9 +141,10 @@ const seedSession = Effect.gen(function* () {
     .pipe(Effect.orDie)
 })
 
-// A side-effecting tool that counts its own executions, so "the call was recorded but not run" is
-// checked against the tool itself rather than only against the projection.
-const registerProbe = (ran: { count: number }) =>
+// Two probes that count their own executions, so "recorded but not run" and "not run twice" are
+// checked against the tools themselves rather than only against the projection. `probe_read`
+// declares itself repeatable; `probe_write` does not, which is what decides a retry's behaviour.
+const registerProbes = (ran: { write: number; read: number }) =>
   Effect.gen(function* () {
     yield* (yield* ApplicationTools.Service).register({
       probe_write: Tool.make({
@@ -145,12 +153,25 @@ const registerProbe = (ran: { count: number }) =>
         output: Schema.String,
         execute: () =>
           Effect.sync(() => {
-            ran.count += 1
+            ran.write += 1
             return "wrote"
+          }),
+      }),
+      probe_read: Tool.make({
+        description: "read probe",
+        idempotent: true,
+        input: Schema.Struct({}),
+        output: Schema.String,
+        execute: () =>
+          Effect.sync(() => {
+            ran.read += 1
+            return "read"
           }),
       }),
     })
   })
+
+const counters = () => ({ write: 0, read: 0 })
 
 const toolPart = (messages: ReadonlyArray<SessionMessage.Message>, callID: string) => {
   for (const message of messages) {
@@ -167,8 +188,8 @@ describe("SessionRunner model-only attempt", () => {
   harness(callsTool).effect("records the tool call, hands it back, and does not run it", () =>
     Effect.gen(function* () {
       yield* seedSession
-      const ran = { count: 0 }
-      yield* registerProbe(ran)
+      const ran = counters()
+      yield* registerProbes(ran)
       const runner = yield* SessionRunner.Service
       const store = yield* SessionStore.Service
 
@@ -190,7 +211,7 @@ describe("SessionRunner model-only attempt", () => {
       // The provider's finish reason has to travel with the calls: it lives only in the publisher's
       // memory, so whoever seals the step in another process cannot read it back from the log.
       expect(result.settlement?.finish).toBe("tool-calls")
-      expect(ran.count).toBe(0)
+      expect(ran.write).toBe(0)
 
       const context = yield* store.context(sessionID)
       const part = toolPart(context, "call_probe")
@@ -231,20 +252,111 @@ describe("SessionRunner model-only attempt", () => {
   harness(callsTool).effect("still runs the tool and closes the step through runStep", () =>
     Effect.gen(function* () {
       yield* seedSession
-      const ran = { count: 0 }
-      yield* registerProbe(ran)
+      const ran = counters()
+      yield* registerProbes(ran)
       const runner = yield* SessionRunner.Service
       const store = yield* SessionStore.Service
 
       yield* runner.runStep({ sessionID, step: 2, promotion: undefined, first: false, force: false })
 
       // The contrast that makes the split meaningful: the whole-step path dispatches and seals.
-      expect(ran.count).toBe(1)
+      expect(ran.write).toBe(1)
       const context = yield* store.context(sessionID)
       const part = toolPart(context, "call_probe")
       expect(part?.type === "tool" ? part.state.status : undefined).toBe("completed")
       const message = assistant(context)
       expect(message?.type === "assistant" ? Boolean(message.time.completed) : false).toBe(true)
+    }),
+  )
+})
+
+// Dispatching one recorded call on its own. The policy under test is what happens on a retry, when
+// the side effect may already have run and the log cannot say: repeatable tools run again, the rest
+// are reported unknown so the model decides. Same rule the crash-resume path already follows.
+describe("SessionRunner tool dispatch", () => {
+  const deferOneCall = Effect.gen(function* () {
+    const runner = yield* SessionRunner.Service
+    const result = yield* runner.runModelCall({
+      sessionID,
+      step: 2,
+      promotion: undefined,
+      first: false,
+      force: false,
+    })
+    if (result.kind !== "called" || !result.calls[0]) throw new Error("expected a deferred call")
+    return result.calls[0]
+  })
+
+  harness(callsTool).effect("runs a deferred call and records its result", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const call = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+
+      const result = yield* runner.runToolCall({ sessionID, call, retry: false })
+
+      expect(result.outcome).toBe("settled")
+      expect(ran.write).toBe(1)
+      const part = toolPart(yield* store.context(sessionID), "call_probe")
+      expect(part?.type === "tool" ? part.state.status : undefined).toBe("completed")
+    }),
+  )
+
+  harness(callsTool).effect("does nothing when the call already has a result", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const call = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+
+      yield* runner.runToolCall({ sessionID, call, retry: false })
+      // A duplicate dispatch: at-least-once delivery means this happens, and it must not re-run.
+      const second = yield* runner.runToolCall({ sessionID, call, retry: true })
+
+      expect(second.outcome).toBe("already-settled")
+      expect(ran.write).toBe(1)
+    }),
+  )
+
+  harness(callsTool).effect("reports a retried side-effecting call as unknown instead of repeating it", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const call = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+
+      // The first attempt died somewhere between dispatch and its result landing, so the log still
+      // shows the call in flight and nothing can say whether the write happened.
+      const result = yield* runner.runToolCall({ sessionID, call, retry: true })
+
+      expect(result.outcome).toBe("unknown")
+      expect(ran.write).toBe(0)
+      const part = toolPart(yield* store.context(sessionID), "call_probe")
+      expect(part?.type === "tool" ? part.state.status : undefined).toBe("error")
+    }),
+  )
+
+  harness(callsIdempotentTool).effect("re-runs a retried call that declares itself repeatable", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const call = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+
+      const result = yield* runner.runToolCall({ sessionID, call, retry: true })
+
+      expect(result.outcome).toBe("settled")
+      expect(ran.read).toBe(1)
+      const part = toolPart(yield* store.context(sessionID), "call_probe")
+      expect(part?.type === "tool" ? part.state.status : undefined).toBe("completed")
     }),
   )
 })

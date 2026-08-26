@@ -37,6 +37,8 @@ import {
   type ModelCallResult,
   type RunError,
   type StepInput,
+  type ToolCallInput,
+  type ToolCallResult,
   type TurnAttemptResult,
   Service,
 } from "./index"
@@ -626,6 +628,61 @@ const layer = Layer.effect(
       return { ran: true, continue: false, step: step + 1, promotion: undefined }
     })
 
+    const toolPartOf = (messages: ReadonlyArray<SessionMessage.Message>, callID: string) => {
+      for (const message of messages) {
+        if (message.type !== "assistant") continue
+        for (const part of message.content) if (part.type === "tool" && part.id === callID) return part
+      }
+      return undefined
+    }
+
+    const runToolCall = Effect.fn("SessionRunner.runToolCall")(function* (input: ToolCallInput) {
+      const session = yield* getSession(input.sessionID)
+      const assistantMessageID = SessionMessage.ID.make(input.call.assistantMessageID)
+      const part = toolPartOf(yield* getContext(input.sessionID), input.call.id)
+      // The call has to be in the log already: the attempt that produced it published Tool.Called
+      // before handing it over. Missing means the log moved under us (a fence), and running a tool
+      // whose call is not recorded would leave an orphan result.
+      if (!part || part.type !== "tool")
+        return yield* Effect.die(`Tool call ${input.call.id} is not recorded on session ${input.sessionID}`)
+      // At-least-once: a duplicate dispatch landing after the result did must not run anything.
+      if (part.state.status !== "pending" && part.state.status !== "running")
+        return { outcome: "already-settled" } as ToolCallResult
+      const agent = yield* agents.select(session.agent)
+      const materialization = yield* tools.materialize(agent.info?.permissions)
+      // A retry cannot know whether the side effect happened, so only a tool that declares itself
+      // repeatable is run again. The rest are reported unknown and the model decides, because
+      // re-running the `git push` that may already have landed is the worse failure.
+      if (input.retry && !materialization.idempotent(input.call.name)) {
+        yield* events.publish(SessionEvent.Tool.Failed, {
+          sessionID: input.sessionID,
+          timestamp: yield* DateTime.now,
+          assistantMessageID,
+          callID: input.call.id,
+          error: { type: "unknown", message: "The outcome of this tool call is unknown" },
+          provider: { executed: false },
+        })
+        return { outcome: "unknown" } as ToolCallResult
+      }
+      const settlement = yield* materialization.settle({
+        sessionID: input.sessionID,
+        agent: agent.id,
+        assistantMessageID,
+        call: LLMEvent.toolCall({ id: input.call.id, name: input.call.name, input: input.call.input }),
+      })
+      yield* emitToolResult(events, {
+        sessionID: input.sessionID,
+        assistantMessageID,
+        callID: input.call.id,
+        result: settlement.result,
+        output: settlement.output,
+        outputPaths: settlement.outputPaths,
+        // Deferred calls are never provider-executed: those are filtered out before the hand-off.
+        provider: { executed: false },
+      })
+      return { outcome: "settled" } as ToolCallResult
+    })
+
     const runStep = Effect.fn("SessionRunner.runStep")(function* (input: StepInput) {
       const prologue = yield* stepPrologue(input)
       if (prologue.kind === "settled") return prologue.result
@@ -649,6 +706,7 @@ const layer = Layer.effect(
       run,
       runStep,
       runModelCall,
+      runToolCall,
     })
   }),
 )
