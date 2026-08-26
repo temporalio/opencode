@@ -127,6 +127,13 @@ Two things are load-bearing and easy to get wrong:
   retry only a tool declaring `idempotent` runs again; anything else is reported to the model as an
   unknown outcome. This is the rule the crash-resume path already followed.
 
+  It is also what closes the zombie window, which the settled-result check on its own does not: that
+  check is a read then a write, so an attempt that lost its heartbeat but kept running could race a
+  retry past it. For the case that matters, a non-idempotent side effect running twice, it cannot
+  happen anyway, because the retry refuses to run the tool at all. What can still race is which
+  truthful outcome reaches the model, the zombie's real result or the retry's "unknown", and both
+  describe something that did happen. Reporting success for a tool that never ran is not reachable.
+
 #### What it costs, measured
 
 Two separate costs, and only one of them is usually real.
@@ -225,8 +232,17 @@ Not covered, stated plainly:
   step). There is no test: forcing compaction needs a model route that declares `limits.context`,
   and the route used live does not. A regression test was written, found to pass with the bug
   deliberately reintroduced, and deleted rather than left as a false assurance.
-- **Two hosts.** Tool activities can be scheduled on any worker and file tools need the project
-  tree. `worktrees.ensure` rebuilds it from snapshot packs, but this has only ever run on one host.
+- **A tool activity rebuilds a worktree it has never seen.** Each of the three drains calls
+  `worktrees.ensure`, so a tool call landing on a worker without the project tree materializes it
+  from the snapshot packs. Checked by deleting the entire working directory between two turns of a
+  live session: the next turn's tool activity rebuilt both files, the `read` completed, and the model
+  answered with the file's contents. Worker affinity would skip the materialization on warm paths and
+  is still not implemented; the packs are the baseline that works without it.
+
+Not covered, stated plainly:
+
+- **A second machine.** The rebuild above is a worker meeting a missing tree, which is the mechanism
+  that matters, but it ran in one process on one host.
 
 #### The contract covers both modes
 
