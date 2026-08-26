@@ -6,6 +6,7 @@ import { SessionSchema } from "../schema"
 import type { ContextSnapshotDecodeError, MessageDecodeError, SessionRunDeclinedError } from "../error"
 import type { SessionInput } from "../input"
 import { SessionRunnerModel } from "./model"
+import type { StepSettlement } from "./publish-llm-event"
 import type { SystemContext } from "../../system-context/index"
 import type { ToolOutputStore } from "../../tool-output-store"
 
@@ -35,6 +36,37 @@ export interface StepResult {
   readonly promotion: SessionInput.Delivery | undefined
 }
 
+/** A tool call the provider asked for, recorded as Tool.Called but not run, handed to the caller to
+ * dispatch. Every id comes from the provider or the publisher and is carried, never regenerated: a
+ * second run of the same step would mint different ones and the results would not match the log. */
+export interface DeferredToolCall {
+  readonly id: string
+  readonly name: string
+  readonly input: unknown
+  readonly assistantMessageID: string
+}
+
+/** What one provider attempt produced. `calls` is empty unless the caller deferred dispatch, in
+ * which case the step is left open and `settlement` is what seals it. */
+export interface TurnAttemptResult {
+  readonly needsContinuation: boolean
+  readonly step: number
+  readonly calls: ReadonlyArray<DeferredToolCall>
+  readonly settlement?: StepSettlement
+}
+
+/** What a model-only attempt produced. `settled` means the step is already over (a crashed step was
+ * finalized from the log, or the recovery gate found no work) and there is nothing to dispatch.
+ * `called` hands back the recorded calls plus the settlement whoever seals the step will need. */
+export type ModelCallResult =
+  | { readonly kind: "settled"; readonly result: StepResult }
+  | {
+      readonly kind: "called"
+      readonly step: number
+      readonly calls: ReadonlyArray<DeferredToolCall>
+      readonly settlement?: StepSettlement
+    }
+
 /** Runs one local continuation from already-recorded Session history. */
 export interface Interface {
   /** Drains eligible durable work. Explicit runs perform one provider attempt even when no work is eligible. */
@@ -45,6 +77,10 @@ export interface Interface {
   /** Run exactly one step and report the next loop state, so a caller (e.g. a Temporal workflow)
    * can drive the turn one step at a time. Mirrors one iteration of `run`'s loop. */
   readonly runStep: (input: StepInput) => Effect.Effect<StepResult, RunError>
+  /** Run the provider attempt of one step and stop, handing back the tool calls it asked for instead
+   * of running them. The caller dispatches each one and then seals the step. This is what puts the
+   * model-to-tools loop in a durable executor's hands rather than inside a single activity. */
+  readonly runModelCall: (input: StepInput) => Effect.Effect<ModelCallResult, RunError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionRunner") {}

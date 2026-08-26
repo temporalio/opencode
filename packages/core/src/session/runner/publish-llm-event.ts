@@ -27,6 +27,13 @@ const tokens = (usage: Usage | undefined) => {
   }
 }
 
+/** What the provider said about how the step ended. Held in memory by the publisher, so a caller
+ * that defers Step.Ended to another process has to carry it there itself. */
+export interface StepSettlement {
+  readonly finish: string
+  readonly tokens: ReturnType<typeof tokens>
+}
+
 const record = (value: unknown): Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : { value }
 
@@ -113,7 +120,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
   let assistantActive = false
   let assistantFailed = false
   let providerFailed = false
-  let stepSettlement: { readonly finish: string; readonly tokens: ReturnType<typeof tokens> } | undefined
+  let stepSettlement: StepSettlement | undefined
 
   const startAssistant = Effect.fnUntraced(function* () {
     if (assistantMessageID !== undefined) return assistantMessageID
