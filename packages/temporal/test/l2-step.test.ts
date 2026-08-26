@@ -1,0 +1,105 @@
+// Deterministic unit tests for the stepped turn body (src/l2-step.ts) driven by fake activities --
+// no Temporal, no DB. This is the piece that turns one step into three units of work, so what is
+// pinned here is the orchestration: the owner token reaches every writer, a settled step dispatches
+// nothing, a failed tool still lets the step close, and an interrupt is not swallowed.
+import { describe, it, expect } from "bun:test"
+import { makeSteppedTurn, type SteppedActivities } from "../src/l2-step"
+import type { StepDrainInput, StepDrainResult } from "../src/activities"
+import type { ModelCallDrainResult, SealDrainInput, ToolCallDrainInput } from "../src/l2-drain"
+
+class FakeCancel extends Error {}
+const isCancellation = (e: unknown) => e instanceof FakeCancel
+
+const INPUT: StepDrainInput = { sessionID: "ses_1", step: 2, promotion: null, first: false, force: false }
+const SEALED: StepDrainResult = { ran: true, continue: true, step: 3, promotion: "steer" }
+const call = (id: string, name = "probe_write") => ({ id, name, input: {}, assistantMessageID: "msg_1" })
+
+const fakes = (
+  model: ModelCallDrainResult,
+  onTool: (input: ToolCallDrainInput) => Promise<{ outcome: "settled" }> = async () => ({ outcome: "settled" }),
+) => {
+  const tools: ToolCallDrainInput[] = []
+  const seals: SealDrainInput[] = []
+  const activities: SteppedActivities = {
+    runModelCall: async () => model,
+    runToolCall: async (input) => {
+      tools.push(input)
+      return onTool(input)
+    },
+    sealStep: async (input) => {
+      seals.push(input)
+      return SEALED
+    },
+  }
+  return { activities, tools, seals }
+}
+
+describe("stepped turn", () => {
+  it("dispatches nothing and does not seal when the step is already settled", async () => {
+    const settled: StepDrainResult = { ran: false, continue: false, step: 2, promotion: null }
+    const { activities, tools, seals } = fakes({ kind: "settled", result: settled })
+
+    const result = await makeSteppedTurn({ activities, isCancellation })(INPUT)
+
+    // A crashed step finalized from the log, or the recovery gate finding no work: there is nothing
+    // to run and nothing to close.
+    expect(result).toEqual(settled)
+    expect(tools).toHaveLength(0)
+    expect(seals).toHaveLength(0)
+  })
+
+  it("runs every call under the attempt's owner and then seals", async () => {
+    const { activities, tools, seals } = fakes({
+      kind: "called",
+      step: 2,
+      calls: [call("call_a"), call("call_b")],
+      settlement: { finish: "tool-calls", tokens: { input: 1, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } },
+      owner: "run-1:model-1:1",
+    })
+
+    const result = await makeSteppedTurn({ activities, isCancellation })(INPUT)
+
+    expect(tools.map((t) => t.call.id)).toEqual(["call_a", "call_b"])
+    // Every writer in the step publishes under the token the attempt claimed. A token minted per
+    // activity would make them fence each other out of the log.
+    expect(tools.map((t) => t.owner)).toEqual(["run-1:model-1:1", "run-1:model-1:1"])
+    expect(seals).toHaveLength(1)
+    expect(seals[0]?.owner).toBe("run-1:model-1:1")
+    // The finish reason lives only in the attempt's memory, so the seal has to be handed it.
+    expect(seals[0]?.settlement?.finish).toBe("tool-calls")
+    expect(result).toEqual(SEALED)
+  })
+
+  it("seals even when a tool call fails outright", async () => {
+    const { activities, tools, seals } = fakes(
+      { kind: "called", step: 2, calls: [call("call_a"), call("call_b")], owner: "own" },
+      async (input) => {
+        if (input.call.id === "call_a") throw new Error("activity exhausted its retries")
+        return { outcome: "settled" }
+      },
+    )
+
+    const result = await makeSteppedTurn({ activities, isCancellation })(INPUT)
+
+    // One broken tool must not take the turn with it: the seal closes that call as an error and the
+    // model gets to react, which beats losing the step.
+    expect(tools).toHaveLength(2)
+    expect(seals).toHaveLength(1)
+    expect(result).toEqual(SEALED)
+  })
+
+  it("lets an interrupt end the turn instead of sealing it", async () => {
+    const { activities, seals } = fakes(
+      { kind: "called", step: 2, calls: [call("call_a")], owner: "own" },
+      async () => {
+        throw new FakeCancel("interrupted")
+      },
+    )
+
+    const run = makeSteppedTurn({ activities, isCancellation })(INPUT)
+
+    // A cancellation is not a failed tool. Swallowing it would close a step the user stopped.
+    await expect(run).rejects.toBeInstanceOf(FakeCancel)
+    expect(seals).toHaveLength(0)
+  })
+})

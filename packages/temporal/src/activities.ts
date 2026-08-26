@@ -28,10 +28,34 @@ function ownerToken(): string {
 // The step contract lives with the drain in core; re-exported here so the workflow and its tests
 // keep one import site inside this package.
 import type { StepDrainInput, StepDrainResult } from "./drain"
+import type {
+  ModelCallDrainInput,
+  ModelCallDrainResult,
+  SealDrainInput,
+  ToolCallDrainInput,
+  ToolCallDrainResult,
+} from "./l2-drain"
 export type { StepDrainInput, StepDrainResult }
 
 export type StepActivities = {
   runTurnStep(input: StepDrainInput): Promise<StepDrainResult>
+}
+
+// Heartbeat while a drain runs so a dead worker is noticed quickly. This only proves the process is
+// alive, not that the work is progressing.
+const beating = async <A>(body: () => Promise<A>): Promise<A> => {
+  const beat = setInterval(() => {
+    try {
+      heartbeat()
+    } catch {
+      // heartbeat outside an activity context is a no-op for our purposes
+    }
+  }, 3000)
+  try {
+    return await body()
+  } finally {
+    clearInterval(beat)
+  }
 }
 
 export function makeStepActivities(
@@ -39,18 +63,44 @@ export function makeStepActivities(
 ): StepActivities {
   return {
     async runTurnStep(input) {
-      const beat = setInterval(() => {
-        try {
-          heartbeat()
-        } catch {
-          // heartbeat outside an activity context is a no-op for our purposes
-        }
-      }, 3000)
-      try {
-        return await stepDrain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal)
-      } finally {
-        clearInterval(beat)
-      }
+      return beating(() => stepDrain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal))
+    },
+  }
+}
+
+export type SteppedTurnActivities = {
+  runModelCall(input: ModelCallDrainInput): Promise<ModelCallDrainResult>
+  runToolCall(input: ToolCallDrainInput): Promise<ToolCallDrainResult>
+  sealStep(input: SealDrainInput): Promise<StepDrainResult>
+}
+
+// The three activities of a stepped step. Only the model call mints and claims an owner token: it is
+// the writer that supersedes the attempt before it, and the tool and seal activities publish under
+// the token it returned. Giving each of them its own token would make a step's writers fence each
+// other out of the log.
+export function makeSteppedTurnActivities(drains: {
+  modelCallDrain: (
+    input: ModelCallDrainInput & { readonly owner: string },
+    signal: AbortSignal,
+  ) => Promise<ModelCallDrainResult>
+  toolCallDrain: (input: ToolCallDrainInput, signal: AbortSignal) => Promise<ToolCallDrainResult>
+  sealDrain: (input: SealDrainInput, signal: AbortSignal) => Promise<StepDrainResult>
+}): SteppedTurnActivities {
+  return {
+    async runModelCall(input) {
+      return beating(() =>
+        drains.modelCallDrain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal),
+      )
+    },
+    async runToolCall(input) {
+      // Whether the side effect may already have happened is the activity's own knowledge, not the
+      // workflow's: a second attempt of THIS call is a re-run of a tool whose result never landed.
+      // The workflow could not compute this without reading non-deterministic state.
+      const retry = Context.current().info.attempt > 1
+      return beating(() => drains.toolCallDrain({ ...input, retry }, Context.current().cancellationSignal))
+    },
+    async sealStep(input) {
+      return beating(() => drains.sealDrain(input, Context.current().cancellationSignal))
     },
   }
 }
