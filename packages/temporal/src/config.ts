@@ -18,6 +18,9 @@ export interface Interface {
   readonly role: Role
   /** Override for the supervisor's idle self-termination; local mode honors the same variable. */
   readonly idleTimeout?: string
+  /** Drive each step as a provider attempt, one activity per tool call, and a seal. Off by default:
+   * the whole-step mode is what runs today, and this only changes how new sessions start. */
+  readonly stepped?: boolean
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/temporal/Config") {}
@@ -28,4 +31,5 @@ export const fromEnv = (): Interface => ({
   taskQueue: process.env.OPENCODE_TEMPORAL_TASK_QUEUE ?? DEFAULTS.taskQueue,
   role: (process.env.OPENCODE_TEMPORAL_ROLE as Role | undefined) ?? "both",
   idleTimeout: process.env.OPENCODE_SESSION_IDLE_TIMEOUT,
+  stepped: process.env.OPENCODE_TEMPORAL_STEPPED === "1",
 })
