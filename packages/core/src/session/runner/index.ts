@@ -53,6 +53,8 @@ export interface SealStepInput {
   /** The provider's finish reason and token counts, from the attempt that opened this step. They
    * live only in that process's memory, so they have to be carried here rather than read back. */
   readonly settlement?: StepSettlement
+  /** The message the attempt opened. Absent only for a step that produced nothing to close. */
+  readonly assistantMessageID?: string
 }
 
 /** One recorded tool call, to run on its own. */
@@ -82,6 +84,9 @@ export interface TurnAttemptResult {
   readonly step: number
   readonly calls: ReadonlyArray<DeferredToolCall>
   readonly settlement?: StepSettlement
+  /** The assistant message this attempt opened, minted here so a seal in another process closes the
+   * right one even when the turn published no content of its own. */
+  readonly assistantMessageID?: string
 }
 
 /** What a model-only attempt produced. `settled` means the step is already over (a crashed step was
@@ -94,6 +99,7 @@ export type ModelCallResult =
       readonly step: number
       readonly calls: ReadonlyArray<DeferredToolCall>
       readonly settlement?: StepSettlement
+      readonly assistantMessageID?: string
     }
 
 /** Runs one local continuation from already-recorded Session history. */
