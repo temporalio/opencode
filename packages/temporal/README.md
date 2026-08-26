@@ -228,6 +228,29 @@ Not covered, stated plainly:
 - **Two hosts.** Tool activities can be scheduled on any worker and file tools need the project
   tree. `worktrees.ensure` rebuilds it from snapshot packs, but this has only ever run on one host.
 
+#### The contract covers both modes
+
+The conformance suite is the executable definition of what an executor must do, and stepped mode has
+to satisfy the same one or the two Temporal modes drift and only the tested one is trustworthy:
+
+```bash
+temporal server start-dev --port 7237 --headless &
+cd packages/temporal
+# whole step per activity
+OPENCODE_CONTRACT_TEMPORAL=1 bun test --timeout 180000 test/session-execution-temporal-contract.test.ts
+# model call, one activity per tool, seal
+OPENCODE_CONTRACT_TEMPORAL=1 OPENCODE_TEMPORAL_STEPPED=1 bun test --timeout 180000 \
+  test/session-execution-temporal-contract.test.ts
+```
+
+Both pass 4/4. Running it the first time was worth the effort: **stepped mode failed 2 of the 4**,
+on a case none of the live testing had reached. `countingModel` streams a step start and a step
+finish and no content at all, so the publisher never mints an assistant message. The whole-step path
+survives that because it mints one inside `Step.Ended` via `startAssistant()`; the seal, running in
+another process with no publisher, searched the projection, found nothing, and left the turn open
+forever. The fix carries the assistant message id out of the attempt the same way the tool call ids
+are carried.
+
 #### Live streaming does not cross a process boundary
 
 Worth stating separately, because it is **not** specific to stepped mode: it is a property of

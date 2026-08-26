@@ -403,11 +403,20 @@ const layer = Layer.effect(
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
             return yield* Effect.failCause(settled.cause)
+          // A provider turn can finish having published nothing at all (no text, no tool call), and
+          // then no assistant message exists for the seal to close. The whole-step path never hits
+          // this because it mints one right here, inside Step.Ended. Mint it the same way and carry
+          // the id, rather than leave the seal to guess from the projection.
+          const assistantMessageID =
+            deferTools && stepSettlement && !publisher.hasProviderError()
+              ? yield* withPublication(publisher.startAssistant())
+              : undefined
           return {
             needsContinuation: !publisher.hasProviderError() && needsContinuation,
             step: currentStep,
             calls: deferred as ReadonlyArray<DeferredToolCall>,
             settlement: stepSettlement,
+            assistantMessageID,
           }
         }),
       )
@@ -629,7 +638,9 @@ const layer = Layer.effect(
       )
       // On a retry that lands after Step.Ended was published there is nothing open, but the loop
       // decision still has to come out the same, so it is read off the step we just closed.
+      const carried = input.assistantMessageID
       const target =
+        (carried ? context.findLast((m): m is SessionMessage.Assistant => m.id === carried) : undefined) ??
         inFlight ??
         context.findLast((message): message is SessionMessage.Assistant => message.type === "assistant")
       if (!target) return yield* stepContinuation(input.sessionID, false, input.step)
@@ -737,6 +748,7 @@ const layer = Layer.effect(
         step: result.step,
         calls: result.calls,
         settlement: result.settlement,
+        assistantMessageID: result.assistantMessageID,
       } as ModelCallResult
     })
 

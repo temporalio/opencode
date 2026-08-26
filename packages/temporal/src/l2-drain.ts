@@ -34,6 +34,7 @@ export type ModelCallDrainResult =
       readonly step: number
       readonly calls: ReadonlyArray<DeferredToolCall>
       readonly settlement?: StepSettlement
+      readonly assistantMessageID?: string
       /** The event-log token this attempt claimed. The tool and seal activities of this step must
        * publish under it, so it travels with the calls instead of being minted again. */
       readonly owner: string
@@ -56,6 +57,7 @@ export interface SealDrainInput {
   readonly sessionID: string
   readonly step: number
   readonly settlement?: StepSettlement
+  readonly assistantMessageID?: string
   readonly owner: string
 }
 
@@ -119,6 +121,7 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
                 step: result.step,
                 calls: result.calls,
                 settlement: result.settlement,
+                assistantMessageID: result.assistantMessageID,
                 owner: input.owner,
               },
         ),
@@ -143,7 +146,12 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
       input.sessionID,
       signal,
       inSession(input.sessionID, input.owner, false, (runner, session) =>
-        runner.sealStep({ sessionID: session.id, step: input.step, settlement: input.settlement }),
+        runner.sealStep({
+          sessionID: session.id,
+          step: input.step,
+          settlement: input.settlement,
+          assistantMessageID: input.assistantMessageID,
+        }),
       ).pipe(
         Effect.map((result) => ({
           ran: result.ran,
