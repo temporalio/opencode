@@ -32,7 +32,14 @@ import { SessionInput } from "../input"
 import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
-import { type RunError, Service } from "./index"
+import {
+  type DeferredToolCall,
+  type ModelCallResult,
+  type RunError,
+  type StepInput,
+  type TurnAttemptResult,
+  Service,
+} from "./index"
 import { SessionRunnerModel } from "./model"
 import { createLLMEventPublisher, emitToolResult } from "./publish-llm-event"
 import { toLLMMessages } from "./to-llm-message"
@@ -201,6 +208,9 @@ const layer = Layer.effect(
       promotion: SessionInput.Delivery | undefined,
       step: number,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
+      // When set, tool calls are recorded and returned instead of run, and the step is left open for
+      // whoever runs them. This is what lets a durable executor make each call its own unit of work.
+      deferTools = false,
     ) {
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
@@ -208,6 +218,7 @@ const layer = Layer.effect(
       const agent = yield* agents.select(session.agent)
       const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent), session.id)
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
+      const deferred: DeferredToolCall[] = []
       let needsContinuation = false
       let currentStep = step
       if (promotion) {
@@ -283,6 +294,13 @@ const layer = Layer.effect(
             }
             needsContinuation = true
             const assistantMessageID = yield* publisher.assistantMessageID(event.id)
+            // Tool.Called is already durable (the publish above), so handing the call back is enough
+            // for the caller to run it later. Nothing forks here, which is why the step ends when the
+            // stream does and the overlap between the model and its tools is lost.
+            if (deferTools) {
+              deferred.push({ id: event.id, name: event.name, input: event.input, assistantMessageID })
+              return
+            }
             yield* Effect.uninterruptibleMask((restore) =>
               restore(
                 toolMaterialization.settle({
@@ -350,7 +368,9 @@ const layer = Layer.effect(
             yield* withPublication(publisher.failUnsettledTools(`Tool execution failed: ${message}`))
           }
           const stepSettlement = publisher.stepSettlement()
-          if (stepSettlement && !publisher.hasProviderError()) {
+          // Deferred tools have not run yet, so the step is not over and the end snapshot would be
+          // taken before their side effects. Whoever runs them seals it, with the settlement below.
+          if (stepSettlement && !publisher.hasProviderError() && !deferTools) {
             const endSnapshot = yield* snapshots.capture()
             // Ship the post-step tree: this is the state a resumed step on another host needs.
             if (endSnapshot) yield* snapshotSync.push(endSnapshot)
@@ -380,7 +400,12 @@ const layer = Layer.effect(
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
             return yield* Effect.failCause(settled.cause)
-          return { needsContinuation: !publisher.hasProviderError() && needsContinuation, step: currentStep }
+          return {
+            needsContinuation: !publisher.hasProviderError() && needsContinuation,
+            step: currentStep,
+            calls: deferred as ReadonlyArray<DeferredToolCall>,
+            settlement: stepSettlement,
+          }
         }),
       )
     }, Effect.scoped)
@@ -388,31 +413,32 @@ const layer = Layer.effect(
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
-    ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number }, RunError>
+      deferTools?: boolean,
+    ) => Effect.Effect<TurnAttemptResult, RunError>
 
-    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step).pipe(
+    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, deferTools) {
+      return yield* runTurnAttempt(sessionID, promotion, step, undefined, deferTools).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
               return yield* Effect.die("Post-compaction provider attempt cannot recover another overflow")
             yield* Effect.yieldNow
-            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
+            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, deferTools)
           }),
         ),
       )
     })
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow).pipe(
+    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, deferTools) {
+      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow, deferTools).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             yield* Effect.yieldNow
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
-              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
-            return yield* runTurn(sessionID, undefined, defect.transition.step)
+              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, deferTools)
+            return yield* runTurn(sessionID, undefined, defect.transition.step, deferTools)
           }),
         ),
       )
@@ -545,20 +571,17 @@ const layer = Layer.effect(
 
     // One iteration of `run`'s loop, exposed so a Temporal workflow can drive the turn one step at
     // a time (each step = one runTurn = one provider attempt + its tools). Semantics match `run`.
-    const runStep = Effect.fn("SessionRunner.runStep")(function* (input: {
-      readonly sessionID: SessionSchema.ID
-      readonly step: number
-      readonly promotion: SessionInput.Delivery | undefined
-      readonly first: boolean
-      readonly force: boolean
-    }) {
+    // The checks every step runs before the provider is called. Shared by the whole-step path and
+    // the model-only path so the two cannot drift apart. Returns the terminal result when the step
+    // is already over, otherwise the promotion the turn should apply.
+    const stepPrologue = Effect.fn("SessionRunner.stepPrologue")(function* (input: StepInput) {
       // One projected-history load serves all the entry checks; nothing mutates the projection
       // between them. The turn itself reloads after the first mutation.
       const entryContext = yield* getContext(input.sessionID)
       // Re-drive of a crashed step: finalize it from the log rather than re-calling the model and
       // re-running its already-dispatched tools.
       const resumed = yield* resumeCrashedStep(input, entryContext)
-      if (resumed) return resumed
+      if (resumed) return { kind: "settled", result: resumed } as const
       let promotion = input.promotion
       if (input.first) {
         const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
@@ -572,7 +595,10 @@ const layer = Layer.effect(
           !hasQueue &&
           !(yield* hasRecoverableWork(input.sessionID, entryContext))
         )
-          return { ran: false, continue: false, step: input.step, promotion: undefined }
+          return {
+            kind: "settled",
+            result: { ran: false, continue: false, step: input.step, promotion: undefined },
+          } as const
         promotion = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       }
       // Close tools left pending/running by an interrupted attempt before every turn, not just the
@@ -580,19 +606,49 @@ const layer = Layer.effect(
       // re-stream a request with a dangling tool_use and no tool_result, which the provider rejects
       // -- a retry poison loop. This is a no-op on a healthy step (the prior step settled its tools).
       yield* failInterruptedTools(input.sessionID, entryContext)
-      const result = yield* runTurn(input.sessionID, promotion, input.step)
-      let needsContinuation = result.needsContinuation
-      if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+      return { kind: "run", promotion } as const
+    })
+
+    // What the loop does once a step's provider attempt and its tools are done: a pending steer wins
+    // over a queued prompt, and either one keeps the turn going. Shared for the same reason as the
+    // prologue, and read after the tools have run so work admitted during the step is seen.
+    const stepContinuation = Effect.fn("SessionRunner.stepContinuation")(function* (
+      sessionID: SessionSchema.ID,
+      hadToolCalls: boolean,
+      step: number,
+    ) {
+      let needsContinuation = hadToolCalls
+      if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, sessionID, "steer")
       if (needsContinuation)
-        return { ran: true, continue: true, step: result.step + 1, promotion: "steer" as SessionInput.Delivery }
-      const moreQueue = yield* SessionInput.hasPending(db, input.sessionID, "queue")
+        return { ran: true, continue: true, step: step + 1, promotion: "steer" as SessionInput.Delivery }
+      const moreQueue = yield* SessionInput.hasPending(db, sessionID, "queue")
       if (moreQueue) return { ran: true, continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
-      return { ran: true, continue: false, step: result.step + 1, promotion: undefined }
+      return { ran: true, continue: false, step: step + 1, promotion: undefined }
+    })
+
+    const runStep = Effect.fn("SessionRunner.runStep")(function* (input: StepInput) {
+      const prologue = yield* stepPrologue(input)
+      if (prologue.kind === "settled") return prologue.result
+      const result = yield* runTurn(input.sessionID, prologue.promotion, input.step)
+      return yield* stepContinuation(input.sessionID, result.needsContinuation, result.step)
+    })
+
+    const runModelCall = Effect.fn("SessionRunner.runModelCall")(function* (input: StepInput) {
+      const prologue = yield* stepPrologue(input)
+      if (prologue.kind === "settled") return { kind: "settled", result: prologue.result } as ModelCallResult
+      const result = yield* runTurn(input.sessionID, prologue.promotion, input.step, true)
+      return {
+        kind: "called",
+        step: result.step,
+        calls: result.calls,
+        settlement: result.settlement,
+      } as ModelCallResult
     })
 
     return Service.of({
       run,
       runStep,
+      runModelCall,
     })
   }),
 )
