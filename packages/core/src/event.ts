@@ -1,6 +1,6 @@
 export * as EventV2 from "./event"
 
-import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
+import { Cause, Context, Duration, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
@@ -174,7 +174,17 @@ export const allBounded = (events: Interface, capacity: number) =>
 
 export interface LayerOptions {
   readonly beforeAggregateRead?: (aggregateID: string) => Effect.Effect<void>
+  /** How often a durable tail re-reads on its own, on top of the in-process wake. The wake only
+   * fires for commits made in THIS process, so without a tick a subscriber cannot see events another
+   * process appended: a standalone worker's whole turn is invisible to a tail on the HTTP server.
+   * Set to 0 to disable and rely on the wake alone. */
+  readonly livePollInterval?: Duration.Input
 }
+
+/** Chosen to be well under what a person notices in a transcript while staying one cheap indexed
+ * read per subscribed session. In-process commits still wake instantly; this only catches what the
+ * wake cannot see. */
+const DEFAULT_LIVE_POLL = Duration.seconds(1)
 
 export const layerWith = (options?: LayerOptions) =>
   Layer.effect(
@@ -619,7 +629,14 @@ export const layerWith = (options?: LayerOptions) =>
               ),
             )
             const historical = yield* read
+            // Wake on either an in-process commit or the tick. A tick that finds nothing new reads
+            // zero rows and emits nothing, so an idle subscriber costs one indexed query per period.
+            const pollInterval = options?.livePollInterval ?? DEFAULT_LIVE_POLL
+            const ticks = Duration.isZero(Duration.fromInputUnsafe(pollInterval))
+              ? Stream.never
+              : Stream.tick(pollInterval)
             const live = Stream.fromSubscription(wakes).pipe(
+              Stream.merge(ticks),
               Stream.mapEffect(() => read),
               Stream.flattenIterable,
             )
