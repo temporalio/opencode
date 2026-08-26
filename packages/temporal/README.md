@@ -145,9 +145,28 @@ tail and a sleeping tool, so the number is the overlap and nothing else:
 | 3000 ms | 1500 ms | 3038 ms | 4542 ms | **1504 ms** | 1500 ms |
 
 So the loss per step is `min(stream tail after the first tool call, tool duration)`, within about
-10 ms every time. It is **zero when the tool call is the last thing in the stream**, which is the
-common shape: the model asks and stops. It only bites when the model keeps generating after asking,
-and even then the tool's own duration caps it.
+10 ms every time. It is zero when the tool call is the last thing in the stream, and that turns out
+to be what real providers do.
+
+`packages/temporal/scripts/stream-tail-probe.ts` measures the tail against the live API, timed from
+the point the runner actually forks: the `tool-call` event, which the protocol layer emits once a
+call's arguments are complete and parsed, not when its id first appears. Six coding-agent-shaped
+prompts, including ones asking for three and five tools at once and ones asking the model to narrate
+around the call:
+
+| model | median tail | max tail | text after the first call |
+|---|---:|---:|---|
+| `gpt-4o-mini` (chat) | 0 ms | 50 ms | none, in any probe |
+| `gpt-5-mini` (responses) | 33 ms | 36 ms | none, in any probe |
+| `gpt-5` (responses) | 34 ms | 77 ms | none, in any probe |
+
+A single tool call *is* the end of the stream, so there is nothing to overlap. A tail appears only
+when the model asks for several tools at once, and is then just the time to stream calls 2..N: tens
+of milliseconds, one to three percent of the stream. No model emitted a single character of text
+after asking for its first tool.
+
+Taken with the hand-offs below, the whole cost of the split is roughly 40-110 ms per step against
+model calls of two to eight seconds. The overlap is not a reason to avoid it.
 
 **The extra round trips.** Three activities per step instead of one means two more hand-offs.
 Measured from workflow history on a loopback dev server (mean of four, one turn):
