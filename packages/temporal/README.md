@@ -267,6 +267,37 @@ another process with no publisher, searched the projection, found nothing, and l
 forever. The fix carries the assistant message id out of the attempt the same way the tool call ids
 are carried.
 
+#### Worker affinity (`OPENCODE_TEMPORAL_WORKTREE_AFFINITY=1`)
+
+Off by default. Without it every worker polls one queue, and a worker drawing a session whose tree it
+has never seen rebuilds that tree from snapshot packs. That is the portable baseline and it works.
+Affinity avoids the rebuild by routing instead: the queue name is derived from the session's
+directory, and only workers serving that directory poll it.
+
+```bash
+# a worker declares the tree it serves; defaults to the process directory
+OPENCODE_TEMPORAL_WORKTREE_AFFINITY=1 OPENCODE_TEMPORAL_WORKTREE=/srv/trees/acme \
+  OPENCODE_TEMPORAL_ROLE=worker ... bun run packages/server/src/worker.ts
+```
+
+The queue is keyed on the session's `location.directory`, not the project root, because that is the
+tree `worktrees.ensure` has to produce and two sessions in one project can sit in different
+directories. Paths are resolved through `realpath` first: on macOS `/tmp/x` and `/private/tmp/x` are
+one tree, and a client and a worker that disagreed would sit on two queues and the session would hang
+with nothing to show for it.
+
+**This trades availability for latency, which is why it is opt-in.** With affinity on, a session
+whose tree has no worker polling does not fall back to another worker. It waits. Reconstruction is
+what makes any worker able to serve any session, and turning affinity on is choosing not to use it.
+
+Verified live, all three halves:
+
+- a worker serving the session's tree ran the turn, and the workflow sat on the derived queue
+- with only a worker serving a *different* tree alive, the next prompt was not answered, and the
+  queue showed a workflow backlog of one, aged 50 seconds
+- bringing the right worker back drained it and the answer arrived, so the work waits rather than
+  being lost
+
 #### Live streaming across a process boundary
 
 Worth stating separately, because it is **not** specific to stepped mode: it is a property of
