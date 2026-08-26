@@ -46,6 +46,26 @@ export interface DeferredToolCall {
   readonly assistantMessageID: string
 }
 
+/** One recorded tool call, to run on its own. */
+export interface ToolCallInput {
+  readonly sessionID: SessionSchema.ID
+  readonly call: DeferredToolCall
+  /** True when this call is being dispatched again after a crash or a timeout, so its side effect
+   * may already have happened. The dispatcher knows this; the log cannot tell us. */
+  readonly retry: boolean
+}
+
+/** How a dispatched call ended.
+ * - `settled`: the tool ran and its result is durable.
+ * - `already-settled`: the log already had a result, so nothing ran. This is the at-least-once case.
+ * - `unknown`: a retry of a tool that does not declare itself repeatable. Reported to the model as
+ *   an unknown outcome rather than run a second time. */
+export type ToolCallOutcome = "settled" | "already-settled" | "unknown"
+
+export interface ToolCallResult {
+  readonly outcome: ToolCallOutcome
+}
+
 /** What one provider attempt produced. `calls` is empty unless the caller deferred dispatch, in
  * which case the step is left open and `settlement` is what seals it. */
 export interface TurnAttemptResult {
@@ -81,6 +101,9 @@ export interface Interface {
    * of running them. The caller dispatches each one and then seals the step. This is what puts the
    * model-to-tools loop in a durable executor's hands rather than inside a single activity. */
   readonly runModelCall: (input: StepInput) => Effect.Effect<ModelCallResult, RunError>
+  /** Run one recorded tool call and publish its result. Safe to call twice for the same call: the
+   * second sees the settled result and does nothing. */
+  readonly runToolCall: (input: ToolCallInput) => Effect.Effect<ToolCallResult, RunError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionRunner") {}
