@@ -80,6 +80,12 @@ const callsIdempotentTool: LLMClientShape["stream"] = () =>
     LLMEvent.toolCall({ id: "call_probe", name: "probe_read", input: {} }),
     LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
   ])
+// A provider turn that publishes nothing at all: no text, no reasoning, no tool call. The publisher
+// mints the assistant message lazily on first content, so after this stream there is no message in
+// the log for a seal to find. The whole-step path survives it because Step.Ended mints one on the
+// way past; a seal running in another process has no publisher to mint with.
+const silent: LLMClientShape["stream"] = () =>
+  Stream.fromIterable([LLMEvent.stepStart({ index: 0 }), LLMEvent.stepFinish({ index: 0, reason: "stop" })])
 // An answer and no tool call: the step is over as soon as the stream is, but the seal still has to
 // happen, and there is a real assistant message for it to complete.
 const textOnly: LLMClientShape["stream"] = () =>
@@ -464,6 +470,44 @@ describe("SessionRunner step seal", () => {
       const part = toolPart(yield* store.context(sessionID), "call_probe")
       expect(part?.type === "tool" ? part.state.status : undefined).toBe("error")
       expect(ran.write).toBe(0)
+    }),
+  )
+})
+
+// Regression: a content-free provider turn must still close. This failed 2 of 4 conformance
+// scenarios when the split first ran against them, and the turn hung open forever. The conformance
+// suite catches it but needs a dev server and an opt-in env var, so nothing in CI would.
+describe("SessionRunner seal of a silent turn", () => {
+  harness(silent).effect("closes a turn that published no content of its own", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+
+      const model = yield* runner.runModelCall({
+        sessionID,
+        step: 2,
+        promotion: undefined,
+        first: false,
+        force: false,
+      })
+      expect(model.kind).toBe("called")
+      if (model.kind !== "called") return
+      // The attempt has to hand the seal a message id, because there is nothing in the projection
+      // for it to find and it cannot mint one without a publisher.
+      expect(model.assistantMessageID).toBeTruthy()
+
+      const result = yield* runner.sealStep({
+        sessionID,
+        step: model.step,
+        settlement: model.settlement,
+        assistantMessageID: model.assistantMessageID,
+      })
+
+      expect(result.continue).toBe(false)
+      const message = assistant(yield* store.context(sessionID))
+      expect(message?.type).toBe("assistant")
+      expect(message?.type === "assistant" ? Boolean(message.time.completed) : false).toBe(true)
     }),
   )
 })
