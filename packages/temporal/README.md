@@ -93,6 +93,58 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
   the in-flight step activity (attempt 2), the run continues from the event log, and the workflow
   completes.
 
+### A step as three activities (`OPENCODE_TEMPORAL_STEPPED=1`)
+
+By default one step (a provider attempt plus every tool it asks for) is a single activity. That is
+the smallest unit the runner used to expose, and it means nothing can sit between the model asking
+for a tool and the tool running. `OPENCODE_TEMPORAL_STEPPED=1` splits a step into three kinds of
+activity instead:
+
+```
+runModelCall  ->  runToolCall (one per call, concurrent)  ->  sealStep
+```
+
+`SessionRunner.runModelCall` performs the attempt, records each call as `Tool.Called`, and hands the
+calls back rather than running them. `runToolCall` settles one call. `sealStep` takes the end
+snapshot, diffs it against the start, and publishes `Step.Ended`. The loop between them is workflow
+code, so a retry policy, a timeout, an approval or a budget can live where the model-to-tools handoff
+used to be. Each activity also carries its own bounds: sealing does not inherit a turn-sized
+backstop, and one tool waiting on a human no longer holds the attempt and its sibling tools under a
+single timeout.
+
+The supervisor is unchanged. Wake, interrupt, idle self-termination and continue-as-new only ever
+called one `runTurnStep`, so the stepped mode supplies a different one. The mode rides the workflow
+input, so a session that rolls over keeps it.
+
+Two things are load-bearing and easy to get wrong:
+
+- **One owner token per step, not per activity.** The event log fences a publish behind the current
+  owner, so a step's writers have to share one. Only `runModelCall` claims; the tool and seal
+  activities publish under the token it returns. A token per activity execution (right when the
+  activity *is* the whole step) would make them fence each other out.
+- **A retried call is not silently repeated.** Whether a side effect already happened is the
+  activity's knowledge, not the workflow's, so `retry` comes from the Temporal attempt number. On a
+  retry only a tool declaring `idempotent` runs again; anything else is reported to the model as an
+  unknown outcome. This is the rule the crash-resume path already followed.
+
+What it costs: a whole-step activity starts each tool the moment the model asks for it, while the
+stream is still going. Here the attempt has to return before any tool starts, because a workflow
+cannot consume a stream. The tools of one step still run concurrently with each other; the overlap
+between the model and its own tools is what is lost.
+
+#### Verified
+
+Live against a dev server and `gpt-5-mini`, with `OPENCODE_SESSION_EXECUTION=temporal` and
+`OPENCODE_TEMPORAL_STEPPED=1`:
+
+- A turn using one tool recorded five activities: `runModelCall`, `runToolCall`, `sealStep` for the
+  step that called the tool, then `runModelCall`, `sealStep` for the answer. The tool ran once.
+- Crash mid-tool: a turn ran `echo ... >> counter.txt` in one step and `sleep 60` in the next, and
+  the serve process (with its embedded worker) was killed with the sleep in flight. On a fresh
+  worker the interrupted `runToolCall` came back as **attempt 2**, `counter.txt` still held one
+  line (the settled tool was not re-run), the interrupted call reached the model as "The outcome of
+  this tool call is unknown", and the turn ran on to its answer.
+
 ### Two modes, one runner
 
 The factory has exactly two modes, both driving the same `SessionRunner` over the same durable event
