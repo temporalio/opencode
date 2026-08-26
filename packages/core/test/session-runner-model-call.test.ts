@@ -34,6 +34,13 @@ import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
+import { SessionContextEpoch } from "@opencode-ai/core/session/context-epoch"
+import { createLLMEventPublisher } from "@opencode-ai/core/session/runner/publish-llm-event"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { EventTable } from "@opencode-ai/core/event/sql"
+import { eq } from "drizzle-orm"
 import { Location } from "@opencode-ai/core/location"
 import { SystemContextRegistry } from "@opencode-ai/core/system-context/registry"
 import { SystemContext } from "@opencode-ai/core/system-context"
@@ -508,6 +515,138 @@ describe("SessionRunner seal of a silent turn", () => {
       const message = assistant(yield* store.context(sessionID))
       expect(message?.type).toBe("assistant")
       expect(message?.type === "assistant" ? Boolean(message.time.completed) : false).toBe(true)
+    }),
+  )
+})
+
+// Compaction restarts the provider attempt by dying with a transition defect that runTurn catches
+// and re-enters. That recursion has to carry `deferTools`, or a step that happens to compact
+// silently falls back to running its tools inline and the caller never gets the calls it was meant
+// to dispatch. A first version of this dropped the flag, so this is a real regression test.
+describe("SessionRunner model-only attempt under compaction", () => {
+  // The summary request is the one with no tools. It needs text back, while the turn itself needs a
+  // tool call, so the mock has to answer them differently.
+  const compactingStream: LLMClientShape["stream"] = (request) =>
+    request.tools.length === 0
+      ? Stream.fromIterable([
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.textStart({ id: "sum" }),
+          LLMEvent.textDelta({ id: "sum", text: "## Objective\n- keep going" }),
+          LLMEvent.textEnd({ id: "sum" }),
+          LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        ])
+      : callsTool(request)
+
+  const tightModel = SessionRunnerModel.layerWith(() =>
+    Effect.succeed(
+      OpenAIChat.route
+        .with({ endpoint: { baseURL: "https://api.openai.com/v1" }, auth: Auth.bearer("fixture") })
+        // Small enough that a seeded turn already overflows the headroom, so the attempt compacts.
+        .with({ limits: { context: 4_000, output: 50 } })
+        .model({ id: "gpt-4o-mini" }),
+    ),
+  )
+  const compactingConfig = Layer.succeed(
+    Config.Service,
+    Config.Service.of({
+      entries: () =>
+        Effect.succeed([
+          new Config.Document({
+            type: "document",
+            info: new Config.Info({
+              compaction: new ConfigCompaction.Info({
+                buffer: 3_000,
+                keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
+              }),
+            }),
+          }),
+        ]),
+    }),
+  )
+
+  const compactHarness = testEffect(
+    AppNodeBuilder.build(
+      LayerNode.group([
+        Database.node,
+        EventV2.node,
+        SessionProjector.node,
+        SessionStore.node,
+        AgentV2.node,
+        ToolRegistry.node,
+        SessionRunnerModel.node,
+        SystemContextRegistry.node,
+        SkillGuidance.node,
+        ReferenceGuidance.node,
+        Config.node,
+        Snapshot.node,
+        SessionRunnerLLM.node,
+        ApplicationTools.node,
+      ]),
+      [
+        [LayerNodePlatform.llmClient, mockClient(compactingStream)],
+        [PermissionV2.node, permission],
+        [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
+        [SessionRunnerModel.node, tightModel],
+        [SystemContextRegistry.node, systemContext],
+        [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
+        [SkillGuidance.node, skillGuidance],
+        [ReferenceGuidance.node, referenceGuidance],
+        [Config.node, compactingConfig],
+        [Snapshot.node, Snapshot.noopLayer],
+      ],
+    ),
+  )
+
+  compactHarness.effect("still defers dispatch after a compaction restart", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      // The context epoch has to exist BEFORE the history is seeded. It records the sequence it was
+      // created at, and the runner only reads entries after that baseline, so seeding first would
+      // put the whole conversation behind the baseline and the request would come out empty.
+      const { db } = yield* Database.Service
+      yield* SessionContextEpoch.initialize(db, Effect.succeed(SystemContext.empty), sessionID)
+      // A finished turn already in the log, sized into a narrow band. It has to exceed the request
+      // headroom (context - buffer = 1000 tokens) so the attempt compacts at all, while the summary
+      // prompt it produces has to stay under context - summaryOutput (3950) or compaction bails out
+      // on its own guard and never restarts the attempt.
+      const events = yield* EventV2.Service
+      const seeder = createLLMEventPublisher(events, {
+        sessionID,
+        agent: "build",
+        model: { id: ModelV2.ID.make("gpt-4o-mini"), providerID: ProviderV2.ID.make("openai") },
+      })
+      yield* seeder.publish(LLMEvent.textStart({ id: "old" }))
+      yield* seeder.publish(LLMEvent.textDelta({ id: "old", text: "Earlier answer. ".repeat(500) }))
+      yield* seeder.publish(LLMEvent.textEnd({ id: "old" }))
+      yield* seeder.publish(LLMEvent.stepFinish({ index: 0, reason: "stop" }))
+
+
+      const runner = yield* SessionRunner.Service
+      const result = yield* runner.runModelCall({
+        sessionID,
+        step: 2,
+        promotion: undefined,
+        first: false,
+        force: false,
+      })
+
+      // Guard against a vacuous pass: without compaction actually firing this proves nothing about
+      // the restart path.
+      const rows = yield* db
+        .select({ type: EventTable.type })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+      expect(rows.filter((row) => row.type.includes("compaction")).length).toBeGreaterThan(0)
+
+      // The point: whatever the attempt went through, dispatch is still the caller's.
+      expect(result.kind).toBe("called")
+      if (result.kind !== "called") return
+      expect(result.calls.map((call) => call.id)).toEqual(["call_probe"])
+      expect(ran.write).toBe(0)
     }),
   )
 })
