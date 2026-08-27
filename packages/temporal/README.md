@@ -126,16 +126,23 @@ Two things are load-bearing and easy to get wrong:
   owner, so a step's writers have to share one. Only `runModelCall` claims; the tool and seal
   activities publish under the token it returns. A token per activity execution (right when the
   activity *is* the whole step) would make them fence each other out.
-- **A retried call is not silently repeated.** Whether a side effect already happened is the
-  activity's knowledge, not the workflow's, so `retry` comes from the Temporal attempt number. On a
-  retry only a tool declaring `idempotent` runs again; anything else is reported to the model as an
-  unknown outcome. This is the rule the crash-resume path already followed.
+- **A call that already started is not silently repeated.** Whether a side effect may have happened
+  is read off the log: `runToolCall` publishes `Tool.Called` before it runs the tool, so a call the
+  log shows as running is one a dispatch was already inside. Then only a tool declaring `idempotent`
+  runs again; anything else is reported to the model as an unknown outcome. This is the rule the
+  crash-resume path already followed, off the same evidence.
+
+  The attempt number would answer the same question far less precisely. It counts every way a
+  dispatch can die, including the ones that never reached the tool, so a call nobody had touched
+  would come back to the model as an unknown outcome. Publishing the call at dispatch also moves the
+  fence in front of the side effect: under a superseded owner the publish fails and the tool never
+  runs, where before it ran and then lost its result.
 
   It is also what closes the zombie window, which the settled-result check on its own does not: that
   check is a read then a write, so an attempt that lost its heartbeat but kept running could race a
   retry past it. For the case that matters, a non-idempotent side effect running twice, it cannot
-  happen anyway, because the retry refuses to run the tool at all. What can still race is which
-  truthful outcome reaches the model, the zombie's real result or the retry's "unknown", and both
+  happen anyway, because the second dispatch refuses to run the tool at all. What can still race is
+  which truthful outcome reaches the model, the zombie's real result or the "unknown", and both
   describe something that did happen. Reporting success for a tool that never ran is not reachable.
 
 #### What it costs, measured
@@ -522,12 +529,20 @@ all ride the shared store.
 
 **The project working tree** now rides the store too. After each step capture the runner ships
 the snapshot tree as an incremental git pack (`snapshot-sync.ts`, `snapshot_pack` table). Before a
-drain runs, a worker missing the session's directory rebuilds the worktree from those packs
-(`session/execution/worktree.ts`): uncommitted edits and untracked files included, checked out at
-the same absolute path it was captured at (a uniform fleet layout). Ignored files and dependencies
-are not captured, so a rebuilt tree may need an install step before `bash` behaves identically.
-Worker affinity (below) or a shared volume skips the materialization latency on warm paths; the
-packs are the portable baseline that works with neither.
+drain runs, a worker whose tree is missing or older than the store's newest capture builds it from
+those packs (`session/execution/worktree.ts`): uncommitted edits and untracked files included,
+checked out at the same absolute path it was captured at (a uniform fleet layout). Ignored files
+and dependencies are not captured, so a rebuilt tree may need an install step before `bash` behaves
+identically. Worker affinity (below) or a shared volume skips the materialization latency on warm
+paths; the packs are the portable baseline that works with neither.
+
+Two rules bound what that refresh may touch, because checking a stored tree out over the wrong one
+destroys work. A tree is moved only when a host-local note (`snapshot/tip.ts`) says this host is
+behind the store, so a host holding a capture that never shipped is left as it is. And it is moved
+only when this host built the tree from packs, so a checkout the host already had, a developer's own
+working copy, is never rewritten: that case is logged and left alone. What stays open is the tools
+of ONE step running on two hosts, since nothing captures their writes until the step is sealed.
+Affinity is what keeps a step's tools on one tree.
 
 Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
 
