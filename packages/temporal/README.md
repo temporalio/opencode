@@ -277,13 +277,18 @@ OPENCODE_CONTRACT_TEMPORAL=1 OPENCODE_TEMPORAL_STEPPED=1 bun test --timeout 1800
   test/session-execution-temporal-contract.test.ts
 ```
 
-Both pass 4/4. Running it the first time was worth the effort: **stepped mode failed 2 of the 4**,
-on a case none of the live testing had reached. `countingModel` streams a step start and a step
-finish and no content at all, so the publisher never mints an assistant message. The whole-step path
-survives that because it mints one inside `Step.Ended` via `startAssistant()`; the seal, running in
-another process with no publisher, searched the projection, found nothing, and left the turn open
-forever. The fix carries the assistant message id out of the attempt the same way the tool call ids
-are carried.
+Both modes pass, and so does the local coordinator in core's own `bun test`. Running it the first
+time was worth the effort: **stepped mode failed two scenarios**, on a case none of the live testing
+had reached. `countingModel` streams a step start and a step finish and no content at all, so the
+publisher never mints an assistant message. The whole-step path survives that because it mints one
+inside `Step.Ended` via `startAssistant()`; the seal, running in another process with no publisher,
+searched the projection, found nothing, and left the turn open forever. The fix carries the
+assistant message id out of the attempt the same way the tool call ids are carried.
+
+One scenario is there for this split in particular: a turn that asks for a tool, runs it, and goes
+back to the model with the result. Everything else in the suite settles without a tool, so the piece
+the split actually changes, one activity per call rather than one for the whole step, would have had
+no scenario that both modes must pass.
 
 #### Worker affinity (`OPENCODE_TEMPORAL_WORKTREE_AFFINITY=1`)
 
