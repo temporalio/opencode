@@ -26,6 +26,7 @@ import { ToolRegistry } from "../../tool/registry"
 import { ToolOutputStore } from "../../tool-output-store"
 import { SessionContextEpoch } from "../context-epoch"
 import { SessionCompaction } from "../compaction"
+import { SessionRunDeclinedError } from "../error"
 import { SessionEvent } from "../event"
 import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
@@ -823,18 +824,20 @@ const layer = Layer.effect(
             input: input.call.input,
           }),
         })
-        // A decline is the user stopping the turn, not a tool that failed. It has to reach the
-        // boundary as an interrupt, or the dispatcher treats it as one bad tool, seals the step and
-        // the agent carries on past a refusal.
         .pipe(
-          Effect.catchCause((cause) =>
-            isUserDeclined(cause) ? Effect.interrupt : Effect.failCause(cause),
-          ),
           // The tool itself ran: what failed is storing its output. Letting that fail the dispatch
           // would retry a side effect that already happened and finally tell the model the call was
           // interrupted, which is not what happened to it. The whole-step path reports the same
-          // reason the same way.
+          // reason the same way. A decline is a defect, so it passes through this untouched.
           Effect.catch((error) => Effect.succeed({ failure: error })),
+          // A decline is the user stopping the turn, not a tool that failed. It is named here
+          // rather than raised as a bare interrupt, so nothing downstream has to infer from the
+          // absence of a cancellation what the user meant.
+          Effect.catchCause((cause) =>
+            isUserDeclined(cause)
+              ? Effect.fail(new SessionRunDeclinedError({ sessionID: input.sessionID }))
+              : Effect.failCause(cause),
+          ),
         )
       if ("failure" in settlement) {
         const reason =

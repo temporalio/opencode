@@ -71,6 +71,9 @@ export const makeDrains = ({ store, locations, ctx, events, worktrees }: DrainDe
         ).pipe(Effect.provide(locations.get(session.location)))
         return { ran: r.ran, continue: r.continue, step: r.step, promotion: r.promotion ?? null }
       }).pipe(Effect.provideService(EventV2.EventOwner, input.owner), Effect.provide(ctx), Effect.scoped),
+      // A whole step turns a declined permission into an interrupt to halt its own loop, so an
+      // interrupt with nothing cancelling it is that refusal and nothing else.
+      { declineIsInterrupt: true },
     )
 
   return { stepDrain }
