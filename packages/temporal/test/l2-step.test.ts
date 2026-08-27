@@ -8,7 +8,9 @@ import type { StepDrainInput, StepDrainResult } from "../src/activities"
 import type { ModelCallDrainResult, SealDrainInput, ToolCallDrainInput } from "../src/l2-drain"
 
 class FakeCancel extends Error {}
+class FakeHalt extends Error {}
 const isCancellation = (e: unknown) => e instanceof FakeCancel
+const isHalt = (e: unknown) => e instanceof FakeHalt
 
 const INPUT: StepDrainInput = { sessionID: "ses_1", step: 2, promotion: null, first: false, force: false }
 const SEALED: StepDrainResult = { ran: true, continue: true, step: 3, promotion: "steer" }
@@ -39,7 +41,7 @@ describe("stepped turn", () => {
     const settled: StepDrainResult = { ran: false, continue: false, step: 2, promotion: null }
     const { activities, tools, seals } = fakes({ kind: "settled", result: settled })
 
-    const result = await makeSteppedTurn({ activities, isCancellation })(INPUT)
+    const result = await makeSteppedTurn({ activities, isCancellation, isHalt })(INPUT)
 
     // A crashed step finalized from the log, or the recovery gate finding no work: there is nothing
     // to run and nothing to close.
@@ -57,7 +59,7 @@ describe("stepped turn", () => {
       owner: "run-1:model-1:1",
     })
 
-    const result = await makeSteppedTurn({ activities, isCancellation })(INPUT)
+    const result = await makeSteppedTurn({ activities, isCancellation, isHalt })(INPUT)
 
     expect(tools.map((t) => t.call.id)).toEqual(["call_a", "call_b"])
     // Every writer in the step publishes under the token the attempt claimed. A token minted per
@@ -79,7 +81,7 @@ describe("stepped turn", () => {
       },
     )
 
-    const result = await makeSteppedTurn({ activities, isCancellation })(INPUT)
+    const result = await makeSteppedTurn({ activities, isCancellation, isHalt })(INPUT)
 
     // One broken tool must not take the turn with it: the seal closes that call as an error and the
     // model gets to react, which beats losing the step.
@@ -96,10 +98,27 @@ describe("stepped turn", () => {
       },
     )
 
-    const run = makeSteppedTurn({ activities, isCancellation })(INPUT)
+    const run = makeSteppedTurn({ activities, isCancellation, isHalt })(INPUT)
 
     // A cancellation is not a failed tool. Swallowing it would close a step the user stopped.
     await expect(run).rejects.toBeInstanceOf(FakeCancel)
+    expect(seals).toHaveLength(0)
+  })
+
+  it("lets a user halt end the turn instead of sealing it", async () => {
+    const { activities, seals } = fakes(
+      { kind: "called", step: 2, calls: [call("call_a")], owner: "own" },
+      async () => {
+        throw new FakeHalt("declined")
+      },
+    )
+
+    const run = makeSteppedTurn({ activities, isCancellation, isHalt })(INPUT)
+
+    // A decline crosses the activity boundary as an ordinary failure, not a cancel, so without a
+    // separate test for it the dispatcher would seal the step and the turn would carry on past the
+    // user's refusal.
+    await expect(run).rejects.toBeInstanceOf(FakeHalt)
     expect(seals).toHaveLength(0)
   })
 })

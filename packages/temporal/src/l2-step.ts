@@ -31,6 +31,10 @@ export interface SteppedTurnDeps {
   /** Whether an error is the driver's cancellation. An interrupt has to end the turn, so it must not
    * be swallowed the way a failed tool is. */
   readonly isCancellation: (error: unknown) => boolean
+  /** Whether an error is the user stopping the turn, like a declined permission. It arrives as an
+   * ordinary activity failure, so without this it reads as one bad tool and the turn carries on
+   * past the refusal. */
+  readonly isHalt: (error: unknown) => boolean
 }
 
 /**
@@ -38,7 +42,7 @@ export interface SteppedTurnDeps {
  * of a whole-step activity.
  */
 export const makeSteppedTurn =
-  ({ activities, isCancellation }: SteppedTurnDeps) =>
+  ({ activities, isCancellation, isHalt }: SteppedTurnDeps) =>
   async (input: StepDrainInput): Promise<StepDrainResult> => {
     const model = await activities.runModelCall(input)
     // A crashed step finalized from the log, or the recovery gate finding no work: the step is over
@@ -47,14 +51,15 @@ export const makeSteppedTurn =
 
     // Each call is its own unit of work. A tool that fails outright does not take the turn with it:
     // the seal closes its call as an error and the model gets to react, which is better than losing
-    // the step. An interrupt is different and has to propagate.
+    // the step. A cancel and a user halt are different, and both have to propagate.
     const dispatched = await Promise.allSettled(
       model.calls.map((call) =>
         activities.runToolCall({ sessionID: input.sessionID, call, owner: model.owner }),
       ),
     )
     for (const outcome of dispatched) {
-      if (outcome.status === "rejected" && isCancellation(outcome.reason)) throw outcome.reason
+      if (outcome.status !== "rejected") continue
+      if (isCancellation(outcome.reason) || isHalt(outcome.reason)) throw outcome.reason
     }
 
     return activities.sealStep({

@@ -59,9 +59,10 @@ exposes a substitutable `SessionExecution` service (`active` / `resume` / `wake`
 whose local impl comments "Future remote placement belongs here." This change provides a
 Temporal-backed `SessionExecution` in `packages/core/src/session/execution/`:
 
-- `temporal-workflow.ts`: the pure per-session workflow (the Temporal equivalent of
+- `packages/temporal/src/workflow.ts`: the pure per-session workflow (the Temporal equivalent of
   `SessionRunCoordinator`: `wake`/`force` drive one drain, wakes coalesce, quiescent runs end).
-- `temporal-activities.ts`: the `runTurnStep` activity (heartbeats; forwards cancellation;
+- `packages/temporal/src/activities.ts`: the `runTurnStep` activity (heartbeats; forwards
+  cancellation;
   injects the attempt's event-log owner token).
 - `temporal.ts`: the `SessionExecution` layer + node: `wake` → `signalWithStart`, `resume` →
   forced `signalWithStart`, `interrupt` → cancel signal; each drain runs one step of the local
@@ -232,12 +233,16 @@ Verified live (dev server, `gpt-5-mini`, stepped mode on):
   answered with the file's contents. Worker affinity (below) skips the
   materialization on warm paths;
   the packs are the baseline that works without it.
+Covered by tests rather than by a live run:
+
 - **A compaction restart keeps deferring.** The `deferTools` flag is threaded through both
   `ContinueAfterCompaction` recursions; a first version dropped it, which would have silently run
   tools inline on a compacting step.
 - **A provider error ends the turn.** The attempt's own continuation decision is carried to the
   seal, because the log cannot tell a failed attempt from one that wants another step.
-- **A declined permission halts the turn** rather than reaching the model as one failed tool.
+- **A declined permission halts the turn** rather than reaching the model as one failed tool. Both
+  halves matter: the runner raises it as an interrupt, and the workflow tells that failure apart
+  from a tool that merely failed.
 
 Not covered, stated plainly:
 
@@ -290,6 +295,19 @@ with nothing to show for it.
 whose tree has no worker polling does not fall back to another worker. It waits. Reconstruction is
 what makes any worker able to serve any session, and turning affinity on is choosing not to use it.
 
+Two consequences to plan for, both silent:
+
+- **A worker serves one tree.** In the default `role=both` deployment the embedded worker polls the
+  queue for the process directory, so every session in another directory has no poller. If you open
+  more than one project against one serve process, do not turn this on.
+- **Flipping the flag strands workflows already running.** A workflow keeps the task queue it
+  started on for life, and its activities inherit it. Restarting workers with the flag changed
+  leaves in-flight sessions with nobody polling their queue; they retry rather than fail. Drain
+  before flipping, in either direction.
+
+Both processes log the queue they use (`pollQueue` on a worker, `worktree` on the client), so a
+mismatch shows up as two names in the logs rather than as a session that never runs.
+
 Verified live, all three halves:
 
 - a worker serving the session's tree ran the turn, and the workflow sat on the derived queue
@@ -298,7 +316,7 @@ Verified live, all three halves:
 - bringing the right worker back drained it and the answer arrived, so the work waits rather than
   being lost
 
-#### Live streaming across a process boundary
+#### Durable events across a process boundary
 
 Worth stating separately, because it is **not** specific to stepped mode: it is a property of
 running a standalone worker at all, and the mechanism is in `event.ts`.
@@ -309,8 +327,11 @@ process's map, so a commit in another process cannot wake a tail. Split into
 complete, but a client subscribed *live* saw exactly one event, `prompt.admitted`, the only one the
 serve process writes itself. A UI attached to serve saw a prompt admitted and then silence.
 
-The durable tail now also re-reads on a tick (`LayerOptions.livePollInterval`, default one second,
-0 to disable). In-process commits still wake it instantly, so latency is unchanged where it already
+Token deltas are not part of this. `Text.Delta`, `Reasoning.Delta` and `Tool.Input.Delta` are
+live-only and never reach the durable log, so what crosses a process boundary is block-level:
+`step.started`, `tool.called`, `tool.success`, `step.ended`. The durable tail now also re-reads on a
+tick (`LayerOptions.livePollInterval`, default one second, 0 to disable). In-process commits
+still wake it instantly, so latency is unchanged where it already
 worked; the tick only catches what the wake cannot see. An idle subscriber costs one indexed read
 per period, and a tick with nothing new emits nothing. The same split now delivers the worker's
 `step.started`, `tool.called`, `tool.success` and `step.ended` to a live subscriber.

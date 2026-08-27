@@ -13,6 +13,7 @@ import { ApplicationFailure } from "@temporalio/activity"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import { encodeRunError } from "@opencode-ai/core/session/execution/run-error-codec"
+import { HALTED_FAILURE_TYPE } from "./protocol"
 
 export const runAtBoundary = async <A>(
   sessionID: string,
@@ -28,7 +29,7 @@ export const runAtBoundary = async <A>(
     const declined = encodeRunError(new SessionRunDeclinedError({ sessionID: SessionSchema.ID.make(sessionID) }))
     throw ApplicationFailure.create({
       message: "session run halted (user declined)",
-      type: "SessionRunDeclined",
+      type: HALTED_FAILURE_TYPE,
       nonRetryable: true,
       details: declined === undefined ? undefined : [declined],
     })
