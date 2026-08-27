@@ -53,9 +53,11 @@ jobs:
           git config --global user.email "bot@opencode.ai"
           git config --global user.name "opencode"
 
+      # Concurrency capped: a full-width turbo run puts enough `tsgo` processes on a hosted runner
+      # at once that several are killed for memory, which reads as a code failure and is not one.
       - name: Typecheck
         timeout-minutes: 20
-        run: bun typecheck
+        run: bun turbo typecheck --concurrency=2
 
       - name: Unit tests (core)
         timeout-minutes: 30
