@@ -5,6 +5,8 @@
 import { describe, it, expect } from "bun:test"
 import { isHaltFailure, makeSteppedTurn, type SteppedActivities } from "../src/l2-step"
 import { runAtBoundary } from "../src/boundary"
+import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { Effect } from "effect"
 import {
   ActivityFailure,
@@ -155,21 +157,39 @@ describe("halt predicate", () => {
   const wrap = (cause?: Error) =>
     new ActivityFailure("activity failed", "runToolCall", "1", 1 as never, undefined, cause)
 
-  it("recognises what the activity boundary throws for a user halt", async () => {
-    // Built by running the boundary rather than by hand, so the two sides cannot drift: an
-    // interrupt
-    // with no abort is how a decline leaves the runner, and whatever that produces is what a
-    // dispatcher has to recognise.
-    const thrown = await runAtBoundary(
-      "ses_1",
-      new AbortController().signal,
-      Effect.interrupt,
-    ).then(
+  const throwsFrom = <A>(
+    body: Effect.Effect<A, unknown, never>,
+    options?: { declineIsInterrupt: true },
+  ) =>
+    runAtBoundary("ses_1", new AbortController().signal, body, options).then(
       () => undefined,
       (error: unknown) => error,
     )
+
+  it("recognises what the activity boundary throws for a named refusal", async () => {
+    // Built by running the boundary rather than by hand, so the two sides cannot drift: a dispatch
+    // reports a decline as this error, and whatever the boundary makes of it is what a dispatcher
+    // has to recognise.
+    const thrown = await throwsFrom(
+      Effect.fail(new SessionRunDeclinedError({ sessionID: SessionSchema.ID.make("ses_1") })),
+    )
     expect(thrown).toBeInstanceOf(ApplicationFailure)
     expect(isHaltFailure(wrap(thrown as Error))).toBe(true)
+  })
+
+  it("recognises a whole step's refusal, which arrives as an interrupt", async () => {
+    const thrown = await throwsFrom(Effect.interrupt, { declineIsInterrupt: true })
+    expect(isHaltFailure(wrap(thrown as Error))).toBe(true)
+  })
+
+  it("does not read an unexplained interrupt as a refusal", async () => {
+    // The stepped path names its refusals, so an interrupt with nothing cancelling it is the
+    // runner stopping for another reason. Calling that a decline would report a user decision
+    // nobody made.
+    const thrown = await throwsFrom(Effect.interrupt)
+    expect(thrown).toBeInstanceOf(ApplicationFailure)
+    expect((thrown as ApplicationFailure).type).toBe("SessionRunInterrupted")
+    expect(isHaltFailure(wrap(thrown as Error))).toBe(false)
   })
 
   it("says no to everything else that can come back from an activity", () => {

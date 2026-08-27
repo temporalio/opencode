@@ -36,6 +36,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import { DateTime } from "effect"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { SessionContextEpoch } from "@opencode-ai/core/session/context-epoch"
@@ -853,11 +854,13 @@ describe("SessionRunner declined permission in a stepped turn", () => {
         .runToolCall({ sessionID, call: model.calls[0] })
         .pipe(Effect.exit)
 
-      // An interrupt is what the activity boundary turns into a non-retryable halt. A plain failure
-      // reads as one bad tool and the turn continues.
+      // Named, not inferred: the activity boundary turns this error into a non-retryable halt,
+      // where a plain tool failure reads as one bad tool and the turn continues. Raising a bare
+      // interrupt instead would leave the boundary to guess the user's decision from the absence
+      // of a cancellation.
       expect(Exit.isFailure(exit)).toBe(true)
       if (!Exit.isFailure(exit)) return
-      expect(Cause.hasInterrupts(exit.cause)).toBe(true)
+      expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionRunDeclinedError)
     }),
   )
 })
