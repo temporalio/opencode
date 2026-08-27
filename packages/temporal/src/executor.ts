@@ -17,6 +17,9 @@ import { makeStepActivities, makeSteppedTurnActivities } from "./activities"
 import { makeDrains } from "./drain"
 import { makeL2Drains } from "./l2-drain"
 import { queueForWorktree } from "./queue"
+import { Database } from "@opencode-ai/core/database/database"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { eq } from "drizzle-orm"
 import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktree"
 import { toRunError } from "@opencode-ai/core/session/execution/run-error-codec"
 import * as WF from "./workflow"
@@ -50,6 +53,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const store = yield* SessionStore.Service
     const locations = yield* LocationServiceMap.Service
+    const db = (yield* Database.Service).db
     // The app context the local drain runs in: providing it, then the per-location layer, supplies
     // SessionRunner and all of its dependencies.
     const ctx = yield* Effect.context<SessionStore.Service | LocationServiceMap.Service>()
@@ -69,14 +73,23 @@ const layer = Layer.effect(
     // Which queue a worker polls. With affinity off this is the one shared queue and any worker can
     // draw any session, rebuilding the tree if it has to.
     const POLL_QUEUE = AFFINITY ? queueForWorktree(TASK_QUEUE, SERVED_WORKTREE) : TASK_QUEUE
-    // Which queue a session's workflow runs on. Reads the session because the tree that has to be
-    // present is its location, not the project root: two sessions under one project can sit in
-    // different directories.
+    // Which queue a session's workflow runs on. Keyed on the PROJECT worktree, not the session's
+    // directory: `worktrees.ensure` rebuilds the project tree, so keying on the directory a session
+    // happened to start in would split one physical tree across a queue per subdirectory, and a
+    // session started from a subfolder would wait on a queue nobody polls.
     const queueFor = (id: SessionSchema.ID) =>
       AFFINITY
-        ? Effect.map(store.get(id), (session) =>
-            session ? queueForWorktree(TASK_QUEUE, session.location.directory) : TASK_QUEUE,
-          )
+        ? Effect.gen(function* () {
+            const session = yield* store.get(id)
+            if (!session) return TASK_QUEUE
+            const project = yield* db
+              .select({ worktree: ProjectTable.worktree })
+              .from(ProjectTable)
+              .where(eq(ProjectTable.id, session.projectID))
+              .get()
+              .pipe(Effect.orDie)
+            return project ? queueForWorktree(TASK_QUEUE, project.worktree) : TASK_QUEUE
+          })
         : Effect.succeed(TASK_QUEUE)
     const events = yield* EventV2.Service
     const worktrees = yield* WorktreeMaterializer.Service
@@ -282,5 +295,11 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: SessionExecution.Service,
   layer,
-  deps: [SessionStore.node, LocationServiceMap.node, EventV2.node, WorktreeMaterializer.node],
+  deps: [
+    SessionStore.node,
+    LocationServiceMap.node,
+    EventV2.node,
+    WorktreeMaterializer.node,
+    Database.node,
+  ],
 })

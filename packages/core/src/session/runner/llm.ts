@@ -693,7 +693,9 @@ const layer = Layer.effect(
       const carried = input.assistantMessageID
       const target =
         (carried
-          ? context.findLast((m): m is SessionMessage.Assistant => m.id === carried)
+          ? context.findLast(
+              (m): m is SessionMessage.Assistant => m.type === "assistant" && m.id === carried,
+            )
           : undefined) ??
         inFlight ??
         context.findLast(
@@ -749,14 +751,6 @@ const layer = Layer.effect(
       )
     })
 
-    const toolPartOf = (messages: ReadonlyArray<SessionMessage.Message>, callID: string) => {
-      for (const message of messages) {
-        if (message.type !== "assistant") continue
-        for (const part of message.content)
-          if (part.type === "tool" && part.id === callID) return part
-      }
-      return undefined
-    }
 
     const runToolCall = Effect.fn("SessionRunner.runToolCall")(function* (input: ToolCallInput) {
       const session = yield* getSession(input.sessionID)
