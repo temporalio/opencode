@@ -59,11 +59,15 @@ export function createServiceLayer() {
   // (execution/local.ts) -- no server, no ports. Both drive SessionRunner over the same durable
   // event log; the local coordinator owns the wake/resume/interrupt lifecycle and is shared with
   // the v1 server path, so it is the well-exercised default.
-  const executionNode =
-    process.env.OPENCODE_SESSION_EXECUTION === "temporal"
-      ? SessionExecutionTemporal.node
-      : SessionExecutionLocal.node
-  return AppNodeBuilder.build(applicationServices, [[SessionExecution.node, executionNode]])
+  const temporal = process.env.OPENCODE_SESSION_EXECUTION === "temporal"
+  const executionNode = temporal ? SessionExecutionTemporal.node : SessionExecutionLocal.node
+  return AppNodeBuilder.build(applicationServices, [
+    [SessionExecution.node, executionNode],
+    // Only the durable executor can put a turn in another process, and only then does a live tail
+    // need to re-read on its own: the wake it otherwise runs on is published in-process. Local mode
+    // keeps the wake alone, so the default deployment pays nothing for a case it does not have.
+    [EventV2.node, temporal ? EventV2.pollingNode : EventV2.node],
+  ])
 }
 
 // The context for a standalone worker (src/worker.ts). Same services as serve, but with
@@ -73,6 +77,7 @@ export function createWorkerLayer() {
   // A standalone worker only makes sense in temporal mode.
   return AppNodeBuilder.build(LayerNode.group([applicationServices, SessionExecution.node]), [
     [SessionExecution.node, SessionExecutionTemporal.node],
+    [EventV2.node, EventV2.pollingNode],
   ])
 }
 

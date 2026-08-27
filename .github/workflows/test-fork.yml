@@ -1,0 +1,70 @@
+# The upstream `test` workflow asks for Blacksmith runners (`blacksmith-4vcpu-*`), which this fork
+# cannot schedule: every run of it here, on every branch including `dev` and dependabot PRs, is
+# cancelled with no runner ever assigned. So nothing in this fork has had a CI signal.
+#
+# This runs typecheck and the affected packages' unit tests on GitHub's own runners, so a change
+# made here is checked by something other than the author's laptop.
+#
+# Deliberately narrower than upstream's, in two ways worth being explicit about:
+#   - Linux only, no Windows matrix, no e2e, no generated-client or HttpApi gates. Those belong to
+#     upstream's runners, and pretending to cover them here would be worse than not claiming to.
+#   - `bun turbo test` is NOT run, because `@opencode-ai/app` currently fails one locale-detection
+#     assertion (`detectDesktopNativeLocale(["pa-PK"])` returns "en", not "pa") that depends on the
+#     ICU data in the bun build. It reproduces on the untouched base branch, so a whole-monorepo
+#     test job would be red on arrival and worth nothing. Typecheck still covers every package.
+name: test (fork)
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  unit:
+    name: unit + typecheck (linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      # Some suites shell out to git, which refuses to run without an identity.
+      - name: Configure git identity
+        run: |
+          git config --global user.email "bot@opencode.ai"
+          git config --global user.name "opencode"
+
+      # Concurrency capped: a full-width turbo run puts enough `tsgo` processes on a hosted runner
+      # at once that several are killed for memory, which reads as a code failure and is not one.
+      - name: Typecheck
+        timeout-minutes: 20
+        run: bun turbo typecheck --concurrency=2
+
+      - name: Unit tests (core)
+        timeout-minutes: 30
+        working-directory: packages/core
+        run: bun test
+
+      - name: Unit tests (temporal)
+        timeout-minutes: 15
+        working-directory: packages/temporal
+        run: bun test
