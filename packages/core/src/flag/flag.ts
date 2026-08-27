@@ -79,4 +79,10 @@ export const Flag = {
   get OPENCODE_CLIENT() {
     return process.env["OPENCODE_CLIENT"] ?? "cli"
   },
+  // Milliseconds between a live event tail's own re-reads, `0` to rely on the in-process wake
+  // alone. Only a deployment where another process appends to the log needs it, so it is off unless
+  // the composition root asks for it; this overrides either way.
+  get OPENCODE_EVENT_POLL_MS() {
+    return process.env["OPENCODE_EVENT_POLL_MS"]
+  },
 }
