@@ -35,6 +35,8 @@ import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { DateTime } from "effect"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { SessionContextEpoch } from "@opencode-ai/core/session/context-epoch"
 import { createLLMEventPublisher } from "@opencode-ai/core/session/runner/publish-llm-event"
@@ -767,6 +769,55 @@ describe("SessionRunner declined permission in a stepped turn", () => {
       expect(Exit.isFailure(exit)).toBe(true)
       if (!Exit.isFailure(exit)) return
       expect(Cause.hasInterrupts(exit.cause)).toBe(true)
+    }),
+  )
+})
+
+// A step's writers share one owner token, so the fence does not separate two seal attempts. The
+// projector is what holds the line, and step.ended was the one event in that window with no guard.
+describe("SessionRunner duplicate seal", () => {
+  harness(callsTool).effect("keeps the first close when a late attempt lands", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+      const model = yield* runner.runModelCall({
+        sessionID,
+        step: 2,
+        promotion: undefined,
+        first: false,
+        force: false,
+      })
+      if (model.kind !== "called" || !model.calls[0]) throw new Error("expected a deferred call")
+      yield* runner.runToolCall({ sessionID, call: model.calls[0], retry: false })
+      const seal = {
+        sessionID,
+        step: model.step,
+        settlement: model.settlement,
+        assistantMessageID: model.assistantMessageID,
+        needsContinuation: model.needsContinuation,
+      }
+      yield* runner.sealStep(seal)
+      const closedAt = assistant(yield* store.context(sessionID))
+      const first = String(closedAt?.type === "assistant" ? closedAt.time.completed : undefined)
+
+      // A zombie attempt publishing its own Step.Ended under the same token is admitted by the
+      // fence, so the projection has to reject it.
+      const events = yield* EventV2.Service
+      yield* events.publish(SessionEvent.Step.Ended, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID: SessionMessage.ID.make(model.assistantMessageID!),
+        finish: "stop",
+        cost: 0,
+        tokens: { input: 99, output: 99, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+
+      const after = assistant(yield* store.context(sessionID))
+      expect(String(after?.type === "assistant" ? after.time.completed : undefined)).toBe(first)
+      expect(after?.type === "assistant" ? after.tokens?.input : undefined).not.toBe(99)
     }),
   )
 })

@@ -306,12 +306,14 @@ what makes any worker able to serve any session, and turning affinity on is choo
 Two consequences to plan for, both silent:
 
 - **A worker serves one tree.** In the default `role=both` deployment the embedded worker polls the
-  queue for the process directory, so every session in another directory has no poller. If you open
-  more than one project against one serve process, do not turn this on.
+  queue for the process directory, so a session in another project has no poller. Point
+  `OPENCODE_TEMPORAL_WORKTREE` at the project root, not at a subfolder, since the key is the project
+  worktree.
 - **Flipping the flag strands workflows already running.** A workflow keeps the task queue it
   started on for life, and its activities inherit it. Restarting workers with the flag changed
-  leaves in-flight sessions with nobody polling their queue; they retry rather than fail. Drain
-  before flipping, in either direction.
+  leaves in-flight sessions with nobody polling their queue. They do not fail; they stay `RUNNING`
+  forever, because the workflow task that would run their idle timer is never picked up either.
+  Drain before flipping, in either direction.
 
 Both processes log the queue they use (`pollQueue` on a worker, `worktree` on the client), so a
 mismatch shows up as two names in the logs rather than as a session that never runs.
