@@ -8,6 +8,11 @@ export const WORKFLOW_TYPE = "sessionTurn"
 export const SIGNALS = { wake: "wake", interrupt: "interrupt" } as const
 export const RESUME_UPDATE = "resume"
 
+/** The failure type a drain raises when the user stopped the turn (a declined permission, a
+ * rejected question). The workflow has to tell it apart from a failed tool, so the name is shared
+ * rather than spelled twice. */
+export const HALTED_FAILURE_TYPE = "SessionRunDeclined"
+
 export const WORKFLOW_ID_PREFIX = "session-exec-"
 export const workflowId = (sessionID: string) => `${WORKFLOW_ID_PREFIX}${sessionID}`
 

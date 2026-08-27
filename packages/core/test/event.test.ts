@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
 import { Session } from "@opencode-ai/schema/session"
@@ -1192,6 +1192,31 @@ describe("EventV2", () => {
         durableData(aggregateID, "seed").messageID,
         durableData(aggregateID, "from-elsewhere").messageID,
       ])
+    }),
+  )
+
+  it.live("ends a durable tail when the event layer is released under it", () =>
+    Effect.gen(function* () {
+      const aggregateID = Session.ID.create()
+      // The layer needs its own closeable scope, and the consumer has to be forked into a scope that
+      // OUTLIVES it. Fork into the test's own scope and closing that scope interrupts the consumer
+      // before the finalizer runs, so a hung tail and a killed one look the same.
+      const outer = yield* Effect.scope
+      const layerScope = yield* Scope.make()
+      const ctx = yield* Layer.buildWithScope(EventV2.layerWith(), layerScope)
+      const events = yield* EventV2.Service.pipe(Effect.provideContext(ctx as never))
+      yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
+
+      const tail = yield* events
+        .durable({ aggregateID, after: -1 })
+        .pipe(Stream.runDrain, Effect.forkIn(outer))
+      yield* Effect.sleep("150 millis")
+      yield* Scope.close(layerScope, Exit.void)
+
+      // The tick never ends on its own, so it must not become what holds the tail open: a subscriber
+      // would outlive the layer and keep reading a database being torn down.
+      const settled = yield* Fiber.await(tail).pipe(Effect.timeout("5 seconds"), Effect.exit)
+      expect(Exit.isSuccess(settled)).toBe(true)
     }),
   )
 

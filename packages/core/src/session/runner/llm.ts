@@ -704,10 +704,13 @@ const layer = Layer.effect(
       // A point read, not the whole projected history. The call carries the message
       // that owns it, so decoding every message to find one part would make a step
       // cost O(session) per tool instead of O(1).
+      // Message ids are looked up on their own, so the session has to be checked too: a call from
+      // another session must not resolve here.
       const owner = yield* store.message(assistantMessageID)
       const part =
-        owner?.message.type === "assistant"
-          ? owner.message.content.find(
+        owner?.sessionID === input.sessionID && owner.message.type === "assistant"
+          ? // findLast to agree with the projector, which writes tool updates the same way.
+            owner.message.content.findLast(
               (item): item is SessionMessage.AssistantTool =>
                 item.type === "tool" && item.id === input.call.id,
             )
