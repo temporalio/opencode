@@ -73,9 +73,11 @@ export interface ToolCallInput {
 /** How a dispatched call ended.
  * - `settled`: the tool ran and its result is durable.
  * - `already-settled`: the log already had a result, so nothing ran. The at-least-once case.
+ * - `failed`: the tool ran and could not be settled. The reason reaches the model, and the call is
+ *   closed, because a repeat would not fix it.
  * - `unknown`: a retry of a tool that does not declare itself repeatable. Reported to the model as
  *   an unknown outcome rather than run a second time. */
-export type ToolCallOutcome = "settled" | "already-settled" | "unknown"
+export type ToolCallOutcome = "settled" | "already-settled" | "failed" | "unknown"
 
 export interface ToolCallResult {
   readonly outcome: ToolCallOutcome

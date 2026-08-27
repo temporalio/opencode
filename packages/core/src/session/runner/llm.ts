@@ -813,7 +813,29 @@ const layer = Layer.effect(
           Effect.catchCause((cause) =>
             isUserDeclined(cause) ? Effect.interrupt : Effect.failCause(cause),
           ),
+          // The tool itself ran: what failed is storing its output. Letting that fail the dispatch
+          // would retry a side effect that already happened and finally tell the model the call was
+          // interrupted, which is not what happened to it. The whole-step path reports the same
+          // reason the same way.
+          Effect.catch((error) => Effect.succeed({ failure: error })),
         )
+      if ("failure" in settlement) {
+        const reason =
+          settlement.failure instanceof Error
+            ? settlement.failure.message
+            : String(settlement.failure)
+        yield* Effect.uninterruptible(
+          events.publish(SessionEvent.Tool.Failed, {
+            sessionID: input.sessionID,
+            timestamp: yield* DateTime.now,
+            assistantMessageID,
+            callID: input.call.id,
+            error: { type: "unknown", message: `Tool execution failed: ${reason}` },
+            provider: { executed: false },
+          }),
+        )
+        return { outcome: "failed" } as ToolCallResult
+      }
       // The tool has run by here, so losing the result to an interrupt would hide a
       // side effect that already happened.
       yield* Effect.uninterruptible(emitToolResult(events, {

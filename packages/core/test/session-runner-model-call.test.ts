@@ -129,7 +129,21 @@ const textOnly: LLMClientShape["stream"] = () =>
     LLMEvent.stepFinish({ index: 0, reason: "stop" }),
   ])
 
-const harness = (stream: LLMClientShape["stream"]) =>
+// A store that cannot keep what a tool produced. The tool itself still ran by then, which is the
+// case a dispatch has to report honestly rather than as a call that never finished.
+const failingOutputStore = Layer.mock(ToolOutputStore.Service, {
+  bound: () =>
+    Effect.fail(
+      new ToolOutputStore.StorageError({ operation: "write", cause: new Error("disk full") }),
+    ),
+})
+
+const harness = (
+  stream: LLMClientShape["stream"],
+  outputStore:
+    | typeof ToolOutputStore.nodeWithoutConfig
+    | Layer.Layer<ToolOutputStore.Service> = ToolOutputStore.nodeWithoutConfig,
+) =>
   testEffect(
     AppNodeBuilder.build(
       LayerNode.group([
@@ -151,7 +165,7 @@ const harness = (stream: LLMClientShape["stream"]) =>
       [
         [LayerNodePlatform.llmClient, mockClient(stream)],
         [PermissionV2.node, permission],
-        [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
+        [ToolOutputStore.node, outputStore],
         [SessionRunnerModel.node, models],
         [SystemContextRegistry.node, systemContext],
         [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
@@ -403,6 +417,31 @@ describe("SessionRunner tool dispatch", () => {
         expect(ran.write).toBe(0)
         const part = toolPart(yield* store.context(sessionID), "call_probe")
         expect(part?.type === "tool" ? part.state.status : undefined).toBe("error")
+      }),
+  )
+
+  harness(callsTool, failingOutputStore).effect(
+    "tells the model why a dispatched call failed",
+    () =>
+      Effect.gen(function* () {
+        yield* seedSession
+        const ran = counters()
+        yield* registerProbes(ran)
+        const call = yield* deferOneCall
+        const runner = yield* SessionRunner.Service
+        const store = yield* SessionStore.Service
+
+        const result = yield* runner.runToolCall({ sessionID, call, retry: false })
+
+        // The tool ran and only its output was lost. Letting that fail the dispatch would repeat
+        // the write on the next attempt, and the step would finally close the call as interrupted:
+        // a reason the model cannot act on, and not what happened to it.
+        expect(result.outcome).toBe("failed")
+        expect(ran.write).toBe(1)
+        const part = toolPart(yield* store.context(sessionID), "call_probe")
+        const failure =
+          part?.type === "tool" && part.state.status === "error" ? part.state.error : undefined
+        expect(failure?.message).toContain("disk full")
       }),
   )
 
