@@ -1,31 +1,39 @@
 export * as WorktreeMaterializer from "./worktree"
 
-// Rebuilds a missing project worktree from the shared store before a drain runs. This closes the
-// host-local gap in cross-host resume: file tools need the tree, and a fresh worker does not have
-// it. The capture side (snapshot-sync.ts) ships each snapshot as an incremental git pack; this
-// side indexes every pack for the worktree into a fresh repo and checks out the newest tree.
-// Ignored files and dependencies are not captured, so a bootstrap step (install, build) stays the
-// project's own concern.
+// Brings the project worktree to the newest state in the shared store before a drain runs. This
+// closes the host-local gap in cross-host resume: file tools need the tree, and a worker that never
+// ran an earlier step either has no tree at all or has one from the step it last ran. The capture
+// side (snapshot-sync.ts) ships each snapshot as an incremental git pack; this side indexes every
+// pack for the worktree and checks out the newest tree. Ignored files and dependencies are not
+// captured, so a bootstrap step (install, build) stays the project's own concern.
+//
+// A tree is only ever moved forward, and only when this host's own note (snapshot/tip.ts) says it
+// is behind the store. What that leaves open: two workers running tools of the SAME step on two
+// hosts still cannot see each other's writes, because those are not captured until the step is
+// sealed. One worker per worktree is what makes a step's tools share a tree.
 
 import { rm, writeFile } from "node:fs/promises"
 import path from "path"
 import { Cause, Context, Effect, Layer } from "effect"
 import { ChildProcess } from "effect/unstable/process"
-import { asc, desc, eq } from "drizzle-orm"
+import { and, asc, desc, eq } from "drizzle-orm"
 import { Database } from "../../database/database"
 import { makeGlobalNode } from "../../effect/app-node"
 import { KeyedMutex } from "../../effect/keyed-mutex"
 import { FSUtil } from "../../fs-util"
 import { Git } from "../../git"
+import { Global } from "../../global"
 import { AppProcess } from "../../process"
 import { AbsolutePath } from "../../schema"
 import { SnapshotPackTable } from "../../snapshot/sql"
+import { readWorktreeTip, writeWorktreeTip } from "../../snapshot/tip"
 
 export interface Interface {
   /**
-   * Make sure the session's directory exists, rebuilding its worktree from stored snapshot packs
-   * when it does not. A directory with no stored packs, or one whose worktree root already
-   * exists, is left alone. Never fails the caller.
+   * Make sure the session's directory holds the newest state the shared store has for it,
+   * rebuilding its worktree from stored snapshot packs when it is missing or behind. A directory
+   * with no stored packs, and a tree this host has neither built nor captured from, are left
+   * alone. Never fails the caller.
    */
   readonly ensure: (directory: string) => Effect.Effect<void>
 }
@@ -34,11 +42,15 @@ export class Service extends Context.Service<Service, Interface>()(
   "@opencode/v2/WorktreeMaterializer",
 ) {}
 
+// HEAD of a rebuilt tree, which doubles as the mark that says the tree is ours to move.
+const RESTORED = "refs/heads/opencode-restore"
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const git = yield* Git.Service
+    const global = yield* Global.Service
     const proc = yield* AppProcess.Service
     const { db } = yield* Database.Service
     const locks = KeyedMutex.makeUnsafe<string>()
@@ -79,7 +91,7 @@ const layer = Layer.effect(
         .run(
           ChildProcess.make(
             "git",
-            ["--git-dir", repository.gitDirectory, "update-ref", "refs/heads/opencode-restore", tip.id],
+            ["--git-dir", repository.gitDirectory, "update-ref", RESTORED, tip.id],
             { cwd: worktree, extendEnv: true },
           ),
         )
@@ -88,11 +100,12 @@ const layer = Layer.effect(
         .run(
           ChildProcess.make(
             "git",
-            ["--git-dir", repository.gitDirectory, "symbolic-ref", "HEAD", "refs/heads/opencode-restore"],
+            ["--git-dir", repository.gitDirectory, "symbolic-ref", "HEAD", RESTORED],
             { cwd: worktree, extendEnv: true },
           ),
         )
         .pipe(Effect.ignore)
+      yield* writeWorktreeTip(global.data, tip.worktree, tip.tree)
       yield* Effect.logInfo("materialized worktree from snapshot packs", {
         worktree: tip.worktree,
         packs: rows.length,
@@ -100,9 +113,51 @@ const layer = Layer.effect(
       })
     })
 
+    // Whether the tree on this host is older than what the store holds. No note means the tree was
+    // neither built from packs nor captured from here, so it belongs to whoever put it there. A
+    // note the store has never seen means a capture that never shipped, so this host holds work
+    // nothing else has and must not be moved back to an older tree.
+    const behind = Effect.fnUntraced(function* (tip: typeof SnapshotPackTable.$inferSelect) {
+      const held = yield* readWorktreeTip(global.data, tip.worktree)
+      if (!held || held === tip.tree) return false
+      const shipped = yield* db
+        .select({ time: SnapshotPackTable.time_created })
+        .from(SnapshotPackTable)
+        .where(and(eq(SnapshotPackTable.worktree, tip.worktree), eq(SnapshotPackTable.tree, held)))
+        .orderBy(desc(SnapshotPackTable.time_created))
+        .limit(1)
+        .get()
+        .pipe(Effect.orDie)
+      return shipped !== undefined && shipped.time < tip.time_created
+    })
+
+    // Whether this tree is one we built from packs. A checkout the host already had is somebody's
+    // working copy: reading its captures is fine, but checking a stored tree out over it would
+    // rewrite files and HEAD under whoever owns it.
+    const rebuilt = (worktree: string) =>
+      proc
+        .run(
+          ChildProcess.make(
+            "git",
+            [
+              "--git-dir",
+              path.join(worktree, ".git"),
+              "rev-parse",
+              "--verify",
+              "--quiet",
+              RESTORED,
+            ],
+            { cwd: worktree, extendEnv: true },
+          ),
+        )
+        .pipe(
+          Effect.map((result) => result.exitCode === 0),
+          Effect.catchCause(() => Effect.succeed(false)),
+        )
+
     const ensure = Effect.fn("WorktreeMaterializer.ensure")(function* (directory: string) {
-      if (yield* fs.existsSafe(directory)) return
-      // The newest capture whose session ran in this directory decides which worktree to rebuild.
+      // The newest capture whose session ran in this directory decides which worktree to rebuild,
+      // and which state a tree that is already here has to be brought to.
       const tip = yield* db
         .select()
         .from(SnapshotPackTable)
@@ -112,18 +167,31 @@ const layer = Layer.effect(
         .get()
         .pipe(Effect.orDie)
       if (!tip) return
+      const present = yield* fs.existsSafe(tip.worktree)
+      if (present) {
+        if (!(yield* behind(tip))) return
+        if (!(yield* rebuilt(tip.worktree))) {
+          yield* Effect.logWarning("worktree is behind the store and was not built from it", {
+            worktree: tip.worktree,
+            tree: tip.tree,
+          })
+          return
+        }
+      }
       yield* locks.withLock(tip.worktree)(
         Effect.gen(function* () {
-          // Re-check inside the lock (a concurrent drain may have rebuilt it), and never touch a
-          // worktree root that already exists: something else owns that tree.
-          if (yield* fs.existsSafe(tip.worktree)) return
+          // Re-check inside the lock: a concurrent drain may have done this already.
+          if ((yield* fs.existsSafe(tip.worktree)) && !(yield* behind(tip))) return
           yield* materialize(tip).pipe(
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterrupts(cause),
               (cause) =>
                 Effect.gen(function* () {
-                  // A half-built tree would pass the exists check forever; remove what we created.
-                  yield* Effect.promise(() => rm(tip.worktree, { recursive: true, force: true }))
+                  // A half-built tree would pass the exists check forever, so what we created is
+                  // removed. A tree that was already here is not ours to remove: a failed refresh
+                  // leaves it as stale as it was.
+                  if (!present)
+                    yield* Effect.promise(() => rm(tip.worktree, { recursive: true, force: true }))
                   yield* Effect.logWarning("failed to materialize worktree", {
                     worktree: tip.worktree,
                     cause,
@@ -142,5 +210,5 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [Database.node, FSUtil.node, Git.node, AppProcess.node],
+  deps: [Database.node, FSUtil.node, Git.node, Global.node, AppProcess.node],
 })

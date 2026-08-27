@@ -21,6 +21,7 @@ import { AppProcess } from "./process"
 import { AbsolutePath } from "./schema"
 import type { Snapshot } from "./snapshot"
 import { SnapshotPackTable } from "./snapshot/sql"
+import { writeWorktreeTip } from "./snapshot/tip"
 import { Hash } from "./util/hash"
 
 export interface Interface {
@@ -62,6 +63,10 @@ const layer = Layer.effect(
       )
 
     const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID) {
+      // Noted before the packing, which is best-effort: what this host holds is true whether or not
+      // the pack reaches the store, and a note left behind would let a later drain check out an
+      // older tree over work only this host has.
+      if (source) yield* writeWorktreeTip(global.data, worktree, tree)
       yield* Effect.gen(function* () {
         if (!source) return
         const latest = yield* db
