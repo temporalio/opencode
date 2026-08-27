@@ -144,6 +144,19 @@ Two things are load-bearing and easy to get wrong:
   happen anyway, because the second dispatch refuses to run the tool at all. What can still race is
   which truthful outcome reaches the model, the zombie's real result or the "unknown", and both
   describe something that did happen. Reporting success for a tool that never ran is not reachable.
+- **A stop closes the calls it cut short.** A whole step closes the tools it opened on its way out.
+  A call that is its own activity has nobody to do that, so an interrupted turn used to leave it
+  recorded as running until the next prompt: a transcript showing a tool still going, and an entry
+  check left to work out what happened to it. The dispatch closes its own call when the cancellation
+  means the turn is over. When it means this attempt is being handed on (a worker shutting down, a
+  pause, a heartbeat timeout), the call is left exactly as it was, or the next attempt would read a
+  closed call and never run the tool.
+- **A refusal is named, not inferred.** A declined permission crosses the activity boundary as its
+  own error type. The whole-step path still raises it as an interrupt, because halting the local
+  loop that way is the behaviour V1 defined and its tests pin, so that drain says so at the boundary
+  (`declineIsInterrupt`). What the boundary no longer does is read every interrupt with nothing
+  cancelling it as a refusal: a runner that stopped itself for another reason used to be reported as
+  a decision the user never made.
 
 #### What it costs, measured
 
@@ -230,6 +243,14 @@ Verified live (dev server, `gpt-5-mini`, stepped mode on):
   returned 204, the child process died, the call was closed as `Tool execution interrupted` so the
   next attempt is not a poisoned request, the workflow stayed RUNNING, and the next prompt answered
   normally.
+
+  What the stop does not wait for is the tools. A step's dispatch runs under `allSettled` with the
+  activity default of `WAIT_CANCELLATION_COMPLETED`, which reads like the turn ends only once the
+  slowest tool has acknowledged. History says otherwise: with a tool that never finishes, the
+  workflow recorded `ActivityTaskCancelRequested` and moved on in the same second, and completed two
+  seconds later with that activity still running. The stop costs one workflow task, not the slowest
+  cleanup. The tool activity closes its own call on the way out, so the log is not left waiting on
+  it either.
 - **An approval holds only the tool that is waiting.** Reading a `*.env` file parks on the default
   agent's `ask` rule. While the human deliberated, `runModelCall` was **completed** and
   `runToolCall` was the only outstanding activity. Replying `once` completed the tool and the turn.
@@ -285,10 +306,12 @@ inside `Step.Ended` via `startAssistant()`; the seal, running in another process
 searched the projection, found nothing, and left the turn open forever. The fix carries the
 assistant message id out of the attempt the same way the tool call ids are carried.
 
-One scenario is there for this split in particular: a turn that asks for a tool, runs it, and goes
-back to the model with the result. Everything else in the suite settles without a tool, so the piece
-the split actually changes, one activity per call rather than one for the whole step, would have had
-no scenario that both modes must pass.
+Two scenarios are there for this split in particular. One is a turn that asks for a tool, runs it,
+and goes back to the model with the result; the other interrupts a turn with a tool in flight and
+demands that no call is left running. Everything else in the suite settles without a tool, so the
+piece the split actually changes, one activity per call rather than one for the whole step, would
+have had no scenario that both modes must pass. The interrupt one was the more useful of the two:
+stepped mode failed it until the dispatch learned to close its own call.
 
 #### Worker affinity (`OPENCODE_TEMPORAL_WORKTREE_AFFINITY=1`)
 
@@ -351,12 +374,17 @@ serve process writes itself. A UI attached to serve saw a prompt admitted and th
 
 Token deltas are not part of this. `Text.Delta`, `Reasoning.Delta` and `Tool.Input.Delta` are
 live-only and never reach the durable log, so what crosses a process boundary is block-level:
-`step.started`, `tool.called`, `tool.success`, `step.ended`. The durable tail now also re-reads on a
-tick (`LayerOptions.livePollInterval`, default one second, 0 to disable). In-process commits
-still wake it instantly, so latency is unchanged where it already
-worked; the tick only catches what the wake cannot see. An idle subscriber costs one indexed read
-per period, and a tick with nothing new emits nothing. The same split now delivers the worker's
-`step.started`, `tool.called`, `tool.success` and `step.ended` to a live subscriber.
+`step.started`, `tool.called`, `tool.success`, `step.ended`. A durable tail can also re-read on a
+tick (`LayerOptions.livePollInterval`). In-process commits still wake it instantly, so latency is
+unchanged where it already worked; the tick only catches what the wake cannot see. An idle
+subscriber costs one indexed read per period, and a tick with nothing new emits nothing. With it,
+the same split delivers the worker's `step.started`, `tool.called`, `tool.success` and `step.ended`
+to a live subscriber.
+
+It is off unless a composition root asks for it, and only the durable executor's does
+(`EventV2.pollingNode`, wired in `server/src/routes.ts`). A deployment running in one process wakes
+its own subscribers, so a tick there would be a query per second per subscribed session for events
+that cannot exist. `OPENCODE_EVENT_POLL_MS` overrides either way, `0` to turn it off.
 
 ### Two modes, one runner
 
