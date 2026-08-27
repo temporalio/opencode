@@ -33,9 +33,14 @@ const captureStack = (file: string, worktree: string, data: string) =>
     [Global.node, Layer.succeed(Global.Service, Global.make({ data }))],
   ])
 
-// The resuming host: only the shared store, no location, no snapshot repo, no worktree.
-const materializeStack = (file: string) =>
-  AppNodeBuilder.build(WorktreeMaterializer.node, [[Database.node, Database.layerFromPath(file)]])
+// The resuming host: the shared store and its own data directory, no location, no snapshot repo,
+// no worktree. The data directory is what makes two of these independent hosts: it holds the note
+// saying which state that host's tree is at.
+const materializeStack = (file: string, data: string) =>
+  AppNodeBuilder.build(WorktreeMaterializer.node, [
+    [Database.node, Database.layerFromPath(file)],
+    [Global.node, Layer.succeed(Global.Service, Global.make({ data }))],
+  ])
 
 describe("WorktreeMaterializer", () => {
   it.live("rebuilds a deleted worktree from shared-store packs, incremental chain included", () =>
@@ -80,7 +85,7 @@ describe("WorktreeMaterializer", () => {
 
       // The fresh host: the tree is gone, only the shared store remains.
       yield* Effect.promise(() => rm(worktree, { recursive: true, force: true }))
-      const B = yield* Layer.build(materializeStack(file))
+      const B = yield* Layer.build(materializeStack(file, path.join(root, "host-b-data")))
       yield* WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(Effect.provide(B))
 
       const [tracked, untracked, extra] = yield* Effect.promise(() =>
@@ -99,6 +104,73 @@ describe("WorktreeMaterializer", () => {
       expect(yield* Effect.promise(() => readFile(path.join(worktree, "tracked.txt"), "utf8"))).toBe(
         "v3\n",
       )
+
+      yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
+    }),
+  )
+
+  it.live("moves a rebuilt tree forward, and leaves a tree it did not build alone", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const root = realpathSync(tmp.path)
+      const worktree = path.join(root, "project")
+      const file = path.join(root, "shared.db")
+      const tracked = path.join(worktree, "tracked.txt")
+      const content = () => Effect.promise(() => readFile(tracked, "utf8"))
+      const put = (text: string) => Effect.promise(() => writeFile(tracked, text))
+      yield* Effect.promise(async () => {
+        await mkdir(worktree, { recursive: true })
+        await $`git init -q ${worktree}`.quiet()
+        await $`git -C ${worktree} config user.email t@t`.quiet()
+        await $`git -C ${worktree} config user.name t`.quiet()
+        await writeFile(tracked, "v1\n")
+        await $`git -C ${worktree} add .`.quiet()
+        await $`git -C ${worktree} commit -qm seed`.quiet()
+      })
+
+      const A = yield* Layer.build(captureStack(file, worktree, path.join(root, "host-a-data")))
+      const ship = Effect.gen(function* () {
+        const tree = yield* Snapshot.Service.use((s) => s.capture())
+        if (!tree) throw new Error("expected a capture to produce a tree")
+        yield* SnapshotSync.Service.use((s) => s.push(tree))
+      }).pipe(Effect.provide(A))
+      yield* ship
+
+      // A checkout this host already had is somebody's working copy: however far behind the store
+      // it is, checking a stored tree out over it would rewrite files under whoever owns them.
+      const C = yield* Layer.build(materializeStack(file, path.join(root, "host-c-data")))
+      yield* put("mine\n")
+      yield* WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(Effect.provide(C))
+      expect(yield* content()).toBe("mine\n")
+
+      // Host B builds the tree from the store, which is what makes it B's to move.
+      yield* Effect.promise(() => rm(worktree, { recursive: true, force: true }))
+      const B = yield* Layer.build(materializeStack(file, path.join(root, "host-b-data")))
+      const ensureB = WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(
+        Effect.provide(B),
+      )
+      yield* ensureB
+      expect(yield* content()).toBe("v1\n")
+
+      // The store moves on while B's tree does not: another host captured a newer state, which is
+      // what a worker picking up a later step of the same session arrives to.
+      yield* Effect.sleep(10)
+      yield* put("v2\n")
+      yield* ship
+      yield* put("v1\n")
+
+      yield* ensureB
+
+      // Rebuilding only a missing tree is not enough: a present one is served as it was left, and
+      // the tools of the step read files from whichever step this worker last ran.
+      expect(yield* content()).toBe("v2\n")
+
+      // A tree already at the newest state is left alone whatever is in it. This is what keeps the
+      // later tools of a step from checking out over what its earlier tools wrote, since nothing
+      // captures those until the step is sealed.
+      yield* put("uncaptured\n")
+      yield* ensureB
+      expect(yield* content()).toBe("uncaptured\n")
 
       yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
     }),
