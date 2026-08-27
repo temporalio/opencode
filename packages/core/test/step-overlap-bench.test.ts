@@ -207,7 +207,7 @@ describe.skipIf(!process.env.OPENCODE_OVERLAP_BENCH)("step overlap cost", () => 
           const result = yield* runner.runModelCall({ sessionID: split, ...step })
           if (result.kind !== "called") return
           for (const call of result.calls)
-            yield* runner.runToolCall({ sessionID: split, call, retry: false })
+            yield* runner.runToolCall({ sessionID: split, call })
           yield* runner.sealStep({
             sessionID: split,
             step: result.step,
