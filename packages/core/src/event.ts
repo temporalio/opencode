@@ -632,11 +632,14 @@ export const layerWith = (options?: LayerOptions) =>
             // Wake on either an in-process commit or the tick. A tick that finds nothing new reads
             // zero rows and emits nothing, so an idle subscriber costs one indexed query per period.
             const pollInterval = options?.livePollInterval ?? DEFAULT_LIVE_POLL
-            const ticks = Duration.isZero(Duration.fromInputUnsafe(pollInterval))
-              ? Stream.never
-              : Stream.tick(pollInterval)
-            const live = Stream.fromSubscription(wakes).pipe(
-              Stream.merge(ticks),
+            const woken = Stream.fromSubscription(wakes)
+            // haltStrategy "left" keeps the wake stream as what ends the tail. The tick never ends,
+            // so the default ("both") would leave a subscriber hanging past the layer's own
+            // PubSub.shutdown, still reading from a database being torn down.
+            const source = Duration.isZero(Duration.fromInputUnsafe(pollInterval))
+              ? woken
+              : woken.pipe(Stream.merge(Stream.tick(pollInterval), { haltStrategy: "left" }))
+            const live = source.pipe(
               Stream.mapEffect(() => read),
               Stream.flattenIterable,
             )

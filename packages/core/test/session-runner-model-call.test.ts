@@ -48,7 +48,7 @@ import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { Auth } from "@opencode-ai/llm/route"
 import { describe, expect } from "bun:test"
-import { Effect, Layer, Schema, Stream } from "effect"
+import { Cause, Effect, Exit, Layer, Schema, Stream } from "effect"
 import { testEffect } from "./lib/effect"
 
 const model = OpenAIChat.route
@@ -77,6 +77,20 @@ const callsTool: LLMClientShape["stream"] = () =>
     LLMEvent.stepStart({ index: 0 }),
     LLMEvent.toolCall({ id: "call_probe", name: "probe_write", input: {} }),
     LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+  ])
+// Calls the tool that declines.
+const callsDecliningTool: LLMClientShape["stream"] = () =>
+  Stream.fromIterable([
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolCall({ id: "call_probe", name: "probe_declines", input: {} }),
+    LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+  ])
+// A tool call, then the provider dies mid-stream. The calls are recorded but the turn is over.
+const callsToolThenFails: LLMClientShape["stream"] = () =>
+  Stream.fromIterable([
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolCall({ id: "call_probe", name: "probe_write", input: {} }),
+    LLMEvent.providerError({ message: "upstream exploded" }),
   ])
 // The same, for the tool that declares itself repeatable.
 const callsIdempotentTool: LLMClientShape["stream"] = () =>
@@ -169,6 +183,14 @@ const registerProbes = (ran: { write: number; read: number }) =>
             ran.write += 1
             return "wrote"
           }),
+      }),
+      // permission.assert declines by dying with this, so a tool that dies the same way exercises
+      // the same classification without needing the permission service in the tool's context.
+      probe_declines: Tool.make({
+        description: "declines",
+        input: Schema.Struct({}),
+        output: Schema.String,
+        execute: () => Effect.die(new PermissionV2.DeclinedError()),
       }),
       probe_read: Tool.make({
         description: "read probe",
@@ -645,6 +667,78 @@ describe("SessionRunner model-only attempt under compaction", () => {
       if (result.kind !== "called") return
       expect(result.calls.map((call) => call.id)).toEqual(["call_probe"])
       expect(ran.write).toBe(0)
+    }),
+  )
+})
+
+// A turn has to stop when the provider fails. Only the attempt knows that happened: the log shows a
+// failed assistant with tool parts, which reads the same as a step that wants to keep going. If the
+// seal re-derives the decision instead of being told, a hard provider failure loops on the durable
+// path until a step ceiling catches it.
+describe("SessionRunner provider failure in a stepped turn", () => {
+  harness(callsToolThenFails).effect("ends the turn instead of asking for another step", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const runner = yield* SessionRunner.Service
+
+      const model = yield* runner.runModelCall({
+        sessionID,
+        step: 2,
+        promotion: undefined,
+        first: false,
+        force: false,
+      })
+
+      expect(model.kind).toBe("called")
+      if (model.kind !== "called") return
+      expect(model.needsContinuation).toBe(false)
+      // The attempt already failed them on the way out, so dispatching would only re-read settled
+      // parts.
+      expect(model.calls).toHaveLength(0)
+
+      const result = yield* runner.sealStep({
+        sessionID,
+        step: model.step,
+        settlement: model.settlement,
+        assistantMessageID: model.assistantMessageID,
+        needsContinuation: model.needsContinuation,
+      })
+
+      expect(result.continue).toBe(false)
+      expect(ran.write).toBe(0)
+    }),
+  )
+})
+
+// A decline is the user stopping the turn, not one tool failing. If it reaches the dispatcher as an
+// ordinary tool error it gets swallowed, the step seals, and the agent carries on past a refusal.
+describe("SessionRunner declined permission in a stepped turn", () => {
+  harness(callsDecliningTool).effect("halts the turn rather than reporting a failed tool", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const runner = yield* SessionRunner.Service
+      const model = yield* runner.runModelCall({
+        sessionID,
+        step: 2,
+        promotion: undefined,
+        first: false,
+        force: false,
+      })
+      if (model.kind !== "called" || !model.calls[0]) throw new Error("expected a deferred call")
+
+      const exit = yield* runner
+        .runToolCall({ sessionID, call: model.calls[0], retry: false })
+        .pipe(Effect.exit)
+
+      // An interrupt is what the activity boundary turns into a non-retryable halt. A plain failure
+      // reads as one bad tool and the turn continues.
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (!Exit.isFailure(exit)) return
+      expect(Cause.hasInterrupts(exit.cause)).toBe(true)
     }),
   )
 })

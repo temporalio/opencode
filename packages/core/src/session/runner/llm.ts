@@ -414,7 +414,11 @@ const layer = Layer.effect(
           return {
             needsContinuation: !publisher.hasProviderError() && needsContinuation,
             step: currentStep,
-            calls: deferred as ReadonlyArray<DeferredToolCall>,
+            // A provider error already failed every recorded call, so handing them back would only
+            // buy a dispatch that reads them as settled.
+            calls: (publisher.hasProviderError()
+              ? []
+              : deferred) as ReadonlyArray<DeferredToolCall>,
             settlement: stepSettlement,
             assistantMessageID,
           }
@@ -648,7 +652,12 @@ const layer = Layer.effect(
       // A step continues so the model can see its tool results. Provider-executed calls need no
       // follow-up turn, so a step holding only those finalizes as a plain stop.
       const localTools = toolParts.some((part) => part.provider?.executed !== true)
-      if (!inFlight) return yield* stepContinuation(input.sessionID, localTools, input.step)
+      if (target.time.completed)
+        return yield* stepContinuation(
+          input.sessionID,
+          input.needsContinuation ?? localTools,
+          input.step,
+        )
       // A dispatch that failed outright leaves its call open. Close it here, or the next attempt
       // sends a request carrying a tool_use with no tool_result and the provider rejects it.
       yield* failInterruptedTools(input.sessionID, context)
@@ -674,7 +683,11 @@ const layer = Layer.effect(
         snapshot: endSnapshot,
         files,
       })
-      return yield* stepContinuation(input.sessionID, localTools, input.step)
+      return yield* stepContinuation(
+        input.sessionID,
+        input.needsContinuation ?? localTools,
+        input.step,
+      )
     })
 
     const toolPartOf = (messages: ReadonlyArray<SessionMessage.Message>, callID: string) => {
@@ -688,7 +701,17 @@ const layer = Layer.effect(
     const runToolCall = Effect.fn("SessionRunner.runToolCall")(function* (input: ToolCallInput) {
       const session = yield* getSession(input.sessionID)
       const assistantMessageID = SessionMessage.ID.make(input.call.assistantMessageID)
-      const part = toolPartOf(yield* getContext(input.sessionID), input.call.id)
+      // A point read, not the whole projected history. The call carries the message
+      // that owns it, so decoding every message to find one part would make a step
+      // cost O(session) per tool instead of O(1).
+      const owner = yield* store.message(assistantMessageID)
+      const part =
+        owner?.message.type === "assistant"
+          ? owner.message.content.find(
+              (item): item is SessionMessage.AssistantTool =>
+                item.type === "tool" && item.id === input.call.id,
+            )
+          : undefined
       // The call has to be in the log already: the attempt that produced it published Tool.Called
       // before handing it over. Missing means the log moved under us (a fence), and running a tool
       // whose call is not recorded would leave an orphan result.
@@ -713,13 +736,28 @@ const layer = Layer.effect(
         })
         return { outcome: "unknown" } as ToolCallResult
       }
-      const settlement = yield* materialization.settle({
-        sessionID: input.sessionID,
-        agent: agent.id,
-        assistantMessageID,
-        call: LLMEvent.toolCall({ id: input.call.id, name: input.call.name, input: input.call.input }),
-      })
-      yield* emitToolResult(events, {
+      const settlement = yield* materialization
+        .settle({
+          sessionID: input.sessionID,
+          agent: agent.id,
+          assistantMessageID,
+          call: LLMEvent.toolCall({
+            id: input.call.id,
+            name: input.call.name,
+            input: input.call.input,
+          }),
+        })
+        // A decline is the user stopping the turn, not a tool that failed. It has to reach the
+        // boundary as an interrupt, or the dispatcher treats it as one bad tool, seals the step and
+        // the agent carries on past a refusal.
+        .pipe(
+          Effect.catchCause((cause) =>
+            isUserDeclined(cause) ? Effect.interrupt : Effect.failCause(cause),
+          ),
+        )
+      // The tool has run by here, so losing the result to an interrupt would hide a
+      // side effect that already happened.
+      yield* Effect.uninterruptible(emitToolResult(events, {
         sessionID: input.sessionID,
         assistantMessageID,
         callID: input.call.id,
@@ -728,7 +766,7 @@ const layer = Layer.effect(
         outputPaths: settlement.outputPaths,
         // Deferred calls are never provider-executed: those are filtered out before the hand-off.
         provider: { executed: false },
-      })
+      }))
       return { outcome: "settled" } as ToolCallResult
     })
 
@@ -749,6 +787,7 @@ const layer = Layer.effect(
         calls: result.calls,
         settlement: result.settlement,
         assistantMessageID: result.assistantMessageID,
+        needsContinuation: result.needsContinuation,
       } as ModelCallResult
     })
 

@@ -15,24 +15,27 @@
 // sandbox does not have. The queue is chosen by the client that starts the workflow and by the worker
 // that polls, both of which are ordinary Node.
 import { createHash } from "node:crypto"
-import { realpathSync } from "node:fs"
+import { resolve } from "node:path"
 
 /** Longer than needed to make a collision implausible, short enough to keep the queue name readable
  * in the Temporal UI and in `temporal task-queue describe`. */
 const DIGEST_LENGTH = 12
 
 /**
- * The queue for one worktree. Resolved through realpath so two spellings of the same directory agree
- * on a name: on macOS `/tmp/x` and `/private/tmp/x` are the same tree, and a client and a worker that
- * disagreed about that would sit on two queues and never meet. Falls back to the given path when it
- * does not exist yet, which is the case for a worker declaring a tree it has not materialized.
+ * The queue for one worktree.
+ *
+ * Derived from the path alone, never from the filesystem. The two sides that have to agree do not
+ * see the same disk: the client hashes the session's directory, the worker hashes the tree it was
+ * told to serve, and a worker may not have materialized that tree yet. Resolving through the
+ * filesystem would make the key depend on whether the path happens to exist locally, so one side
+ * would canonicalize and the other would not, and they would sit on different queues while nothing
+ * reported an error.
+ *
+ * The cost is that the operator has to spell the tree the same way on both sides. `/tmp/x` and
+ * `/private/tmp/x` are one tree on macOS and two keys here. Both processes log the queue they use,
+ * so a mismatch shows up as two names rather than as a session that never runs.
  */
 export const queueForWorktree = (base: string, directory: string): string => {
-  let canonical = directory
-  try {
-    canonical = realpathSync(directory)
-  } catch {
-    // Not present yet; the literal path is still a stable key.
-  }
+  const canonical = resolve(directory).replace(/[/\\]+$/, "")
   return `${base}-wt-${createHash("sha256").update(canonical).digest("hex").slice(0, DIGEST_LENGTH)}`
 }

@@ -35,6 +35,7 @@ export type ModelCallDrainResult =
       readonly calls: ReadonlyArray<DeferredToolCall>
       readonly settlement?: StepSettlement
       readonly assistantMessageID?: string
+      readonly needsContinuation?: boolean
       /** The event-log token this attempt claimed. The tool and seal activities of this step must
        * publish under it, so it travels with the calls instead of being minted again. */
       readonly owner: string
@@ -58,6 +59,7 @@ export interface SealDrainInput {
   readonly step: number
   readonly settlement?: StepSettlement
   readonly assistantMessageID?: string
+  readonly needsContinuation?: boolean
   readonly owner: string
 }
 
@@ -80,7 +82,9 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
   ) =>
     Effect.gen(function* () {
       const session = yield* store.get(SessionSchema.ID.make(sessionID))
-      if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
+      // Deleting a session while its workflow is alive is not a run error. The whole-step drain
+      // reports it as nothing to do, and a resume waiting on this should resolve, not reject.
+      if (!session) return undefined
       if (claim) yield* events.claim(session.id, owner)
       // A worker taking this step on a host without the project tree rebuilds it from snapshot packs.
       yield* worktrees.ensure(session.location.directory)
@@ -106,7 +110,12 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
         }),
       ).pipe(
         Effect.map((result): ModelCallDrainResult =>
-          result.kind === "settled"
+          result === undefined
+            ? {
+                kind: "settled",
+                result: { ran: false, continue: false, step: input.step, promotion: null },
+              }
+            : result.kind === "settled"
             ? {
                 kind: "settled",
                 result: {
@@ -122,6 +131,7 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
                 calls: result.calls,
                 settlement: result.settlement,
                 assistantMessageID: result.assistantMessageID,
+                needsContinuation: result.needsContinuation,
                 owner: input.owner,
               },
         ),
@@ -138,7 +148,7 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
           call: input.call,
           retry: input.retry === true,
         }),
-      ),
+      ).pipe(Effect.map((result) => result ?? { outcome: "already-settled" as const })),
     )
 
   const sealDrain = async (input: SealDrainInput, signal: AbortSignal): Promise<StepDrainResult> =>
@@ -151,14 +161,19 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
           step: input.step,
           settlement: input.settlement,
           assistantMessageID: input.assistantMessageID,
+          needsContinuation: input.needsContinuation,
         }),
       ).pipe(
-        Effect.map((result) => ({
-          ran: result.ran,
-          continue: result.continue,
-          step: result.step,
-          promotion: result.promotion ?? null,
-        })),
+        Effect.map((result) =>
+          result === undefined
+            ? { ran: false, continue: false, step: input.step, promotion: null }
+            : {
+                ran: result.ran,
+                continue: result.continue,
+                step: result.step,
+                promotion: result.promotion ?? null,
+              },
+        ),
       ),
     )
 
