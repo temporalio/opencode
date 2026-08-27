@@ -1,8 +1,10 @@
 // How much of a real provider's stream arrives AFTER it has asked for its first tool?
 //
 // That gap is the only thing a stepped executor gives up: a whole-step activity forks the tool
-// immediately and runs it under the rest of the stream, while a split has to wait for the attempt to
-// return. The bench measured the loss as min(tail, tool duration) with a dialled mock. This measures
+// immediately and runs it under the rest of the stream, while a split has to wait for the attempt
+// to
+// return. The bench measured the loss as min(tail, tool duration) with a dialled mock. This
+// measures
 // the tail itself, against the real API, so the mock's dial can be set to something honest.
 //
 // The measuring point matters. OpenCode forks on the `tool-call` event, which the protocol layer
@@ -62,7 +64,8 @@ const PROBES: ReadonlyArray<Probe> = [
   { label: "single-call-terse", prompt: "What files are here? Use the bash tool once." },
   {
     label: "three-calls",
-    prompt: "Read these three files: src/a.ts, src/b.ts, src/c.ts. Use the read_file tool, one call per file.",
+    prompt:
+      "Read these three files: src/a.ts, src/b.ts, src/c.ts. Use the read_file tool, one call per file.",
   },
   {
     label: "five-calls",
@@ -71,7 +74,8 @@ const PROBES: ReadonlyArray<Probe> = [
   },
   {
     label: "narrate-then-call",
-    prompt: "Say one short sentence about what you are going to check, then run `git status` with the bash tool.",
+    prompt:
+      "Say one short sentence about what you are going to check, then run `git status` with the bash tool.",
   },
   {
     label: "call-then-narrate",
@@ -137,7 +141,8 @@ const streamResponses = async (model: string, prompt: string): Promise<Result> =
   return consume(res, started, (obj) => {
     const ids: string[] = []
     // The fork point: arguments complete, so the call can actually be dispatched.
-    if (obj?.type === "response.function_call_arguments.done") ids.push(String(obj.item_id ?? obj.output_index))
+    if (obj?.type === "response.function_call_arguments.done")
+      ids.push(String(obj.item_id ?? obj.output_index))
     const text = obj?.type === "response.output_text.delta" ? String(obj.delta ?? "").length : 0
     return { toolIds: ids, text }
   })
@@ -209,7 +214,10 @@ for (const probe of PROBES) {
   let after = 0
   for (let i = 0; i < runs; i++) {
     try {
-      const r = api === "responses" ? await streamResponses(model, probe.prompt) : await streamChat(model, probe.prompt)
+      const r =
+        api === "responses"
+          ? await streamResponses(model, probe.prompt)
+          : await streamChat(model, probe.prompt)
       if (r.firstToolAt === undefined) continue
       tails.push(Math.round(r.lastAt - r.firstToolAt))
       calls = Math.max(calls, r.calls)

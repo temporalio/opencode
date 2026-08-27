@@ -24,7 +24,8 @@ import { TemporalConfig } from "./config"
 import { WORKFLOW_TYPE, WORKFLOW_ID_PREFIX, workflowId } from "./protocol"
 
 // Classify an interrupt-signal delivery error. "already completed"/"not found" means an idle
-// session's workflow has already closed -- nothing to interrupt, a no-op. Anything else is a genuine
+// session's workflow has already closed -- nothing to interrupt, a no-op. Anything else is a
+// genuine
 // control-plane failure: the user's stop was not delivered, and it must NOT be reported as success.
 export function classifyInterruptError(e: unknown): "ignore" | "fail" {
   const message = String((e as { message?: unknown })?.message ?? e)
@@ -90,7 +91,9 @@ const layer = Layer.effect(
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
     if (HOST_WORKER) {
-      const { NativeConnection, Worker } = yield* Effect.tryPromise(() => import("@temporalio/worker")).pipe(
+      const { NativeConnection, Worker } = yield* Effect.tryPromise(
+        () => import("@temporalio/worker"),
+      ).pipe(
         Effect.catch(() =>
           Effect.die(
             "The embedded Temporal worker is unavailable in this build. Run standalone workers " +
@@ -122,7 +125,8 @@ const layer = Layer.effect(
     }
 
     // Worker-only process: it hosts activities but drives no workflows, so the client methods are
-    // unused. Return a service whose driving methods fail loudly if something unexpectedly calls them.
+    // unused. Return a service whose driving methods fail loudly if something unexpectedly calls
+    // them.
     if (!HOST_CLIENT) {
       yield* Effect.logInfo("SessionExecutionTemporal worker ready").pipe(
         Effect.annotateLogs({
@@ -157,7 +161,11 @@ const layer = Layer.effect(
             workflowId: workflowId(id),
             args: [
               id,
-              { startWithWake: true, idleTimeout: IDLE_TIMEOUT, stepped: STEPPED } satisfies WF.SessionTurnOptions,
+              {
+                startWithWake: true,
+                idleTimeout: IDLE_TIMEOUT,
+                stepped: STEPPED,
+              } satisfies WF.SessionTurnOptions,
             ],
             signal: WF.wake,
             signalArgs: [],
@@ -215,8 +223,10 @@ const layer = Layer.effect(
                 const startOp = new WithStartWorkflowOperation(WORKFLOW_TYPE, {
                   taskQueue: resumeQueue,
                   workflowId: workflowId(id),
-                  // startWithWake=false: a fresh resume-with-start must not manufacture a wake drain;
-                  // its forced drain comes from the resume update. Ignored when USE_EXISTING joins a
+                  // startWithWake=false: a fresh resume-with-start must not manufacture a wake
+                  // drain;
+                  // its forced drain comes from the resume update. Ignored when USE_EXISTING joins
+                  // a
                   // running workflow (which keeps its own state).
                   args: [
                     id,
@@ -256,7 +266,8 @@ const layer = Layer.effect(
             // An idle session's workflow has already completed; nothing to interrupt is fine.
             if (classifyInterruptError(e) === "ignore") return Effect.void
             // A genuine delivery failure must not read as success: the stop did not happen. The
-            // interface has no error channel, so surface it as a defect rather than a false success.
+            // interface has no error channel, so surface it as a defect rather than a false
+            // success.
             const message = String((e as { message?: unknown })?.message ?? e)
             return Effect.logError("session interrupt signal failed").pipe(
               Effect.annotateLogs({ sessionID: id, error: message }),

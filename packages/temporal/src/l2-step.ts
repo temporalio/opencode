@@ -1,5 +1,6 @@
 // One step as three units of work instead of one: the provider attempt, each tool call it asks for,
-// and the seal that closes it. This is the whole point of the split, and it is workflow code, so the
+// and the seal that closes it. This is the whole point of the split, and it is workflow code, so
+// the
 // model-to-tools loop lives where retries, timers, approvals and budgets can sit between the two.
 //
 // MUST stay pure, like supervisor.ts: this is bundled into the workflow sandbox, so no `effect`, no
@@ -7,7 +8,8 @@
 //
 // What this costs, stated plainly: a whole-step activity starts each tool the moment the model asks
 // for it, while the stream is still going. Here the attempt has to return before any tool starts,
-// because a workflow cannot consume a stream. The tools of one step still run concurrently with each
+// because a workflow cannot consume a stream. The tools of one step still run concurrently with
+// each
 // other; what is lost is the overlap between the model and its own tools.
 
 import { ActivityFailure, type ApplicationFailure } from "@temporalio/workflow"
@@ -22,7 +24,8 @@ import type {
 } from "./l2-drain"
 
 /**
- * A halt the user asked for, as it looks once it has crossed an activity boundary. The runner raises
+ * A halt the user asked for, as it looks once it has crossed an activity boundary. The runner
+ * raises
  * it as an interrupt, `boundary.ts` throws it as an `ApplicationFailure`, and the SDK wraps that in
  * one `ActivityFailure`. It is not a cancellation, so `isCancellation` says no, and a dispatcher
  * that checks only that would treat a refusal as one failed tool and carry on.
@@ -42,8 +45,8 @@ export interface SteppedActivities {
 
 export interface SteppedTurnDeps {
   readonly activities: SteppedActivities
-  /** Whether an error is the driver's cancellation. An interrupt has to end the turn, so it must not
-   * be swallowed the way a failed tool is. */
+  /** Whether an error is the driver's cancellation. An interrupt has to end the turn, so it must
+   * not be swallowed the way a failed tool is. */
   readonly isCancellation: (error: unknown) => boolean
   /** Whether an error is the user stopping the turn, like a declined permission. It arrives as an
    * ordinary activity failure, so without this it reads as one bad tool and the turn carries on
@@ -52,7 +55,8 @@ export interface SteppedTurnDeps {
 }
 
 /**
- * Drives one step and reports the next loop state, so it drops straight into the supervisor in place
+ * Drives one step and reports the next loop state, so it drops straight into the supervisor in
+ * place
  * of a whole-step activity.
  */
 export const makeSteppedTurn =

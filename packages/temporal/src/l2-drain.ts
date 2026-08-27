@@ -78,7 +78,10 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
     sessionID: string,
     owner: string,
     claim: boolean,
-    use: (runner: SessionRunner.Interface, session: SessionSchema.Info) => Effect.Effect<A, SessionRunner.RunError>,
+    use: (
+      runner: SessionRunner.Interface,
+      session: SessionSchema.Info,
+    ) => Effect.Effect<A, SessionRunner.RunError>,
   ) =>
     Effect.gen(function* () {
       const session = yield* store.get(SessionSchema.ID.make(sessionID))
@@ -86,7 +89,8 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
       // reports it as nothing to do, and a resume waiting on this should resolve, not reject.
       if (!session) return undefined
       if (claim) yield* events.claim(session.id, owner)
-      // A worker taking this step on a host without the project tree rebuilds it from snapshot packs.
+      // A worker taking this step on a host without the project tree rebuilds it from snapshot
+      // packs.
       yield* worktrees.ensure(session.location.directory)
       return yield* SessionRunner.Service.use((runner) => use(runner, session)).pipe(
         Effect.provide(locations.get(session.location)),
@@ -109,36 +113,40 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
           force: input.force,
         }),
       ).pipe(
-        Effect.map((result): ModelCallDrainResult =>
-          result === undefined
-            ? {
-                kind: "settled",
-                result: { ran: false, continue: false, step: input.step, promotion: null },
-              }
-            : result.kind === "settled"
-            ? {
-                kind: "settled",
-                result: {
-                  ran: result.result.ran,
-                  continue: result.result.continue,
-                  step: result.result.step,
-                  promotion: result.result.promotion ?? null,
-                },
-              }
-            : {
-                kind: "called",
-                step: result.step,
-                calls: result.calls,
-                settlement: result.settlement,
-                assistantMessageID: result.assistantMessageID,
-                needsContinuation: result.needsContinuation,
-                owner: input.owner,
-              },
+        Effect.map(
+          (result): ModelCallDrainResult =>
+            result === undefined
+              ? {
+                  kind: "settled",
+                  result: { ran: false, continue: false, step: input.step, promotion: null },
+                }
+              : result.kind === "settled"
+                ? {
+                    kind: "settled",
+                    result: {
+                      ran: result.result.ran,
+                      continue: result.result.continue,
+                      step: result.result.step,
+                      promotion: result.result.promotion ?? null,
+                    },
+                  }
+                : {
+                    kind: "called",
+                    step: result.step,
+                    calls: result.calls,
+                    settlement: result.settlement,
+                    assistantMessageID: result.assistantMessageID,
+                    needsContinuation: result.needsContinuation,
+                    owner: input.owner,
+                  },
         ),
       ),
     )
 
-  const toolCallDrain = async (input: ToolCallDrainInput, signal: AbortSignal): Promise<ToolCallDrainResult> =>
+  const toolCallDrain = async (
+    input: ToolCallDrainInput,
+    signal: AbortSignal,
+  ): Promise<ToolCallDrainResult> =>
     runAtBoundary(
       input.sessionID,
       signal,

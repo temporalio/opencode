@@ -6,7 +6,8 @@
 import { heartbeat, Context } from "@temporalio/activity"
 
 // The event-log owner token for one activity execution: run id + activity id + attempt. A Temporal
-// retry of the SAME step gets a fresh attempt, so once the retry claims the log the previous attempt
+// retry of the SAME step gets a fresh attempt, so once the retry claims the log the previous
+// attempt
 // (if still running) is fenced out. The activity id is essential: activity attempt numbers restart
 // at 1 for every step, so a run-id+attempt token alone would repeat across steps (step 1 attempt 1
 // and step 2 attempt 1 both mint `run#1`), letting a zombie attempt from an earlier step re-match
@@ -19,7 +20,8 @@ export function ownerTokenFrom(run: string, activityId: string, attempt: number)
 function ownerToken(): string {
   const info = Context.current().info
   // runId/workflowType are typed optional on ActivityInfo; activityId is always present and already
-  // makes the token unique per execution, so an empty run prefix in the (degenerate) missing case is
+  // makes the token unique per execution, so an empty run prefix in the (degenerate) missing case
+  // is
   // harmless.
   const run = info.workflowExecution?.runId ?? info.workflowType ?? ""
   return ownerTokenFrom(run, info.activityId, info.attempt)
@@ -63,7 +65,9 @@ export function makeStepActivities(
 ): StepActivities {
   return {
     async runTurnStep(input) {
-      return beating(() => stepDrain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal))
+      return beating(() =>
+        stepDrain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal),
+      )
     },
   }
 }
@@ -74,7 +78,8 @@ export type SteppedTurnActivities = {
   sealStep(input: SealDrainInput): Promise<StepDrainResult>
 }
 
-// The three activities of a stepped step. Only the model call mints and claims an owner token: it is
+// The three activities of a stepped step. Only the model call mints and claims an owner token: it
+// is
 // the writer that supersedes the attempt before it, and the tool and seal activities publish under
 // the token it returned. Giving each of them its own token would make a step's writers fence each
 // other out of the log.
@@ -89,7 +94,10 @@ export function makeSteppedTurnActivities(drains: {
   return {
     async runModelCall(input) {
       return beating(() =>
-        drains.modelCallDrain({ ...input, owner: ownerToken() }, Context.current().cancellationSignal),
+        drains.modelCallDrain(
+          { ...input, owner: ownerToken() },
+          Context.current().cancellationSignal,
+        ),
       )
     },
     async runToolCall(input) {
@@ -97,7 +105,9 @@ export function makeSteppedTurnActivities(drains: {
       // workflow's: a second attempt of THIS call is a re-run of a tool whose result never landed.
       // The workflow could not compute this without reading non-deterministic state.
       const retry = Context.current().info.attempt > 1
-      return beating(() => drains.toolCallDrain({ ...input, retry }, Context.current().cancellationSignal))
+      return beating(() =>
+        drains.toolCallDrain({ ...input, retry }, Context.current().cancellationSignal),
+      )
     },
     async sealStep(input) {
       return beating(() => drains.sealDrain(input, Context.current().cancellationSignal))

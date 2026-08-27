@@ -6,7 +6,12 @@ import { describe, it, expect } from "bun:test"
 import { isHaltFailure, makeSteppedTurn, type SteppedActivities } from "../src/l2-step"
 import { runAtBoundary } from "../src/boundary"
 import { Effect } from "effect"
-import { ActivityFailure, ApplicationFailure, CancelledFailure, TimeoutFailure } from "@temporalio/workflow"
+import {
+  ActivityFailure,
+  ApplicationFailure,
+  CancelledFailure,
+  TimeoutFailure,
+} from "@temporalio/workflow"
 import type { StepDrainInput, StepDrainResult } from "../src/activities"
 import type { ModelCallDrainResult, SealDrainInput, ToolCallDrainInput } from "../src/l2-drain"
 
@@ -15,13 +20,26 @@ class FakeHalt extends Error {}
 const isCancellation = (e: unknown) => e instanceof FakeCancel
 const isHalt = (e: unknown) => e instanceof FakeHalt
 
-const INPUT: StepDrainInput = { sessionID: "ses_1", step: 2, promotion: null, first: false, force: false }
+const INPUT: StepDrainInput = {
+  sessionID: "ses_1",
+  step: 2,
+  promotion: null,
+  first: false,
+  force: false,
+}
 const SEALED: StepDrainResult = { ran: true, continue: true, step: 3, promotion: "steer" }
-const call = (id: string, name = "probe_write") => ({ id, name, input: {}, assistantMessageID: "msg_1" })
+const call = (id: string, name = "probe_write") => ({
+  id,
+  name,
+  input: {},
+  assistantMessageID: "msg_1",
+})
 
 const fakes = (
   model: ModelCallDrainResult,
-  onTool: (input: ToolCallDrainInput) => Promise<{ outcome: "settled" }> = async () => ({ outcome: "settled" }),
+  onTool: (input: ToolCallDrainInput) => Promise<{ outcome: "settled" }> = async () => ({
+    outcome: "settled",
+  }),
 ) => {
   const tools: ToolCallDrainInput[] = []
   const seals: SealDrainInput[] = []
@@ -58,7 +76,10 @@ describe("stepped turn", () => {
       kind: "called",
       step: 2,
       calls: [call("call_a"), call("call_b")],
-      settlement: { finish: "tool-calls", tokens: { input: 1, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } },
+      settlement: {
+        finish: "tool-calls",
+        tokens: { input: 1, output: 2, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
       owner: "run-1:model-1:1",
     })
 
@@ -135,10 +156,15 @@ describe("halt predicate", () => {
     new ActivityFailure("activity failed", "runToolCall", "1", 1 as never, undefined, cause)
 
   it("recognises what the activity boundary throws for a user halt", async () => {
-    // Built by running the boundary rather than by hand, so the two sides cannot drift: an interrupt
+    // Built by running the boundary rather than by hand, so the two sides cannot drift: an
+    // interrupt
     // with no abort is how a decline leaves the runner, and whatever that produces is what a
     // dispatcher has to recognise.
-    const thrown = await runAtBoundary("ses_1", new AbortController().signal, Effect.interrupt).then(
+    const thrown = await runAtBoundary(
+      "ses_1",
+      new AbortController().signal,
+      Effect.interrupt,
+    ).then(
       () => undefined,
       (error: unknown) => error,
     )

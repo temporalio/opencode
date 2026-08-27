@@ -6,7 +6,8 @@
 // opt-in:
 //
 //   temporal server start-dev --port 7237 --headless &
-//   OPENCODE_CONTRACT_TEMPORAL=1 bun test --timeout 120000 test/session-execution-temporal-contract.test.ts
+//   OPENCODE_CONTRACT_TEMPORAL=1 \
+//     bun test --timeout 120000 test/session-execution-temporal-contract.test.ts
 //
 // Without the opt-in the file registers nothing, so a plain `bun test` stays server-free.
 import { makeExecutionFor, runContract } from "@opencode-ai/core/session/execution/conformance"
@@ -24,5 +25,6 @@ if (process.env.OPENCODE_CONTRACT_TEMPORAL === "1") {
   const stepped = process.env.OPENCODE_TEMPORAL_STEPPED === "1"
   // Imported dynamically because the driver reads its connection config at module load.
   const { SessionExecutionTemporal } = await import("@opencode-ai/temporal/executor")
-  runContract(stepped ? "temporal driver (stepped)" : "temporal driver", makeExecutionFor(SessionExecutionTemporal.node))
+  const label = stepped ? "temporal driver (stepped)" : "temporal driver"
+  runContract(label, makeExecutionFor(SessionExecutionTemporal.node))
 }

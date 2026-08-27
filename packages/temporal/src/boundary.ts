@@ -1,10 +1,13 @@
 // Crossing from Effect into an activity result. Every drain in this package ends here, so the way a
 // failure is classified is decided in one place:
-//   - an interrupt caused by the driver's own cancellation rethrows the abort reason, so the attempt
+//   - an interrupt caused by the driver's own cancellation rethrows the abort reason, so the
+// attempt
 //     records Cancelled rather than Failed
-//   - an interrupt with no cancellation is an internal halt (a user declining a permission) and must
+//   - an interrupt with no cancellation is an internal halt (a user declining a permission) and
+// must
 //     be non-retryable, or the supervisor re-drives a turn the user explicitly stopped
-//   - a genuine run error crosses non-retryable with the RunError encoded in `details`, so the caller
+//   - a genuine run error crosses non-retryable with the RunError encoded in `details`, so the
+// caller
 //     reconstructs the exact typed error instead of a string
 // Only crashes and task timeouts (never thrown here) go through the activity retry policy.
 
@@ -26,7 +29,9 @@ export const runAtBoundary = async <A>(
   if (Cause.hasInterruptsOnly(cause)) {
     if (signal.aborted)
       throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
-    const declined = encodeRunError(new SessionRunDeclinedError({ sessionID: SessionSchema.ID.make(sessionID) }))
+    const declined = encodeRunError(
+      new SessionRunDeclinedError({ sessionID: SessionSchema.ID.make(sessionID) }),
+    )
     throw ApplicationFailure.create({
       message: "session run halted (user declined)",
       type: HALTED_FAILURE_TYPE,

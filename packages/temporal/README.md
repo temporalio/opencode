@@ -22,7 +22,8 @@ One env var picks the executor. `temporal` runs each session as a per-session Te
 with one activity per step (this package: `executor.ts` wires the client and worker, `supervisor.ts`
 is the loop, `workflow.ts` adapts it to the sandbox, `drain.ts` is the step body). The default runs
 in-process on the proven `SessionRunCoordinator` (core's `execution/local.ts`), the same lifecycle
-the v1 server uses, with no server and no ports (see [Two modes, one runner](#two-modes-one-runner)).
+the v1 server uses, with no server and no ports (see [Two modes, one
+runner](#two-modes-one-runner)).
 What an executor must do is defined executably: core's conformance suite
 (`session/execution/conformance.ts`) runs the same wake/resume/interrupt scenarios against the local
 executor in core's tests and against this package through real workflows.
@@ -109,7 +110,8 @@ runModelCall  ->  runToolCall (one per call, concurrent)  ->  sealStep
 `SessionRunner.runModelCall` performs the attempt, records each call as `Tool.Called`, and hands the
 calls back rather than running them. `runToolCall` settles one call. `sealStep` takes the end
 snapshot, diffs it against the start, and publishes `Step.Ended`. The loop between them is workflow
-code, so a retry policy, a timeout, an approval or a budget can live where the model-to-tools handoff
+code, so a retry policy, a timeout, an approval or a budget can live where the model-to-tools
+handoff
 used to be. Each activity also carries its own bounds: sealing does not inherit a turn-sized
 backstop, and one tool waiting on a human no longer holds the attempt and its sibling tools under a
 single timeout.
@@ -230,7 +232,8 @@ Verified live (dev server, `gpt-5-mini`, stepped mode on):
 - **A tool activity rebuilds a worktree it has never seen.** Each of the three drains calls
   `worktrees.ensure`, so a tool call landing on a worker without the project tree materializes it
   from the snapshot packs. Checked by deleting the entire working directory between two turns of a
-  live session: the next turn's tool activity rebuilt both files, the `read` completed, and the model
+  live session: the next turn's tool activity rebuilt both files, the `read` completed, and the
+  model
   answered with the file's contents. Worker affinity (below) skips the
   materialization on warm paths;
   the packs are the baseline that works without it.
@@ -260,7 +263,8 @@ to satisfy the same one or the two Temporal modes drift and only the tested one 
 temporal server start-dev --port 7237 --headless &
 cd packages/temporal
 # whole step per activity
-OPENCODE_CONTRACT_TEMPORAL=1 bun test --timeout 180000 test/session-execution-temporal-contract.test.ts
+OPENCODE_CONTRACT_TEMPORAL=1 \
+  bun test --timeout 180000 test/session-execution-temporal-contract.test.ts
 # model call, one activity per tool, seal
 OPENCODE_CONTRACT_TEMPORAL=1 OPENCODE_TEMPORAL_STEPPED=1 bun test --timeout 180000 \
   test/session-execution-temporal-contract.test.ts
@@ -276,7 +280,8 @@ are carried.
 
 #### Worker affinity (`OPENCODE_TEMPORAL_WORKTREE_AFFINITY=1`)
 
-Off by default. Without it every worker polls one queue, and a worker drawing a session whose tree it
+Off by default. Without it every worker polls one queue, and a worker drawing a session whose tree
+it
 has never seen rebuilds that tree from snapshot packs. That is the portable baseline and it works.
 Affinity avoids the rebuild by routing instead: the queue name is derived from the session's
 directory, and only workers serving that directory poll it.
@@ -290,7 +295,8 @@ OPENCODE_TEMPORAL_WORKTREE_AFFINITY=1 OPENCODE_TEMPORAL_WORKTREE=/srv/trees/acme
 The queue is keyed on the session's `location.directory`, not the project root, because that is the
 tree `worktrees.ensure` has to produce and two sessions in one project can sit in different
 directories. Paths are resolved through `realpath` first: on macOS `/tmp/x` and `/private/tmp/x` are
-one tree, and a client and a worker that disagreed would sit on two queues and the session would hang
+one tree, and a client and a worker that disagreed would sit on two queues and the session would
+hang
 with nothing to show for it.
 
 **This trades availability for latency, which is why it is opt-in.** With affinity on, a session
@@ -345,7 +351,8 @@ log. `OPENCODE_SESSION_EXECUTION=temporal` runs each session as a per-session Te
 `sessionTurn` supervisor (`supervisor.ts`) loops a `runTurnStep` drain, so each step (one provider
 attempt + its tools) is its own activity with its own retry/timeout/visibility, reusing
 `SessionRunner.runStep` (one iteration of `run`'s loop). Anything else (the default) runs in-process
-on the proven `SessionRunCoordinator` (`execution/local.ts`) -- no server, no worker, no ports -- which
+on the proven `SessionRunCoordinator` (`execution/local.ts`) -- no server, no worker, no ports --
+which
 drives whole turns with `SessionRunner.run` and owns the wake/resume/interrupt lifecycle. That
 coordinator is the same one the v1 server uses and has direct lifecycle tests
 (`session-run-coordinator.test.ts`), so the default path reuses well-exercised code rather than a
@@ -361,7 +368,8 @@ local modes were folded away in favor of the coordinator for local.)
 A per-step re-drive resumes from the durable event log rather than re-running work. `runStep` closes
 any tool left dangling by an interrupted attempt on every entry, not just the first. Without that, a
 mid-turn retry (`first=false`) re-streamed a request carrying a `tool_use` with no `tool_result`,
-which the provider rejects, a retry poison loop. And if the crashed step had already dispatched tools
+which the provider rejects, a retry poison loop. And if the crashed step had already dispatched
+tools
 it is finalized from the log: completed tool results are kept, still-unsettled tools are failed, and
 a synthesized `Step.Ended` closes the step without re-calling the model. A tool caught in flight at
 the crash is handled by declared idempotency: a side-effect-free tool (`read`/`glob`/`grep`, marked
@@ -426,7 +434,8 @@ have the session's worktree present (see "What resumes cross-host").
 ### Durable permission asks
 
 A tool waiting for user approval used to park on an in-memory deferred: invisible outside the asking
-process (a standalone worker's ask could never be answered) and gone on restart. A pending ask is now
+process (a standalone worker's ask could never be answered) and gone on restart. A pending ask is
+now
 also a row in the shared store (`permission_request`). The blocked `assert` races its local deferred
 against a poll of the row, so a reply from ANY process sharing the store (the HTTP server answering
 for a detached worker) unblocks it; `list`/`get`/`forSession` read the rows, so serve can show asks
@@ -499,10 +508,14 @@ distinct worker identities.
 
 ### What resumes cross-host, and what does not
 
-The runner rebuilds a session's LLM context purely from the shared DB (`SessionHistory.entriesForRunner`
-then `toLLMMessages`); it never reads local disk to reconstruct context. So the **conversation** resumes
-on any worker: messages, tool results (the bounded preview and structured output that the model sees),
-prompt attachments (stored inline as `data:` URIs in the prompt), and credentials (`CredentialTable`)
+The runner rebuilds a session's LLM context purely from the shared DB
+(`SessionHistory.entriesForRunner`
+then `toLLMMessages`); it never reads local disk to reconstruct context. So the **conversation**
+resumes
+on any worker: messages, tool results (the bounded preview and structured output that the model
+sees),
+prompt attachments (stored inline as `data:` URIs in the prompt), and credentials
+(`CredentialTable`)
 all ride the shared store.
 
 **The project working tree** now rides the store too. After each step capture the runner ships
@@ -517,9 +530,12 @@ packs are the portable baseline that works with neither.
 Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
 
 - **The snapshot store (`${data}/snapshot`) and the retained full tool-output files
-  (`${data}/tool-output`).** The runner never reads these to rebuild context: snapshot file-diffs are
-  best-effort (`Effect.catch` to `undefined`), and the model sees the bounded tool-output preview, not
-  the file. They only affect the diff/restore/revert features and full-output viewing. Point `${data}`
+  (`${data}/tool-output`).** The runner never reads these to rebuild context: snapshot file-diffs
+  are
+  best-effort (`Effect.catch` to `undefined`), and the model sees the bounded tool-output preview,
+  not
+  the file. They only affect the diff/restore/revert features and full-output viewing. Point
+  `${data}`
   (the XDG data dir) at shared storage to make them portable.
 
 ## Porting this pattern

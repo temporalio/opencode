@@ -72,7 +72,7 @@ export interface ToolCallInput {
 
 /** How a dispatched call ended.
  * - `settled`: the tool ran and its result is durable.
- * - `already-settled`: the log already had a result, so nothing ran. This is the at-least-once case.
+ * - `already-settled`: the log already had a result, so nothing ran. The at-least-once case.
  * - `unknown`: a retry of a tool that does not declare itself repeatable. Reported to the model as
  *   an unknown outcome rather than run a second time. */
 export type ToolCallOutcome = "settled" | "already-settled" | "unknown"
@@ -117,15 +117,16 @@ export interface Interface {
   /** Run exactly one step and report the next loop state, so a caller (e.g. a Temporal workflow)
    * can drive the turn one step at a time. Mirrors one iteration of `run`'s loop. */
   readonly runStep: (input: StepInput) => Effect.Effect<StepResult, RunError>
-  /** Run the provider attempt of one step and stop, handing back the tool calls it asked for instead
-   * of running them. The caller dispatches each one and then seals the step. This is what puts the
+  /** Run the provider attempt of one step and stop, handing back the tool calls it asked for
+   * instead of running them. The caller dispatches each one and then seals the step. This is what
+   * puts the
    * model-to-tools loop in a durable executor's hands rather than inside a single activity. */
   readonly runModelCall: (input: StepInput) => Effect.Effect<ModelCallResult, RunError>
   /** Run one recorded tool call and publish its result. Safe to call twice for the same call: the
    * second sees the settled result and does nothing. */
   readonly runToolCall: (input: ToolCallInput) => Effect.Effect<ToolCallResult, RunError>
-  /** Close a step once its calls have been dispatched: snapshot, file diff, Step.Ended, and the loop
-   * decision. Safe to call twice: the second sees the step already closed and returns the same
+  /** Close a step once its calls have been dispatched: snapshot, file diff, Step.Ended, and the
+   * loop decision. Safe to call twice: the second sees the step already closed and returns the same
    * answer without publishing again. */
   readonly sealStep: (input: SealStepInput) => Effect.Effect<StepResult, RunError>
 }

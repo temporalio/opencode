@@ -67,9 +67,16 @@ const model = OpenAIChat.route
   .model({ id: "gpt-4o-mini" })
 const models = SessionRunnerModel.layerWith(() => Effect.succeed(model))
 const systemContext = AppNodeBuilder.build(SystemContextRegistry.node)
-const skillGuidance = Layer.mock(SkillGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
-const referenceGuidance = Layer.mock(ReferenceGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
-const config = Layer.succeed(Config.Service, Config.Service.of({ entries: () => Effect.succeed([]) }))
+const skillGuidance = Layer.mock(SkillGuidance.Service, {
+  load: () => Effect.succeed(SystemContext.empty),
+})
+const referenceGuidance = Layer.mock(ReferenceGuidance.Service, {
+  load: () => Effect.succeed(SystemContext.empty),
+})
+const config = Layer.succeed(
+  Config.Service,
+  Config.Service.of({ entries: () => Effect.succeed([]) }),
+)
 const permission = Layer.mock(PermissionV2.Service, {})
 
 // One tool call, then a stream that keeps going for TAIL_MS. That trailing stream is the whole
@@ -83,9 +90,18 @@ const withTail: LLMClientShape["stream"] = () =>
     ]),
     Stream.concat(
       Stream.fromIterable(
-        Array.from({ length: TAIL_CHUNKS }, (_, i) => LLMEvent.textDelta({ id: "txt_1", text: `chunk ${i} ` })),
-      ).pipe(Stream.mapEffect((event) => Effect.sleep(Duration.millis(TAIL_CHUNK_MS)).pipe(Effect.as(event)))),
-      Stream.fromIterable([LLMEvent.textEnd({ id: "txt_1" }), LLMEvent.stepFinish({ index: 0, reason: "tool-calls" })]),
+        Array.from({ length: TAIL_CHUNKS }, (_, i) =>
+          LLMEvent.textDelta({ id: "txt_1", text: `chunk ${i} ` }),
+        ),
+      ).pipe(
+        Stream.mapEffect((event) =>
+          Effect.sleep(Duration.millis(TAIL_CHUNK_MS)).pipe(Effect.as(event)),
+        ),
+      ),
+      Stream.fromIterable([
+        LLMEvent.textEnd({ id: "txt_1" }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+      ]),
     ),
   )
 
@@ -108,14 +124,17 @@ const harness = testEffect(
       ApplicationTools.node,
     ]),
     [
-      [LayerNodePlatform.llmClient, Layer.succeed(
-        LLMClient.Service,
-        LLMClient.Service.of({
-          prepare: () => Effect.die("unused"),
-          generate: () => Effect.die("unused"),
-          stream: withTail,
-        }),
-      )],
+      [
+        LayerNodePlatform.llmClient,
+        Layer.succeed(
+          LLMClient.Service,
+          LLMClient.Service.of({
+            prepare: () => Effect.die("unused"),
+            generate: () => Effect.die("unused"),
+            stream: withTail,
+          }),
+        ),
+      ],
       [PermissionV2.node, permission],
       [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
       [SessionRunnerModel.node, models],
@@ -140,7 +159,14 @@ const seed = (sessionID: SessionV2.ID) =>
       .pipe(Effect.orDie)
     yield* db
       .insert(SessionTable)
-      .values({ id: sessionID, project_id: Project.ID.global, slug: "t", directory: "/project", title: "t", version: "t" })
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        slug: "t",
+        directory: "/project",
+        title: "t",
+        version: "t",
+      })
       .onConflictDoNothing()
       .run()
       .pipe(Effect.orDie)
@@ -169,7 +195,8 @@ describe.skipIf(!process.env.OPENCODE_OVERLAP_BENCH)("step overlap cost", () => 
 
       const fused = SessionV2.ID.make("ses_bench_fused")
       yield* seed(fused)
-      // Whole step in one go: the tool forks the instant its call arrives, so it runs under the tail.
+      // Whole step in one go: the tool forks the instant its call arrives, so it runs under the
+      // tail.
       const fusedMs = yield* elapsed(runner.runStep({ sessionID: fused, ...step }))
 
       const split = SessionV2.ID.make("ses_bench_split")
@@ -179,8 +206,13 @@ describe.skipIf(!process.env.OPENCODE_OVERLAP_BENCH)("step overlap cost", () => 
         Effect.gen(function* () {
           const result = yield* runner.runModelCall({ sessionID: split, ...step })
           if (result.kind !== "called") return
-          for (const call of result.calls) yield* runner.runToolCall({ sessionID: split, call, retry: false })
-          yield* runner.sealStep({ sessionID: split, step: result.step, settlement: result.settlement })
+          for (const call of result.calls)
+            yield* runner.runToolCall({ sessionID: split, call, retry: false })
+          yield* runner.sealStep({
+            sessionID: split,
+            step: result.step,
+            settlement: result.settlement,
+          })
         }),
       )
 
