@@ -1,4 +1,5 @@
-// The model-only attempt (L2): runModelCall performs one provider attempt, records the tool calls it
+// The model-only attempt (L2): runModelCall performs one provider attempt, records the tool calls
+// it
 // asked for, and stops. The caller dispatches each call as its own unit of work and seals the step
 // afterwards, which is what puts the model-to-tools loop in a durable executor rather than inside a
 // single activity. These tests pin the three properties that split depends on:
@@ -56,9 +57,16 @@ const model = OpenAIChat.route
   .model({ id: "gpt-4o-mini" })
 const models = SessionRunnerModel.layerWith(() => Effect.succeed(model))
 const systemContext = AppNodeBuilder.build(SystemContextRegistry.node)
-const skillGuidance = Layer.mock(SkillGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
-const referenceGuidance = Layer.mock(ReferenceGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
-const config = Layer.succeed(Config.Service, Config.Service.of({ entries: () => Effect.succeed([]) }))
+const skillGuidance = Layer.mock(SkillGuidance.Service, {
+  load: () => Effect.succeed(SystemContext.empty),
+})
+const referenceGuidance = Layer.mock(ReferenceGuidance.Service, {
+  load: () => Effect.succeed(SystemContext.empty),
+})
+const config = Layer.succeed(
+  Config.Service,
+  Config.Service.of({ entries: () => Effect.succeed([]) }),
+)
 const permission = Layer.mock(PermissionV2.Service, {})
 
 const mockClient = (stream: LLMClientShape["stream"]) =>
@@ -104,7 +112,10 @@ const callsIdempotentTool: LLMClientShape["stream"] = () =>
 // the log for a seal to find. The whole-step path survives it because Step.Ended mints one on the
 // way past; a seal running in another process has no publisher to mint with.
 const silent: LLMClientShape["stream"] = () =>
-  Stream.fromIterable([LLMEvent.stepStart({ index: 0 }), LLMEvent.stepFinish({ index: 0, reason: "stop" })])
+  Stream.fromIterable([
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+  ])
 // An answer and no tool call: the step is over as soon as the stream is, but the seal still has to
 // happen, and there is a real assistant message for it to complete.
 const textOnly: LLMClientShape["stream"] = () =>
@@ -162,7 +173,14 @@ const seedSession = Effect.gen(function* () {
     .pipe(Effect.orDie)
   yield* db
     .insert(SessionTable)
-    .values({ id: sessionID, project_id: Project.ID.global, slug: "t", directory: "/project", title: "t", version: "t" })
+    .values({
+      id: sessionID,
+      project_id: Project.ID.global,
+      slug: "t",
+      directory: "/project",
+      title: "t",
+      version: "t",
+    })
     .onConflictDoNothing()
     .run()
     .pipe(Effect.orDie)
@@ -276,7 +294,8 @@ describe("SessionRunner model-only attempt", () => {
       if (result.kind !== "called") return
       expect(result.calls).toHaveLength(0)
       expect(result.settlement?.finish).toBe("stop")
-      // Sealing is uniform: even with nothing to dispatch, the step is closed by the seal, not here,
+      // Sealing is uniform: even with nothing to dispatch, the step is closed by the seal, not
+      // here,
       // so the answer is recorded but its message is still open.
       const message = assistant(yield* store.context(sessionID))
       expect(message?.type).toBe("assistant")
@@ -292,7 +311,13 @@ describe("SessionRunner model-only attempt", () => {
       const runner = yield* SessionRunner.Service
       const store = yield* SessionStore.Service
 
-      yield* runner.runStep({ sessionID, step: 2, promotion: undefined, first: false, force: false })
+      yield* runner.runStep({
+        sessionID,
+        step: 2,
+        promotion: undefined,
+        first: false,
+        force: false,
+      })
 
       // The contrast that makes the split meaningful: the whole-step path dispatches and seals.
       expect(ran.write).toBe(1)
@@ -357,42 +382,46 @@ describe("SessionRunner tool dispatch", () => {
     }),
   )
 
-  harness(callsTool).effect("reports a retried side-effecting call as unknown instead of repeating it", () =>
-    Effect.gen(function* () {
-      yield* seedSession
-      const ran = counters()
-      yield* registerProbes(ran)
-      const call = yield* deferOneCall
-      const runner = yield* SessionRunner.Service
-      const store = yield* SessionStore.Service
+  harness(callsTool).effect(
+    "reports a retried side-effecting call as unknown instead of repeating it",
+    () =>
+      Effect.gen(function* () {
+        yield* seedSession
+        const ran = counters()
+        yield* registerProbes(ran)
+        const call = yield* deferOneCall
+        const runner = yield* SessionRunner.Service
+        const store = yield* SessionStore.Service
 
-      // The first attempt died somewhere between dispatch and its result landing, so the log still
-      // shows the call in flight and nothing can say whether the write happened.
-      const result = yield* runner.runToolCall({ sessionID, call, retry: true })
+        // The first attempt died between dispatch and its result landing, so the log still
+        // shows the call in flight and nothing can say whether the write happened.
+        const result = yield* runner.runToolCall({ sessionID, call, retry: true })
 
-      expect(result.outcome).toBe("unknown")
-      expect(ran.write).toBe(0)
-      const part = toolPart(yield* store.context(sessionID), "call_probe")
-      expect(part?.type === "tool" ? part.state.status : undefined).toBe("error")
-    }),
+        expect(result.outcome).toBe("unknown")
+        expect(ran.write).toBe(0)
+        const part = toolPart(yield* store.context(sessionID), "call_probe")
+        expect(part?.type === "tool" ? part.state.status : undefined).toBe("error")
+      }),
   )
 
-  harness(callsIdempotentTool).effect("re-runs a retried call that declares itself repeatable", () =>
-    Effect.gen(function* () {
-      yield* seedSession
-      const ran = counters()
-      yield* registerProbes(ran)
-      const call = yield* deferOneCall
-      const runner = yield* SessionRunner.Service
-      const store = yield* SessionStore.Service
+  harness(callsIdempotentTool).effect(
+    "re-runs a retried call that declares itself repeatable",
+    () =>
+      Effect.gen(function* () {
+        yield* seedSession
+        const ran = counters()
+        yield* registerProbes(ran)
+        const call = yield* deferOneCall
+        const runner = yield* SessionRunner.Service
+        const store = yield* SessionStore.Service
 
-      const result = yield* runner.runToolCall({ sessionID, call, retry: true })
+        const result = yield* runner.runToolCall({ sessionID, call, retry: true })
 
-      expect(result.outcome).toBe("settled")
-      expect(ran.read).toBe(1)
-      const part = toolPart(yield* store.context(sessionID), "call_probe")
-      expect(part?.type === "tool" ? part.state.status : undefined).toBe("completed")
-    }),
+        expect(result.outcome).toBe("settled")
+        expect(ran.read).toBe(1)
+        const part = toolPart(yield* store.context(sessionID), "call_probe")
+        expect(part?.type === "tool" ? part.state.status : undefined).toBe("completed")
+      }),
   )
 })
 
@@ -641,7 +670,6 @@ describe("SessionRunner model-only attempt under compaction", () => {
       yield* seeder.publish(LLMEvent.textDelta({ id: "old", text: "Earlier answer. ".repeat(500) }))
       yield* seeder.publish(LLMEvent.textEnd({ id: "old" }))
       yield* seeder.publish(LLMEvent.stepFinish({ index: 0, reason: "stop" }))
-
 
       const runner = yield* SessionRunner.Service
       const result = yield* runner.runModelCall({

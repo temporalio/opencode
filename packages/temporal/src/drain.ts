@@ -1,5 +1,6 @@
 // The per-step drain body for the Temporal layer: it runs inside the runTurnStep activity. It wraps
-// one SessionRunner.runStep, claims the event log for the attempt, ensures the worktree, and encodes
+// one SessionRunner.runStep, claims the event log for the attempt, ensures the worktree, and
+// encodes
 // the error for the activity boundary. Local mode does not use this: it runs whole turns through
 // SessionRunner.run on the SessionRunCoordinator (execution/local.ts). Both modes go through the
 // same SessionRunner and the same durable event log.
