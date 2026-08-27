@@ -225,19 +225,19 @@ Verified live (dev server, `gpt-5-mini`, stepped mode on):
   Under the whole-step mode the entire step, model call included, sits in one activity for the whole
   of that wait.
 
-Not covered, stated plainly:
-
-- **Compaction.** The `deferTools` flag is threaded through both `ContinueAfterCompaction`
-  recursions (a first version dropped it, which would have silently run tools inline on a compacting
-  step). There is no test: forcing compaction needs a model route that declares `limits.context`,
-  and the route used live does not. A regression test was written, found to pass with the bug
-  deliberately reintroduced, and deleted rather than left as a false assurance.
 - **A tool activity rebuilds a worktree it has never seen.** Each of the three drains calls
   `worktrees.ensure`, so a tool call landing on a worker without the project tree materializes it
   from the snapshot packs. Checked by deleting the entire working directory between two turns of a
   live session: the next turn's tool activity rebuilt both files, the `read` completed, and the model
-  answered with the file's contents. Worker affinity would skip the materialization on warm paths and
-  is still not implemented; the packs are the baseline that works without it.
+  answered with the file's contents. Worker affinity (below) skips the
+  materialization on warm paths;
+  the packs are the baseline that works without it.
+- **A compaction restart keeps deferring.** The `deferTools` flag is threaded through both
+  `ContinueAfterCompaction` recursions; a first version dropped it, which would have silently run
+  tools inline on a compacting step.
+- **A provider error ends the turn.** The attempt's own continuation decision is carried to the
+  seal, because the log cannot tell a failed attempt from one that wants another step.
+- **A declined permission halts the turn** rather than reaching the model as one failed tool.
 
 Not covered, stated plainly:
 
@@ -364,10 +364,14 @@ later. Verified by `packages/core/test/session-runner-resume.test.ts`.
   `startToCloseTimeout` is a 12-hour backstop for a drain that hangs while its process stays alive.
   When an attempt is retried while the previous one is still alive (a network partition, or the
   backstop firing), the old attempt could briefly keep publishing until its heartbeat is rejected
-  and the AbortSignal interrupts it. That overlap is now fenced: each drain claims the event log
+  and the AbortSignal interrupts it. That overlap is fenced per attempt in whole-step
+  mode: the drain claims the event log
   with an attempt token (`event_sequence.owner_id` via `claim()`), and a live durable append dies
   if a newer attempt has since claimed the log (the check is in `event.ts`, gated by the
-  `EventOwner` context the drain provides). The owner is set activity-side from the run id and
+  `EventOwner` context the drain provides). In stepped mode a step's three activity kinds share one
+  token, so the fence separates steps but not writers inside a step; what keeps the projection right
+  there is the projector applying a tool result only while the part is still open, in the same
+  transaction as the append. The owner is set activity-side from the run id and
   attempt, so it stays out of the workflow's deterministic input; the local driver uses a
   per-instance token. The projector's status guards still make any duplicate settlement a no-op.
 
@@ -484,8 +488,8 @@ drain runs, a worker missing the session's directory rebuilds the worktree from 
 (`session/execution/worktree.ts`): uncommitted edits and untracked files included, checked out at
 the same absolute path it was captured at (a uniform fleet layout). Ignored files and dependencies
 are not captured, so a rebuilt tree may need an install step before `bash` behaves identically.
-Worker affinity or a shared volume skips the materialization latency on warm paths; the packs
-are the portable baseline that works with neither.
+Worker affinity (below) or a shared volume skips the materialization latency on warm paths; the
+packs are the portable baseline that works with neither.
 
 Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
 

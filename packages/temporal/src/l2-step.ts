@@ -62,6 +62,7 @@ export const makeSteppedTurn =
       step: model.step,
       settlement: model.settlement,
       assistantMessageID: model.assistantMessageID,
+      needsContinuation: model.needsContinuation,
       owner: model.owner,
     })
   }

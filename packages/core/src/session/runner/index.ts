@@ -55,6 +55,10 @@ export interface SealStepInput {
   readonly settlement?: StepSettlement
   /** The message the attempt opened. Absent only for a step that produced nothing to close. */
   readonly assistantMessageID?: string
+  /** Whether the turn should keep going, decided by the attempt. Only the attempt knows it hit a
+   * provider error, so a seal that re-derives this from the log would keep calling a provider that
+   * just failed. Absent on a re-drive, where the log is all there is. */
+  readonly needsContinuation?: boolean
 }
 
 /** One recorded tool call, to run on its own. */
@@ -100,6 +104,7 @@ export type ModelCallResult =
       readonly calls: ReadonlyArray<DeferredToolCall>
       readonly settlement?: StepSettlement
       readonly assistantMessageID?: string
+      readonly needsContinuation?: boolean
     }
 
 /** Runs one local continuation from already-recorded Session history. */

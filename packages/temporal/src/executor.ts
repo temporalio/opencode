@@ -170,7 +170,9 @@ const layer = Layer.effect(
         address: ADDRESS,
         taskQueue: TASK_QUEUE,
         workflow: WORKFLOW_TYPE,
-        ...(AFFINITY ? { worktreeAffinity: true } : {}),
+        ...(AFFINITY
+          ? { worktreeAffinity: true, pollQueue: POLL_QUEUE, worktree: SERVED_WORKTREE }
+          : {}),
       }),
     )
 
