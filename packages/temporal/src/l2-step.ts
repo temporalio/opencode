@@ -52,6 +52,10 @@ export interface SteppedTurnDeps {
    * ordinary activity failure, so without this it reads as one bad tool and the turn carries on
    * past the refusal. */
   readonly isHalt: (error: unknown) => boolean
+  /** Where a step says what became of the calls it dispatched. A dispatch that decided not to run
+   * a tool, or could not keep its result, is a step's most surprising outcome and the least
+   * visible: it reads as an ordinary success everywhere else. */
+  readonly log?: (message: string, attributes: Record<string, unknown>) => void
 }
 
 /**
@@ -60,7 +64,7 @@ export interface SteppedTurnDeps {
  * of a whole-step activity.
  */
 export const makeSteppedTurn =
-  ({ activities, isCancellation, isHalt }: SteppedTurnDeps) =>
+  ({ activities, isCancellation, isHalt, log }: SteppedTurnDeps) =>
   async (input: StepDrainInput): Promise<StepDrainResult> => {
     const model = await activities.runModelCall(input)
     // A crashed step finalized from the log, or the recovery gate finding no work: the step is over
@@ -79,6 +83,22 @@ export const makeSteppedTurn =
       if (outcome.status !== "rejected") continue
       if (isCancellation(outcome.reason) || isHalt(outcome.reason)) throw outcome.reason
     }
+
+    // A dispatch that settled its call needs no telling. The rest are what an operator is looking
+    // for when a turn did something unexpected: a tool reported as unknown ran or did not, and
+    // nothing else in this workflow's history says which call that was.
+    const unsettled = model.calls
+      .map((call, index) => {
+        const result = dispatched[index]
+        return {
+          call: call.id,
+          tool: call.name,
+          outcome: result?.status === "fulfilled" ? result.value.outcome : "errored",
+        }
+      })
+      .filter((entry) => entry.outcome !== "settled")
+    if (unsettled.length > 0)
+      log?.("step did not settle every call it dispatched", { step: model.step, calls: unsettled })
 
     return activities.sealStep({
       sessionID: input.sessionID,

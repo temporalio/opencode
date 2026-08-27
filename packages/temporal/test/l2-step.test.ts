@@ -15,7 +15,12 @@ import {
   TimeoutFailure,
 } from "@temporalio/workflow"
 import type { StepDrainInput, StepDrainResult } from "../src/activities"
-import type { ModelCallDrainResult, SealDrainInput, ToolCallDrainInput } from "../src/l2-drain"
+import type {
+  ModelCallDrainResult,
+  SealDrainInput,
+  ToolCallDrainInput,
+  ToolCallDrainResult,
+} from "../src/l2-drain"
 
 class FakeCancel extends Error {}
 class FakeHalt extends Error {}
@@ -39,7 +44,7 @@ const call = (id: string, name = "probe_write") => ({
 
 const fakes = (
   model: ModelCallDrainResult,
-  onTool: (input: ToolCallDrainInput) => Promise<{ outcome: "settled" }> = async () => ({
+  onTool: (input: ToolCallDrainInput) => Promise<ToolCallDrainResult> = async () => ({
     outcome: "settled",
   }),
 ) => {
@@ -96,6 +101,35 @@ describe("stepped turn", () => {
     // The finish reason lives only in the attempt's memory, so the seal has to be handed it.
     expect(seals[0]?.settlement?.finish).toBe("tool-calls")
     expect(result).toEqual(SEALED)
+  })
+
+  it("reports the calls it did not settle, and says nothing when they all settled", async () => {
+    const lines: Array<{ message: string; attributes: Record<string, unknown> }> = []
+    const log = (message: string, attributes: Record<string, unknown>) =>
+      lines.push({ message, attributes })
+    const model: ModelCallDrainResult = {
+      kind: "called",
+      step: 2,
+      calls: [call("call_a"), call("call_b", "probe_read")],
+      owner: "own",
+    }
+    const settling = fakes(model)
+    await makeSteppedTurn({ ...settling, isCancellation, isHalt, log })(INPUT)
+    // Nothing surprising happened, so nothing is said about it.
+    expect(lines).toHaveLength(0)
+
+    const skipping = fakes(model, async (input) => ({
+      outcome: input.call.id === "call_a" ? "unknown" : "settled",
+    }))
+    await makeSteppedTurn({ ...skipping, isCancellation, isHalt, log })(INPUT)
+
+    // Which call was skipped, and why, is the dispatch's own knowledge: the log records what the
+    // model was told, and the workflow's history records an activity that succeeded.
+    expect(lines).toHaveLength(1)
+    expect(lines[0]?.attributes).toEqual({
+      step: 2,
+      calls: [{ call: "call_a", tool: "probe_write", outcome: "unknown" }],
+    })
   })
 
   it("seals even when a tool call fails outright", async () => {

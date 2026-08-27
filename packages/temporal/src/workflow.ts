@@ -18,6 +18,7 @@ import {
   CancellationScope,
   isCancellation,
   allHandlersFinished,
+  log,
 } from "@temporalio/workflow"
 import type { StepActivities, SteppedTurnActivities } from "./activities"
 import { isHaltFailure, makeSteppedTurn } from "./l2-step"
@@ -118,6 +119,8 @@ const steppedRuntime: SupervisorRuntime = {
     activities: { runModelCall, runToolCall, sealStep },
     isCancellation,
     isHalt: isHaltFailure,
+    // The SDK's logger, so a line carries its workflow and run id and is suppressed on replay.
+    log: (message, attributes) => log.info(message, attributes),
   }),
 }
 

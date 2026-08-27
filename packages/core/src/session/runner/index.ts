@@ -67,7 +67,10 @@ export interface ToolCallInput {
   readonly call: DeferredToolCall
 }
 
-/** How a dispatched call ended.
+/** How a dispatched call ended. It is the dispatch's own account of itself: the log says what the
+ * model was told, not whether a tool was skipped on purpose or its result was lost. A durable
+ * executor keeps it with the rest of the call's record, and reports the ones that are not `settled`
+ * where an operator reads about the turn.
  * - `settled`: the tool ran and its result is durable.
  * - `already-settled`: the log already had a result, so nothing ran. The at-least-once case.
  * - `failed`: the tool ran and could not be settled. The reason reaches the model, and the call is
