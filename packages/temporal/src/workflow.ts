@@ -18,12 +18,10 @@ import {
   CancellationScope,
   isCancellation,
   allHandlersFinished,
-  ActivityFailure,
-  ApplicationFailure,
 } from "@temporalio/workflow"
 import type { StepActivities, SteppedTurnActivities } from "./activities"
-import { makeSteppedTurn } from "./l2-step"
-import { HALTED_FAILURE_TYPE, SIGNALS, RESUME_UPDATE } from "./protocol"
+import { isHaltFailure, makeSteppedTurn } from "./l2-step"
+import { SIGNALS, RESUME_UPDATE } from "./protocol"
 import { makeSupervisor, type SupervisorRuntime } from "./supervisor"
 
 const activityOptions = {
@@ -116,11 +114,7 @@ const steppedRuntime: SupervisorRuntime = {
   runTurnStep: makeSteppedTurn({
     activities: { runModelCall, runToolCall, sealStep },
     isCancellation,
-    // A halt crosses the activity boundary as an ApplicationFailure, so isCancellation is false for
-    // it and the dispatcher would treat the user's refusal as one failed tool.
-    isHalt: (error) =>
-      error instanceof ActivityFailure &&
-      (error.cause as ApplicationFailure | undefined)?.type === HALTED_FAILURE_TYPE,
+    isHalt: isHaltFailure,
   }),
 }
 
