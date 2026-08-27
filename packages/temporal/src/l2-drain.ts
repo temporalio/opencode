@@ -45,9 +45,6 @@ export interface ToolCallDrainInput {
   readonly sessionID: string
   readonly call: DeferredToolCall
   readonly owner: string
-  /** Set by the executor from the activity attempt, not by the workflow: only the dispatcher knows
-   * whether this call already had a run whose result never landed. */
-  readonly retry?: boolean
 }
 
 export interface ToolCallDrainResult {
@@ -151,11 +148,7 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
       input.sessionID,
       signal,
       inSession(input.sessionID, input.owner, false, (runner, session) =>
-        runner.runToolCall({
-          sessionID: session.id,
-          call: input.call,
-          retry: input.retry === true,
-        }),
+        runner.runToolCall({ sessionID: session.id, call: input.call }),
       ).pipe(Effect.map((result) => result ?? { outcome: "already-settled" as const })),
     )
 

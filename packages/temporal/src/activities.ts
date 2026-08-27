@@ -101,13 +101,7 @@ export function makeSteppedTurnActivities(drains: {
       )
     },
     async runToolCall(input) {
-      // Whether the side effect may already have happened is the activity's own knowledge, not the
-      // workflow's: a second attempt of THIS call is a re-run of a tool whose result never landed.
-      // The workflow could not compute this without reading non-deterministic state.
-      const retry = Context.current().info.attempt > 1
-      return beating(() =>
-        drains.toolCallDrain({ ...input, retry }, Context.current().cancellationSignal),
-      )
+      return beating(() => drains.toolCallDrain(input, Context.current().cancellationSignal))
     },
     async sealStep(input) {
       return beating(() => drains.sealDrain(input, Context.current().cancellationSignal))

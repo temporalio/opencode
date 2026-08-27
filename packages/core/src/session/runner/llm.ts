@@ -44,7 +44,7 @@ import {
   Service,
 } from "./index"
 import { SessionRunnerModel } from "./model"
-import { createLLMEventPublisher, emitToolResult } from "./publish-llm-event"
+import { createLLMEventPublisher, emitToolResult, record } from "./publish-llm-event"
 import { toLLMMessages } from "./to-llm-message"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { DEFAULT_MAX_STEPS, REPEAT_LIMIT, REPEATED_CALLS_PROMPT, trailingIdenticalToolSteps } from "./loop-guard"
@@ -281,6 +281,7 @@ const layer = Layer.effect(
           ...(session.model?.variant === undefined ? {} : { variant: session.model.variant }),
         },
         snapshot: startSnapshot,
+        deferCalls: deferTools,
       })
       const withPublication = Semaphore.makeUnsafe(1).withPermit
       const publish = (event: LLMEvent, outputPaths: ReadonlyArray<string> = []) =>
@@ -769,7 +770,7 @@ const layer = Layer.effect(
                 item.type === "tool" && item.id === input.call.id,
             )
           : undefined
-      // The call has to be in the log already: the attempt that produced it published Tool.Called
+      // The call has to be in the log already: the attempt that produced it recorded its input
       // before handing it over. Missing means the log moved under us (a fence), and running a tool
       // whose call is not recorded would leave an orphan result.
       if (!part || part.type !== "tool")
@@ -781,10 +782,13 @@ const layer = Layer.effect(
         return { outcome: "already-settled" } as ToolCallResult
       const agent = yield* agents.select(session.agent)
       const materialization = yield* tools.materialize(agent.info?.permissions)
-      // A retry cannot know whether the side effect happened, so only a tool that declares itself
-      // repeatable is run again. The rest are reported unknown and the model decides, because
-      // re-running the `git push` that may already have landed is the worse failure.
-      if (input.retry && !materialization.idempotent(input.call.name)) {
+      // `running` means a dispatch already published Tool.Called and was about to run the tool, so
+      // the side effect may have happened and nothing that reads the log afterwards can tell. Only
+      // a tool that declares itself repeatable runs again. The rest are reported unknown and the
+      // model decides, because re-running the `git push` that may already have landed is the worse
+      // failure. The attempt number would say the same thing far less precisely: it counts every
+      // way a dispatch can die, including the ones that never reached the tool.
+      if (part.state.status === "running" && !materialization.idempotent(input.call.name)) {
         yield* events.publish(SessionEvent.Tool.Failed, {
           sessionID: input.sessionID,
           timestamp: yield* DateTime.now,
@@ -795,6 +799,19 @@ const layer = Layer.effect(
         })
         return { outcome: "unknown" } as ToolCallResult
       }
+      // The durable record that this call is being run, published before the tool can do anything.
+      // It is also the last point a fenced dispatch dies at: under a superseded owner this publish
+      // fails and the tool never runs, instead of running and losing its result.
+      yield* events.publish(SessionEvent.Tool.Called, {
+        sessionID: input.sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID,
+        callID: input.call.id,
+        tool: input.call.name,
+        input: record(input.call.input),
+        // Deferred calls are never provider-executed: those are filtered out before the hand-off.
+        provider: { executed: false },
+      })
       const settlement = yield* materialization
         .settle({
           sessionID: input.sessionID,

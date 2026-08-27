@@ -11,6 +11,10 @@ type Input = {
   readonly agent: string
   readonly model: ModelV2.Ref
   readonly snapshot?: string
+  /** Record the calls the provider asked for, but leave Tool.Called to whoever dispatches them.
+   * The log then says which calls were only asked for and which one a process had started, which
+   * is the difference between re-running a side effect and reporting it as unknown. */
+  readonly deferCalls?: boolean
 }
 
 const safe = (value: number | undefined) => Math.max(0, Number.isFinite(value) ? (value ?? 0) : 0)
@@ -34,7 +38,9 @@ export interface StepSettlement {
   readonly tokens: ReturnType<typeof tokens>
 }
 
-const record = (value: unknown): Record<string, unknown> =>
+/** The shape a tool call's input is recorded in. Exported so a dispatcher publishing Tool.Called
+ * for a deferred call records it exactly as the streaming path would. */
+export const record = (value: unknown): Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : { value }
 
 const message = (value: unknown) => {
@@ -371,6 +377,9 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
         tool.called = true
         tool.providerExecuted = event.providerExecuted === true
         tool.providerMetadata = event.providerMetadata
+        // A provider-executed call has already run, so it is never deferred and is recorded here
+        // whatever the caller asked for.
+        if (input.deferCalls && !tool.providerExecuted) return
         yield* events.publish(SessionEvent.Tool.Called, {
           sessionID: input.sessionID,
           timestamp: yield* timestamp,

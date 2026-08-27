@@ -36,9 +36,9 @@ export interface StepResult {
   readonly promotion: SessionInput.Delivery | undefined
 }
 
-/** A tool call the provider asked for, recorded as Tool.Called but not run, handed to the caller to
- * dispatch. Every id comes from the provider or the publisher and is carried, never regenerated: a
- * second run of the same step would mint different ones and the results would not match the log. */
+/** A tool call the provider asked for, recorded but not run, handed to the caller to dispatch.
+ * Every id comes from the provider or the publisher and is carried, never regenerated: a second run
+ * of the same step would mint different ones and the results would not match the log. */
 export interface DeferredToolCall {
   readonly id: string
   readonly name: string
@@ -65,9 +65,6 @@ export interface SealStepInput {
 export interface ToolCallInput {
   readonly sessionID: SessionSchema.ID
   readonly call: DeferredToolCall
-  /** True when this call is being dispatched again after a crash or a timeout, so its side effect
-   * may already have happened. The dispatcher knows this; the log cannot tell us. */
-  readonly retry: boolean
 }
 
 /** How a dispatched call ended.
@@ -75,8 +72,8 @@ export interface ToolCallInput {
  * - `already-settled`: the log already had a result, so nothing ran. The at-least-once case.
  * - `failed`: the tool ran and could not be settled. The reason reaches the model, and the call is
  *   closed, because a repeat would not fix it.
- * - `unknown`: a retry of a tool that does not declare itself repeatable. Reported to the model as
- *   an unknown outcome rather than run a second time. */
+ * - `unknown`: a second dispatch of a tool that does not declare itself repeatable. Reported to the
+ *   model as an unknown outcome rather than run again. */
 export type ToolCallOutcome = "settled" | "already-settled" | "failed" | "unknown"
 
 export interface ToolCallResult {
