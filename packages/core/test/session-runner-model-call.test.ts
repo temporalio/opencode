@@ -495,6 +495,41 @@ describe("SessionRunner tool dispatch", () => {
       }),
   )
 
+  harness(callsCrashingTool).effect("closes a started call that a stop cut short", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const call = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+      const recorded = Effect.map(store.context(sessionID), (context) => {
+        const part = toolPart(context, "call_probe")
+        return part?.type === "tool" ? part.state : undefined
+      })
+
+      // Nothing has started this call, so it is left for the next turn's entry check: closing it
+      // here would report a tool the model asked for as having been cut short.
+      yield* runner.failToolCall({ sessionID, call })
+      expect((yield* recorded)?.status).toBe("pending")
+
+      // A dispatch died with the tool in flight, which is what the log shows after a stop lands
+      // mid-tool: the call recorded as running, with no result.
+      yield* runner.runToolCall({ sessionID, call }).pipe(Effect.exit)
+      expect((yield* recorded)?.status).toBe("running")
+
+      yield* runner.failToolCall({ sessionID, call })
+      const closed = yield* recorded
+      expect(closed?.status).toBe("error")
+      const reason = closed?.status === "error" ? closed.error.message : ""
+      expect(reason).toBe("Tool execution interrupted")
+
+      // A call that is already terminal keeps what it has, whatever lands afterwards.
+      yield* runner.failToolCall({ sessionID, call })
+      expect(yield* recorded).toEqual(closed)
+    }),
+  )
+
   harness(callsCrashingIdempotentTool).effect(
     "re-runs a started call that declares itself repeatable",
     () =>

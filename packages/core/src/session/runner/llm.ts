@@ -754,23 +754,25 @@ const layer = Layer.effect(
     })
 
 
+    // A point read, not the whole projected history. The call carries the message that owns it, so
+    // decoding every message to find one part would make a step cost O(session) per tool instead
+    // of O(1). Message ids are looked up on their own, so the session has to be checked too: a call
+    // from another session must not resolve here.
+    const recordedCall = Effect.fnUntraced(function* (input: ToolCallInput) {
+      const owner = yield* store.message(SessionMessage.ID.make(input.call.assistantMessageID))
+      if (owner?.sessionID !== input.sessionID || owner.message.type !== "assistant")
+        return undefined
+      // findLast to agree with the projector, which writes tool updates the same way.
+      return owner.message.content.findLast(
+        (item): item is SessionMessage.AssistantTool =>
+          item.type === "tool" && item.id === input.call.id,
+      )
+    })
+
     const runToolCall = Effect.fn("SessionRunner.runToolCall")(function* (input: ToolCallInput) {
       const session = yield* getSession(input.sessionID)
       const assistantMessageID = SessionMessage.ID.make(input.call.assistantMessageID)
-      // A point read, not the whole projected history. The call carries the message
-      // that owns it, so decoding every message to find one part would make a step
-      // cost O(session) per tool instead of O(1).
-      // Message ids are looked up on their own, so the session has to be checked too: a call from
-      // another session must not resolve here.
-      const owner = yield* store.message(assistantMessageID)
-      const part =
-        owner?.sessionID === input.sessionID && owner.message.type === "assistant"
-          ? // findLast to agree with the projector, which writes tool updates the same way.
-            owner.message.content.findLast(
-              (item): item is SessionMessage.AssistantTool =>
-                item.type === "tool" && item.id === input.call.id,
-            )
-          : undefined
+      const part = yield* recordedCall(input)
       // The call has to be in the log already: the attempt that produced it recorded its input
       // before handing it over. Missing means the log moved under us (a fence), and running a tool
       // whose call is not recorded would leave an orphan result.
@@ -871,6 +873,21 @@ const layer = Layer.effect(
       return { outcome: "settled" } as ToolCallResult
     })
 
+    const failToolCall = Effect.fn("SessionRunner.failToolCall")(function* (input: ToolCallInput) {
+      const part = yield* recordedCall(input)
+      // Only a call a dispatch had started is closed. One that never reached its tool is left
+      // pending for the next turn's entry check, and a settled one keeps the result it earned.
+      if (part?.state.status !== "running") return
+      yield* events.publish(SessionEvent.Tool.Failed, {
+        sessionID: input.sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID: SessionMessage.ID.make(input.call.assistantMessageID),
+        callID: input.call.id,
+        error: { type: "unknown", message: "Tool execution interrupted" },
+        provider: { executed: false },
+      })
+    })
+
     const runStep = Effect.fn("SessionRunner.runStep")(function* (input: StepInput) {
       const prologue = yield* stepPrologue(input)
       if (prologue.kind === "settled") return prologue.result
@@ -898,6 +915,7 @@ const layer = Layer.effect(
       runStep,
       runModelCall,
       runToolCall,
+      failToolCall,
       sealStep,
     })
   }),
