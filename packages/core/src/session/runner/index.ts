@@ -124,6 +124,10 @@ export interface Interface {
   /** Run one recorded tool call and publish its result. Safe to call twice for the same call: the
    * second sees the settled result and does nothing. */
   readonly runToolCall: (input: ToolCallInput) => Effect.Effect<ToolCallResult, RunError>
+  /** Close a call a stop cut short, so it does not sit in the log as running until the next turn.
+   * A whole step closes the tools it opened on its way out; a dispatch that is its own unit of work
+   * has to be told. A call that never started, and one that already settled, are left alone. */
+  readonly failToolCall: (input: ToolCallInput) => Effect.Effect<void, RunError>
   /** Close a step once its calls have been dispatched: snapshot, file diff, Step.Ended, and the
    * loop decision. Safe to call twice: the second sees the step already closed and returns the same
    * answer without publishing again. */

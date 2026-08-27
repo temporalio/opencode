@@ -143,12 +143,27 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
   const toolCallDrain = async (
     input: ToolCallDrainInput,
     signal: AbortSignal,
+    /** Whether a cancellation means the turn is over rather than this attempt being handed on.
+     * Only the first closes the call: a worker shutting down leaves it for the next attempt, which
+     * has to be free to decide whether the tool may run again. */
+    turnEnded: () => boolean = () => false,
   ): Promise<ToolCallDrainResult> =>
     runAtBoundary(
       input.sessionID,
       signal,
       inSession(input.sessionID, input.owner, false, (runner, session) =>
-        runner.runToolCall({ sessionID: session.id, call: input.call }),
+        runner.runToolCall({ sessionID: session.id, call: input.call }).pipe(
+          // A stop landing mid-tool leaves the call recorded as running, where a whole step closes
+          // the tools it opened before it returns. Nothing else closes it until the next turn's
+          // entry check, so a transcript would show the call still going long after the stop.
+          Effect.onInterrupt(() =>
+            turnEnded()
+              ? runner
+                  .failToolCall({ sessionID: session.id, call: input.call })
+                  .pipe(Effect.ignore)
+              : Effect.void,
+          ),
+        ),
       ).pipe(Effect.map((result) => result ?? { outcome: "already-settled" as const })),
     )
 

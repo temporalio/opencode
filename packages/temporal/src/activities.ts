@@ -3,7 +3,13 @@
 // crash is detected quickly, and forwards Temporal cancellation as an AbortSignal so an interrupt
 // turns into Effect fiber interruption inside the runner.
 
-import { heartbeat, Context } from "@temporalio/activity"
+import { heartbeat, CancelledFailure, Context } from "@temporalio/activity"
+
+// The SDK's cancel reasons that mean nothing is coming back for this call: the workflow asked to
+// stop, or it is gone. The rest (a worker shutting down, a pause, a heartbeat timeout, a reset)
+// hand the same call to another attempt. They reach an activity as the reason on the abort, which
+// every SDK version sets, and as `cancellationDetails`, which only a server that sends them does.
+const ENDS_THE_TURN = ["CANCELLED", "NOT_FOUND"]
 
 // The event-log owner token for one activity execution: run id + activity id + attempt. A Temporal
 // retry of the SAME step gets a fresh attempt, so once the retry claims the log the previous
@@ -88,7 +94,11 @@ export function makeSteppedTurnActivities(drains: {
     input: ModelCallDrainInput & { readonly owner: string },
     signal: AbortSignal,
   ) => Promise<ModelCallDrainResult>
-  toolCallDrain: (input: ToolCallDrainInput, signal: AbortSignal) => Promise<ToolCallDrainResult>
+  toolCallDrain: (
+    input: ToolCallDrainInput,
+    signal: AbortSignal,
+    turnEnded: () => boolean,
+  ) => Promise<ToolCallDrainResult>
   sealDrain: (input: SealDrainInput, signal: AbortSignal) => Promise<StepDrainResult>
 }): SteppedTurnActivities {
   return {
@@ -101,7 +111,18 @@ export function makeSteppedTurnActivities(drains: {
       )
     },
     async runToolCall(input) {
-      return beating(() => drains.toolCallDrain(input, Context.current().cancellationSignal))
+      const context = Context.current()
+      // An attempt that is being handed on must leave the call as it found it, or its successor
+      // reads a closed call and never runs the tool. A superseded attempt learns of it the same way
+      // a stopped one does; closing a call its successor is re-running costs the model that result,
+      // which is the smaller loss.
+      const turnEnded = () => {
+        const details = context.cancellationDetails
+        if (details) return details.cancelRequested || details.notFound
+        const reason: unknown = context.cancellationSignal.reason
+        return reason instanceof CancelledFailure && ENDS_THE_TURN.includes(reason.message ?? "")
+      }
+      return beating(() => drains.toolCallDrain(input, context.cancellationSignal, turnEnded))
     },
     async sealStep(input) {
       return beating(() => drains.sealDrain(input, Context.current().cancellationSignal))

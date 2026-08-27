@@ -113,6 +113,22 @@ const probeTool = (ran: { count: number }) =>
       }),
   })
 
+// A tool that never finishes, so a turn can be interrupted with one in flight.
+const hangingTool = () =>
+  Tool.make({
+    description: "contract probe that never finishes",
+    input: Schema.Struct({}),
+    output: Schema.String,
+    execute: () => Effect.never,
+  })
+
+const toolParts = (messages: ReadonlyArray<SessionMessage.Message>) =>
+  messages.flatMap((message) =>
+    message.type === "assistant"
+      ? message.content.filter((part): part is SessionMessage.AssistantTool => part.type === "tool")
+      : [],
+  )
+
 // The executor under test, built as its own graph over the shared database file (the same way the
 // serve process builds it), with the model/LLM mocked. Any SessionExecution node with the standard
 // dependency set (the local coordinator, the Temporal driver) plugs in here.
@@ -346,6 +362,43 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
                 part.type === "tool" && part.id === "call_contract",
             )
             expect(call?.state.status).toBe("completed")
+          }),
+        ),
+        60000,
+      )
+    }
+
+    {
+      const { stream } = toolCallingModel()
+      const sessionID = SessionV2.ID.make(`ses_${slug}_interrupt_tool`)
+      it.live("closes a tool call the interrupt cut short", () =>
+        withIdleOverride(
+          Effect.gen(function* () {
+            yield* seedSession(sessionID)
+            yield* seedPrompt(sessionID)
+            const graph = yield* Layer.build(makeExec(stream))
+            yield* Context.get(graph, ApplicationTools.Service).register({
+              contract_probe: hangingTool(),
+            })
+            const exec = Context.get(graph, SessionExecution.Service)
+            const store = yield* SessionStore.Service
+            yield* exec.wake(sessionID)
+            yield* until(store.context(sessionID), (context) =>
+              toolParts(context).some((part) => part.state.status === "running"),
+            )
+
+            yield* exec.interrupt(sessionID)
+
+            // A call left running is not a cosmetic loose end: the transcript shows a tool still
+            // going, and the next turn has to reconstruct what happened to it. A whole step closes
+            // the tools it opened on its way out, and a step whose calls are their own units of
+            // work has to end up in the same place.
+            yield* until(store.context(sessionID), (context) =>
+              toolParts(context).every((part) => part.state.status !== "running"),
+            )
+            const closed = toolParts(yield* store.context(sessionID))
+            expect(closed.map((part) => part.state.status)).toEqual(["error"])
+            yield* until(exec.active, (active) => !active.has(sessionID))
           }),
         ),
         60000,
