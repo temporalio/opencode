@@ -7,6 +7,7 @@ import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
 import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
+import { Flag } from "./flag/flag"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
@@ -179,14 +180,24 @@ export interface LayerOptions {
    * fires for commits made in THIS process, so without a tick a subscriber cannot see events
    * another process appended: a standalone worker's whole turn is invisible to a tail on the
    * HTTP server.
-   * Set to 0 to disable and rely on the wake alone. */
+   * Zero (the default) relies on the wake alone, which is the whole story for a deployment that
+   * runs in one process. */
   readonly livePollInterval?: Duration.Input
 }
 
 /** Chosen to be well under what a person notices in a transcript while staying one cheap indexed
  * read per subscribed session. In-process commits still wake instantly; this only catches what the
- * wake cannot see. */
+ * wake cannot see, so it is worth its cost only where another process writes: see `pollingNode`. */
 const DEFAULT_LIVE_POLL = Duration.seconds(1)
+
+// An operator's override, in milliseconds, for either node. Read at layer build rather than at
+// import, so a test or a CLI that sets it late still gets it.
+const configuredPoll = (fallback: Duration.Input): Duration.Input => {
+  const raw = Flag.OPENCODE_EVENT_POLL_MS
+  if (raw === undefined) return fallback
+  const millis = Number(raw)
+  return Number.isFinite(millis) && millis >= 0 ? millis : fallback
+}
 
 export const layerWith = (options?: LayerOptions) =>
   Layer.effect(
@@ -635,7 +646,7 @@ export const layerWith = (options?: LayerOptions) =>
             // Wake on either an in-process commit or the tick. A tick that finds nothing new reads
             // zero rows and emits nothing, so an idle subscriber costs one indexed query per
             // period.
-            const pollInterval = options?.livePollInterval ?? DEFAULT_LIVE_POLL
+            const pollInterval = configuredPoll(options?.livePollInterval ?? Duration.zero)
             const woken = Stream.fromSubscription(wakes)
             // haltStrategy "left" keeps the wake stream as what ends the tail. The tick never ends,
             // so the default ("both") would leave a subscriber hanging past the layer's own
@@ -684,3 +695,13 @@ export const layerWith = (options?: LayerOptions) =>
 
 const layer = layerWith()
 export const node = makeGlobalNode({ service: Service, layer: layer, deps: [Database.node] })
+
+// For a deployment where the process serving subscribers is not the only one appending: a serve
+// process driving sessions on standalone workers. The wake is published in-process, so without the
+// tick a worker's whole turn is invisible to a tail on the server. Composition roots that know they
+// are in that shape swap this in for `node`; everything else keeps the wake alone.
+export const pollingNode = makeGlobalNode({
+  service: Service,
+  layer: layerWith({ livePollInterval: DEFAULT_LIVE_POLL }),
+  deps: [Database.node],
+})
