@@ -24,6 +24,8 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
 import { SessionRunnerModel, ModelNotSelectedError } from "@opencode-ai/core/session/runner/model"
+import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
+import { Tool } from "@opencode-ai/core/tool/tool"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
@@ -39,7 +41,7 @@ import { Auth } from "@opencode-ai/llm/route"
 import { describe, expect } from "bun:test"
 import { realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { Cause, Context, DateTime, Effect, Exit, Layer, Stream } from "effect"
+import { Cause, Context, DateTime, Effect, Exit, Layer, Schema, Stream } from "effect"
 import { testEffect } from "../../testing/effect"
 
 // The per-location service build resolves the session directory on disk, so it must exist.
@@ -77,13 +79,50 @@ const countingModel = () => {
   return { requests, stream }
 }
 
+// Asks for one tool on the first request and answers on the second, which is the smallest turn that
+// makes a driver dispatch a tool and come back to the model with its result.
+const toolCallingModel = () => {
+  const requests: number[] = []
+  const stream: LLMClientShape["stream"] = () => {
+    requests.push(1)
+    if (requests.length > 1)
+      return Stream.fromIterable([
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+      ])
+    return Stream.fromIterable([
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.toolCall({ id: "call_contract", name: "contract_probe", input: {} }),
+      LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+    ])
+  }
+  return { requests, stream }
+}
+
+// Counts its own executions, so "ran exactly once" is checked against the tool rather than only
+// against the projection.
+const probeTool = (ran: { count: number }) =>
+  Tool.make({
+    description: "contract probe",
+    input: Schema.Struct({}),
+    output: Schema.String,
+    execute: () =>
+      Effect.sync(() => {
+        ran.count += 1
+        return "probed"
+      }),
+  })
+
 // The executor under test, built as its own graph over the shared database file (the same way the
 // serve process builds it), with the model/LLM mocked. Any SessionExecution node with the standard
 // dependency set (the local coordinator, the Temporal driver) plugs in here.
 export const makeExecutionFor =
   (node: typeof SessionExecutionLocal.node) =>
   (stream: LLMClientShape["stream"], models = okModels) =>
-    AppNodeBuilder.build(node, [
+    // The tool registry is named in the group so a scenario can register a probe into the same
+    // graph the driver runs on. One graph, one instance: what the test registers is what the
+    // dispatch finds.
+    AppNodeBuilder.build(LayerNode.group([node, ApplicationTools.node]), [
       [LayerNodePlatform.llmClient, mockClient(stream)],
       [PermissionV2.node, permission],
       [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
@@ -268,6 +307,45 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
             // The Temporal supervisor keeps serving after an interrupt (a racing wake/resume must
             // not be lost); with nothing else queued it leaves the active set via idle retirement.
             yield* until(exec.active, (active) => !active.has(sessionID))
+          }),
+        ),
+        60000,
+      )
+    }
+
+    {
+      const { requests, stream } = toolCallingModel()
+      const ran = { count: 0 }
+      const sessionID = SessionV2.ID.make(`ses_${slug}_tool`)
+      it.live("a tool call runs once and the turn goes back to the model with its result", () =>
+        withIdleOverride(
+          Effect.gen(function* () {
+            yield* seedSession(sessionID)
+            yield* seedPrompt(sessionID)
+            const graph = yield* Layer.build(makeExec(stream))
+            yield* Context.get(graph, ApplicationTools.Service).register({
+              contract_probe: probeTool(ran),
+            })
+            const exec = Context.get(graph, SessionExecution.Service)
+            yield* exec.wake(sessionID)
+            // Waiting on the turn, not on the step: the first step's assistant is completed the
+            // moment the step is sealed, while the follow-up provider call is still to come.
+            yield* until(exec.active, (active) => !active.has(sessionID))
+            // Where the drivers could drift: a step's model call, its tool and its close are one
+            // activity in one mode and three in the other, so the tool has to be dispatched once,
+            // settled in the log, and answered by a second provider turn either way.
+            expect(ran.count).toBe(1)
+            expect(requests).toHaveLength(2)
+            const store = yield* SessionStore.Service
+            const context = yield* store.context(sessionID)
+            const parts = context.flatMap((message) =>
+              message.type === "assistant" ? message.content : [],
+            )
+            const call = parts.findLast(
+              (part): part is SessionMessage.AssistantTool =>
+                part.type === "tool" && part.id === "call_contract",
+            )
+            expect(call?.state.status).toBe("completed")
           }),
         ),
         60000,
