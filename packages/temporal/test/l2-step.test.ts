@@ -3,7 +3,10 @@
 // pinned here is the orchestration: the owner token reaches every writer, a settled step dispatches
 // nothing, a failed tool still lets the step close, and an interrupt is not swallowed.
 import { describe, it, expect } from "bun:test"
-import { makeSteppedTurn, type SteppedActivities } from "../src/l2-step"
+import { isHaltFailure, makeSteppedTurn, type SteppedActivities } from "../src/l2-step"
+import { runAtBoundary } from "../src/boundary"
+import { Effect } from "effect"
+import { ActivityFailure, ApplicationFailure, CancelledFailure, TimeoutFailure } from "@temporalio/workflow"
 import type { StepDrainInput, StepDrainResult } from "../src/activities"
 import type { ModelCallDrainResult, SealDrainInput, ToolCallDrainInput } from "../src/l2-drain"
 
@@ -120,5 +123,36 @@ describe("stepped turn", () => {
     // user's refusal.
     await expect(run).rejects.toBeInstanceOf(FakeHalt)
     expect(seals).toHaveLength(0)
+  })
+})
+
+// The bug this predicate exists for was a mismatch between what `boundary.ts` throws and what the
+// dispatcher recognises. Injecting a fake predicate cannot catch that, so match against the real
+// failure shapes. The negative cases are the point: a predicate that answered true for everything
+// would pass the positive one alone.
+describe("halt predicate", () => {
+  const wrap = (cause?: Error) =>
+    new ActivityFailure("activity failed", "runToolCall", "1", 1 as never, undefined, cause)
+
+  it("recognises what the activity boundary throws for a user halt", async () => {
+    // Built by running the boundary rather than by hand, so the two sides cannot drift: an interrupt
+    // with no abort is how a decline leaves the runner, and whatever that produces is what a
+    // dispatcher has to recognise.
+    const thrown = await runAtBoundary("ses_1", new AbortController().signal, Effect.interrupt).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(thrown).toBeInstanceOf(ApplicationFailure)
+    expect(isHaltFailure(wrap(thrown as Error))).toBe(true)
+  })
+
+  it("says no to everything else that can come back from an activity", () => {
+    expect(isHaltFailure(wrap(new CancelledFailure("cancelled")))).toBe(false)
+    expect(isHaltFailure(wrap(new TimeoutFailure("timed out", undefined, 1 as never)))).toBe(false)
+    expect(isHaltFailure(wrap(ApplicationFailure.create({ type: "SessionRunError" })))).toBe(false)
+    expect(isHaltFailure(wrap())).toBe(false)
+    // Unwrapped, so not what a dispatcher ever sees.
+    expect(isHaltFailure(ApplicationFailure.create({ type: "SessionRunDeclined" }))).toBe(false)
+    expect(isHaltFailure(new Error("plain"))).toBe(false)
   })
 })

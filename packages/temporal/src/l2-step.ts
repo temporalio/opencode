@@ -10,6 +10,8 @@
 // because a workflow cannot consume a stream. The tools of one step still run concurrently with each
 // other; what is lost is the overlap between the model and its own tools.
 
+import { ActivityFailure, type ApplicationFailure } from "@temporalio/workflow"
+import { HALTED_FAILURE_TYPE } from "./protocol"
 import type { StepDrainInput, StepDrainResult } from "./drain"
 import type {
   ModelCallDrainInput,
@@ -18,6 +20,18 @@ import type {
   ToolCallDrainInput,
   ToolCallDrainResult,
 } from "./l2-drain"
+
+/**
+ * A halt the user asked for, as it looks once it has crossed an activity boundary. The runner raises
+ * it as an interrupt, `boundary.ts` throws it as an `ApplicationFailure`, and the SDK wraps that in
+ * one `ActivityFailure`. It is not a cancellation, so `isCancellation` says no, and a dispatcher
+ * that checks only that would treat a refusal as one failed tool and carry on.
+ *
+ * A `TimeoutFailure` or a `CancelledFailure` cause has no `type` field, so neither matches.
+ */
+export const isHaltFailure = (error: unknown) =>
+  error instanceof ActivityFailure &&
+  (error.cause as ApplicationFailure | undefined)?.type === HALTED_FAILURE_TYPE
 
 /** The three activities a stepped turn drives. */
 export interface SteppedActivities {

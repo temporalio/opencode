@@ -64,7 +64,8 @@ Temporal-backed `SessionExecution` in `packages/core/src/session/execution/`:
 - `packages/temporal/src/activities.ts`: the `runTurnStep` activity (heartbeats; forwards
   cancellation;
   injects the attempt's event-log owner token).
-- `temporal.ts`: the `SessionExecution` layer + node: `wake` → `signalWithStart`, `resume` →
+- `packages/temporal/src/executor.ts`: the `SessionExecution` layer + node: `wake` →
+  `signalWithStart`, `resume` →
   forced `signalWithStart`, `interrupt` → cancel signal; each drain runs one step of the local
   coordinator's loop (`SessionRunner.runStep`) in an activity against the durable event log. The
   Temporal client and an embedded worker are co-hosted in the server process (both run under bun).
@@ -233,6 +234,7 @@ Verified live (dev server, `gpt-5-mini`, stepped mode on):
   answered with the file's contents. Worker affinity (below) skips the
   materialization on warm paths;
   the packs are the baseline that works without it.
+
 Covered by tests rather than by a live run:
 
 - **A compaction restart keeps deferring.** The `deferTools` flag is threaded through both
