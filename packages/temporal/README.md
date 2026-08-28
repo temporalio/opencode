@@ -588,6 +588,62 @@ Host-local state that does NOT ride the DB, so it is not reconstructed on a diff
   `${data}`
   (the XDG data dir) at shared storage to make them portable.
 
+## A session that outlives its client
+
+Everything above makes a session survive a worker. Together the same pieces make it survive the
+*client*, which is the part a user can feel: start something, close the laptop, and pick it up from
+a machine that has never seen it.
+
+Nothing new is needed underneath. A session is already a workflow rather than a process, the
+running set already comes from Temporal visibility, the store is already shared, and a live tail
+already re-reads so a subscriber sees work another process is doing. What was missing was a way to
+say so from a command line, which is these three:
+
+```bash
+# hand over a prompt and walk away; prints the session id and exits
+opencode session start "port the auth module to the new API" --attach http://gateway:4096
+
+# what is this deployment running right now, across every client that ever connected
+opencode session running --attach http://gateway:4096
+
+# follow one from anywhere, and stop when the turn stops
+opencode session watch ses_abc123 --attach http://gateway:4096
+```
+
+`--attach` takes any serve in the deployment, because they are interchangeable: each one reads the
+same store and signals the same workflows. There is no "the server that owns this session". That is
+the property, and it is why these commands are plain HTTP clients with no Temporal dependency.
+`$OPENCODE_SERVER` sets the endpoint once. For an interactive terminal instead of a follower,
+`opencode attach <url> --session <id>` already puts the TUI on a remote session.
+
+To run it as a deployment rather than a laptop:
+
+```bash
+export OPENCODE_SESSION_EXECUTION=temporal
+export OPENCODE_DB_URL=libsql://...     # one store, so any worker resumes any session
+export TEMPORAL_ADDRESS=...
+
+OPENCODE_TEMPORAL_ROLE=worker bun run packages/server/src/worker.ts   # as many as you want
+OPENCODE_TEMPORAL_ROLE=client opencode serve --port 4096             # as many as you want
+```
+
+### Verified
+
+`packages/temporal/scripts/detached-session-check.sh` runs the whole claim against real processes:
+serve A starts a turn and is killed with a tool still running, the turn finishes on a standalone
+worker, and serve B (which never saw the session) reports it running and replays the transcript.
+Then `session start` returns without waiting, `session running` lists it, and `session watch`
+follows it live from a cold client and exits when the turn ends.
+
+The shared store is load-bearing, and the check proves it rather than assuming it: give serve B its
+own `OPENCODE_DB` and the three cross-process assertions fail (`active` returns `{}`, the replay is
+empty, the follower hangs) while the serve-A-and-worker ones still pass.
+
+Two things this does not yet do. A turn started from a schedule or a webhook still needs an entry
+point of its own; `session start` is a command, so something has to run it. And the deployment above
+is a set of environment variables rather than a supported mode, so defaults, migration-on-deploy,
+and credential distribution are still the operator's problem.
+
 ## Porting this pattern
 
 The shape transfers to any agent engine; Temporal is one executor behind a seam the engine owns.
