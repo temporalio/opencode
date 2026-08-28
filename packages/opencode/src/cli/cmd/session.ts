@@ -1,6 +1,7 @@
 import type { Argv } from "yargs"
 import { Effect } from "effect"
 import { cmd } from "./cmd"
+import { SessionRunningCommand, SessionStartCommand, SessionWatchCommand } from "./detached"
 import { effectCmd, fail } from "../effect-cmd"
 import { Session } from "@/session/session"
 import { SessionID } from "../../session/schema"
@@ -44,7 +45,14 @@ function pagerCmd(): string[] {
 export const SessionCommand = cmd({
   command: "session",
   describe: "manage sessions",
-  builder: (yargs: Argv) => yargs.command(SessionListCommand).command(SessionDeleteCommand).demandCommand(),
+  builder: (yargs: Argv) =>
+    yargs
+      .command(SessionListCommand)
+      .command(SessionDeleteCommand)
+      .command(SessionStartCommand)
+      .command(SessionRunningCommand)
+      .command(SessionWatchCommand)
+      .demandCommand(),
   async handler() {},
 })
 
