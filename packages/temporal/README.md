@@ -639,10 +639,29 @@ The shared store is load-bearing, and the check proves it rather than assuming i
 own `OPENCODE_DB` and the three cross-process assertions fail (`active` returns `{}`, the replay is
 empty, the follower hangs) while the serve-A-and-worker ones still pass.
 
-Two things this does not yet do. A turn started from a schedule or a webhook still needs an entry
-point of its own; `session start` is a command, so something has to run it. And the deployment above
-is a set of environment variables rather than a supported mode, so defaults, migration-on-deploy,
-and credential distribution are still the operator's problem.
+### Across two machines
+
+`packages/temporal/scripts/cross-host-check.sh` runs the claim against containers, where each worker
+has its own filesystem and hostname and the store is a real libSQL server. A session writes a file
+on worker A, worker A's host is killed, and worker B, whose project volume is empty, continues the
+same session and reads that file back.
+
+That check found a bug a single host cannot show. `WorktreeMaterializer.ensure` treated any existing
+directory as somebody's working copy, and a fresh host has no tip note, so `behind` said no and the
+tree was never built. The tools then ran against an empty directory and the model was told a wrong
+answer, which is worse than a failure. On one host the case never appears: worker B either has the
+project already or has no directory at all, and an absent directory materializes fine. A mounted
+empty directory is the shape of a machine that has never seen the session, and it now materializes
+too (`packages/core/test/worktree-materialize.test.ts` covers it).
+
+The compose file mounts the engine's source over the image, so a code change does not need a new
+image. One libSQL server, so this shows a shared store over a network rather than one that survives
+losing a node.
+
+Still to do. A turn started from a schedule or a webhook needs an entry point of its own;
+`session start` is a command, so something has to run it. And the deployment above is a set of
+environment variables rather than a supported mode, so defaults, migration-on-deploy, and
+credential distribution are still the operator's problem.
 
 ## Porting this pattern
 
