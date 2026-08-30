@@ -12,7 +12,7 @@ export * as WorktreeMaterializer from "./worktree"
 // hosts still cannot see each other's writes, because those are not captured until the step is
 // sealed. One worker per worktree is what makes a step's tools share a tree.
 
-import { rm, writeFile } from "node:fs/promises"
+import { readdir, rm, writeFile } from "node:fs/promises"
 import path from "path"
 import { Cause, Context, Effect, Layer } from "effect"
 import { ChildProcess } from "effect/unstable/process"
@@ -44,6 +44,15 @@ export class Service extends Context.Service<Service, Interface>()(
 
 // HEAD of a rebuilt tree, which doubles as the mark that says the tree is ours to move.
 const RESTORED = "refs/heads/opencode-restore"
+
+// Nothing in it at all, so there is no work to protect and nothing to lose by checking a tree out
+// over it. Unreadable counts as not empty: a directory we cannot look into is not one to overwrite.
+const isEmptyDir = (dir: string) =>
+  Effect.promise(() =>
+    readdir(dir)
+      .then((entries) => entries.length === 0)
+      .catch(() => false),
+  )
 
 const layer = Layer.effect(
   Service,
@@ -167,7 +176,12 @@ const layer = Layer.effect(
         .get()
         .pipe(Effect.orDie)
       if (!tip) return
-      const present = yield* fs.existsSafe(tip.worktree)
+      // An empty directory is not somebody's working copy, so the rule that protects one does not
+      // apply to it. Treating it as present is what stops a fresh host from ever building the tree:
+      // it has no tip note, so `behind` says no, and the tools then run against nothing. A mounted
+      // path that exists but holds nothing is the ordinary shape of a host that has never seen this
+      // project, which is exactly the case the packs are for.
+      const present = (yield* fs.existsSafe(tip.worktree)) && !(yield* isEmptyDir(tip.worktree))
       if (present) {
         if (!(yield* behind(tip))) return
         if (!(yield* rebuilt(tip.worktree))) {
@@ -180,8 +194,12 @@ const layer = Layer.effect(
       }
       yield* locks.withLock(tip.worktree)(
         Effect.gen(function* () {
-          // Re-check inside the lock: a concurrent drain may have done this already.
-          if ((yield* fs.existsSafe(tip.worktree)) && !(yield* behind(tip))) return
+          // Re-check inside the lock: a concurrent drain may have done this already. Same notion of
+          // present as above, or an empty directory bails out here instead and the tree that the
+          // outer check just decided to build never gets built.
+          const here =
+            (yield* fs.existsSafe(tip.worktree)) && !(yield* isEmptyDir(tip.worktree))
+          if (here && !(yield* behind(tip))) return
           yield* materialize(tip).pipe(
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterrupts(cause),

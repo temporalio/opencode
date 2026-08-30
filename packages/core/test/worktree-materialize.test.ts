@@ -109,6 +109,46 @@ describe("WorktreeMaterializer", () => {
     }),
   )
 
+  it.live("rebuilds into a directory that exists but is empty", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const root = realpathSync(tmp.path)
+      const worktree = path.join(root, "project")
+      const file = path.join(root, "shared.db")
+      yield* Effect.promise(async () => {
+        await mkdir(worktree, { recursive: true })
+        await $`git init -q ${worktree}`.quiet()
+        await $`git -C ${worktree} config user.email t@t`.quiet()
+        await $`git -C ${worktree} config user.name t`.quiet()
+        await writeFile(path.join(worktree, "note.txt"), "travelled\n")
+        await $`git -C ${worktree} add .`.quiet()
+        await $`git -C ${worktree} commit -qm seed`.quiet()
+      })
+
+      const A = yield* Layer.build(captureStack(file, worktree, path.join(root, "host-a-data")))
+      const captured = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
+      if (!captured) throw new Error("expected a capture")
+      yield* SnapshotSync.Service.use((s) => s.push(captured)).pipe(Effect.provide(A))
+
+      // The shape a container gives a fresh host: the path is there because something mounted it,
+      // and there is nothing in it. Deleting the directory instead is the case already covered,
+      // and it is the easy one: an absent tree is obviously safe to build.
+      yield* Effect.promise(async () => {
+        await rm(worktree, { recursive: true, force: true })
+        await mkdir(worktree, { recursive: true })
+      })
+
+      const B = yield* Layer.build(materializeStack(file, path.join(root, "host-b-data")))
+      yield* WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(Effect.provide(B))
+
+      expect(yield* Effect.promise(() => readFile(path.join(worktree, "note.txt"), "utf8"))).toBe(
+        "travelled\n",
+      )
+
+      yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
+    }),
+  )
+
   it.live("moves a rebuilt tree forward, and leaves a tree it did not build alone", () =>
     Effect.gen(function* () {
       const tmp = yield* Effect.promise(() => tmpdir())
