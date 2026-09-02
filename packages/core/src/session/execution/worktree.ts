@@ -185,11 +185,15 @@ const layer = Layer.effect(
       if (present) {
         if (!(yield* behind(tip))) return
         if (!(yield* rebuilt(tip.worktree))) {
-          yield* Effect.logWarning("worktree is behind the store and was not built from it", {
-            worktree: tip.worktree,
-            tree: tip.tree,
-          })
-          return
+          // Not a warning. Returning here leaves the drain running against files the store has
+          // moved past, and the model is then told a stale tree is the project, which is worse
+          // than not running at all. Failing sends the work to a host that can do it.
+          return yield* Effect.die(
+            new Error(
+              `worktree ${tip.worktree} is behind the store (${tip.tree}) and was not built ` +
+                `from it, so it will not be moved`,
+            ),
+          )
         }
       }
       yield* locks.withLock(tip.worktree)(
@@ -210,10 +214,15 @@ const layer = Layer.effect(
                   // leaves it as stale as it was.
                   if (!present)
                     yield* Effect.promise(() => rm(tip.worktree, { recursive: true, force: true }))
-                  yield* Effect.logWarning("failed to materialize worktree", {
+                  yield* Effect.logError("failed to materialize worktree", {
                     worktree: tip.worktree,
                     cause,
                   })
+                  // Swallowing this ran the step against whatever was in the directory, which for
+                  // a fresh host is nothing at all.
+                  return yield* Effect.die(
+                    new Error(`could not materialize ${tip.worktree} at ${tip.tree}`),
+                  )
                 }),
             ),
           )
