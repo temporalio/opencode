@@ -172,14 +172,17 @@ export const SessionWatchCommand = cmd({
       event.type === "session.next.step.failed" ||
       (event.type === "session.next.step.ended" && event.data?.finish !== "tool-calls")
 
-    // The running set cannot end a `watch` on its own, because a session stays in it while the
-    // supervisor waits out its idle timeout. It can say the opposite: still there means the turn
-    // did not stop, so a step that ended into a steer is not the end.
-    const stillRunning = async () => {
-      const active = await call<Record<string, unknown>>(r, "/session/active").catch(() => undefined)
-      // Unreachable is not finished, which is the whole point of this command.
-      return active === undefined || sessionID in active
-    }
+    // What says the turn did NOT end after all: a steer or a queued prompt continues the same turn
+    // through `stepContinuation`, and the next thing on the wire is another step starting.
+    const carriesOn = (event: { type?: string }) =>
+      event.type === "session.next.step.started" || event.type === "session.next.prompted"
+
+    // The running set cannot end a `watch`. It holds a session for the whole idle timeout after the
+    // work is done, so gating the exit on it means never exiting. Nothing publishes a turn-level
+    // ending either, so what is left is the wire going quiet: a terminal step, then no continuation
+    // within a grace window. A steer arrives in milliseconds, so the window only has to outlast the
+    // hop between two activities.
+    const GRACE_MS = Number(process.env.OPENCODE_WATCH_GRACE_MS ?? 5_000)
 
     // The stream ends when the serve this is attached to restarts, which is the event this command
     // exists for. Exiting 0 there reports a turn that is still running as done.
@@ -200,8 +203,22 @@ export const SessionWatchCommand = cmd({
         const decoder = new TextDecoder()
         let buffer = ""
         let ended = false
+        // Set by a terminal step, cleared by anything that shows the turn carrying on.
+        let settling = false
         for (;;) {
-          const { done, value } = await reader.read()
+          const next = reader.read()
+          const chunk = settling
+            ? await Promise.race([
+                next,
+                new Promise<"quiet">((resolve) => setTimeout(() => resolve("quiet"), GRACE_MS)),
+              ])
+            : await next
+          // A terminal step and then nothing: the turn is over.
+          if (chunk === "quiet") {
+            ended = true
+            break
+          }
+          const { done, value } = chunk
           if (done) break
           buffer += decoder.decode(value, { stream: true })
           const lines = buffer.split("\n")
@@ -222,12 +239,11 @@ export const SessionWatchCommand = cmd({
               const text = render?.(event.data ?? {})
               if (text) UI.println(`${stamp(event.data?.timestamp)}  ${text}`)
             }
-            if (args.wait && looksDone(event) && !(await stillRunning())) {
-              ended = true
-              break
+            if (args.wait) {
+              if (carriesOn(event)) settling = false
+              else if (looksDone(event)) settling = true
             }
           }
-          if (ended) break
         }
         await reader.cancel().catch(() => {})
         if (ended) return

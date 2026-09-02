@@ -100,13 +100,18 @@ export const makeSteppedTurn =
     } else {
       dispatched.push(...(await Promise.allSettled(model.calls.map(dispatch))))
     }
-    const seal = (needsContinuation: boolean | undefined) =>
+    const seal = (stopped: boolean) =>
       activities.sealStep({
         sessionID: input.sessionID,
         step: model.step,
-        settlement: model.settlement,
+        // A stopped step is not one that continues. The settlement carries the model's own finish
+        // reason, and for a step that asked for tools that is `tool-calls`, which every follower
+        // reads as "another step follows". Passing it through on the way out recorded a turn the
+        // user stopped as a turn still going.
+        settlement:
+          stopped && model.settlement ? { ...model.settlement, finish: "stop" } : model.settlement,
         assistantMessageID: model.assistantMessageID,
-        needsContinuation,
+        needsContinuation: stopped ? false : model.needsContinuation,
         owner: model.owner,
       })
 
@@ -122,7 +127,7 @@ export const makeSteppedTurn =
         // on past a declined permission, because it re-derived "keep going" from the tool parts.
         // The reason the turn is stopping is rethrown either way, and a seal that fails here must
         // not replace it.
-        await (nonCancellable ?? ((fn: () => Promise<unknown>) => fn()))(() => seal(false)).catch(
+        await (nonCancellable ?? ((fn: () => Promise<unknown>) => fn()))(() => seal(true)).catch(
           (err) => log?.("could not seal an interrupted step", { step: model.step, error: String(err) }),
         )
         throw outcome.reason
@@ -145,5 +150,5 @@ export const makeSteppedTurn =
     if (unsettled.length > 0)
       log?.("step did not settle every call it dispatched", { step: model.step, calls: unsettled })
 
-    return seal(model.needsContinuation)
+    return seal(false)
   }

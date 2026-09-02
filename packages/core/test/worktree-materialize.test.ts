@@ -149,7 +149,7 @@ describe("WorktreeMaterializer", () => {
     }),
   )
 
-  it.live("moves a rebuilt tree forward, and leaves a tree it did not build alone", () =>
+  it.live("moves a tree that is behind forward, and leaves one already at the tip alone", () =>
     Effect.gen(function* () {
       const tmp = yield* Effect.promise(() => tmpdir())
       const root = realpathSync(tmp.path)
@@ -276,6 +276,70 @@ describe("WorktreeMaterializer", () => {
       ).pipe(Effect.orDie, Effect.provide(Database.layerFromPath(file)), Effect.scoped)
       expect(rows).toHaveLength(2)
       expect(rows[1]?.tree).toBe(elsewhere)
+
+      yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
+    }),
+  )
+
+  // A host that seeded the session from its own checkout has a note but no rebuild marker, because
+  // only a rebuild writes one. Gating the move on that marker meant every activity such a host drew
+  // died as soon as any other host shipped, and the comment said it would be sent elsewhere when the
+  // boundary marks it non-retryable. The note is the rule: a host that agreed to a state may be
+  // moved off it.
+  it.live("moves a tree the host captured rather than rebuilt", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const root = realpathSync(tmp.path)
+      const worktree = path.join(root, "project")
+      const file = path.join(root, "shared.db")
+      const data = path.join(root, "seed-host-data")
+      yield* Effect.promise(async () => {
+        await mkdir(worktree, { recursive: true })
+        await $`git init -q ${worktree}`.quiet()
+        await $`git -C ${worktree} config user.email t@t`.quiet()
+        await $`git -C ${worktree} config user.name t`.quiet()
+        await writeFile(path.join(worktree, "f.txt"), "seeded\n")
+        await $`git -C ${worktree} add .`.quiet()
+        await $`git -C ${worktree} commit -qm seed`.quiet()
+      })
+
+      // This host captures from its own checkout, so it gets a note and no rebuild marker.
+      const A = yield* Layer.build(captureStack(file, worktree, data))
+      const first = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
+      yield* SnapshotSync.Service.use((s) => s.push(first!)).pipe(Effect.provide(A))
+      const packs = yield* Database.Service.use(({ db }) =>
+        db.select().from(SnapshotPackTable).all(),
+      ).pipe(Effect.orDie, Effect.provide(Database.layerFromPath(file)), Effect.scoped)
+
+      // Another host ships on top, so this one is behind.
+      yield* Effect.sleep(10)
+      yield* Database.Service.use(({ db }) =>
+        db
+          .insert(SnapshotPackTable)
+          .values([
+            {
+              id: "d".repeat(40),
+              directory: worktree,
+              worktree,
+              tree: "e".repeat(40),
+              base: packs[0]!.id,
+              pack: Buffer.from([0x50, 0x41, 0x43, 0x4b]),
+            },
+          ])
+          .run(),
+      ).pipe(Effect.orDie, Effect.provide(Database.layerFromPath(file)), Effect.scoped)
+
+      const B = yield* Layer.build(materializeStack(file, data))
+      const exit = yield* WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(
+        Effect.provide(B),
+        Effect.exit,
+      )
+
+      // The pack above is not a real one, so the rebuild itself cannot succeed here. What this pins
+      // is which failure: a rebuild that was attempted and failed, not a refusal to try.
+      const why = String(exit)
+      expect(why).not.toContain("was not built")
+      expect(why).toContain("could not materialize")
 
       yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
     }),

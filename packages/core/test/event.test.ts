@@ -784,9 +784,10 @@ describe("EventV2", () => {
       const aggregateID = Session.ID.create()
       yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
 
-      yield* events.claim(aggregateID, "run:model-1:1")
-      yield* events.claim(aggregateID, "run:model-1:2")
-      const stale = yield* events.claim(aggregateID, "run:model-1:1").pipe(Effect.exit)
+      // Activity ids as Temporal writes them: an increasing sequence within the run.
+      yield* events.claim(aggregateID, "run:11:1")
+      yield* events.claim(aggregateID, "run:11:2")
+      const stale = yield* events.claim(aggregateID, "run:11:1").pipe(Effect.exit)
       expect(Exit.isFailure(stale)).toBe(true)
 
       const { db } = yield* Database.Service
@@ -795,11 +796,50 @@ describe("EventV2", () => {
         .from(EventSequenceTable)
         .where(eq(EventSequenceTable.aggregate_id, aggregateID))
         .get()
-      expect(row?.ownerID).toBe("run:model-1:2")
+      expect(row?.ownerID).toBe("run:11:2")
 
-      // A different activity is a different unit of work, so it still takes the log: this is the
-      // seal claiming after the model call, not a zombie.
-      yield* events.claim(aggregateID, "run:seal-1:1")
+      // A later activity is a different unit of work, so it still takes the log: this is the seal
+      // claiming after the model call, not a zombie.
+      yield* events.claim(aggregateID, "run:12:1")
+
+      // And an earlier one never does, whatever its attempt says. A model call paused before it
+      // claimed, with three steps completing under other activity ids while it was away, used to
+      // come back and fence out the step that was actually running.
+      const fromAnEarlierStep = yield* events.claim(aggregateID, "run:4:1").pipe(Effect.exit)
+      expect(Exit.isFailure(fromAnEarlierStep)).toBe(true)
+    }),
+  )
+
+  // What this pins is the outcome, not the race: whoever the row names is the one that was told it
+  // won. It does NOT pin the compare-and-set that makes that true under a real interleaving. Two
+  // claims started together here run to completion one after the other, so this passes with the
+  // condition on the write removed. Forcing the interleaving needs a seam between the read and the
+  // write that the production path does not have, and inventing one to test it would be testing the
+  // seam. Named for what it does.
+  it.effect("two claims for one log leave a single owner, and it is one that was told so", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
+
+      const outcomes = yield* Effect.all(
+        ["run:11:1", "run:11:2"].map((token) => events.claim(aggregateID, token).pipe(Effect.exit)),
+        { concurrency: "unbounded" },
+      )
+      const won = outcomes.filter(Exit.isSuccess).length
+
+      const { db } = yield* Database.Service
+      const row = yield* db
+        .select({ ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+        .get()
+
+      // Whoever the row names is the one that must have been told it won. Any other pairing means a
+      // claimer carried on believing it held a log it does not.
+      expect(won).toBeGreaterThanOrEqual(1)
+      expect(["run:11:1", "run:11:2"]).toContain(row?.ownerID ?? "")
+      if (won === 2) expect(row?.ownerID).toBe("run:11:2")
     }),
   )
 
