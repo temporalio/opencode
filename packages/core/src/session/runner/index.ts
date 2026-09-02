@@ -41,14 +41,21 @@ export interface StepResult {
  * of the same step would mint different ones and the results would not match the log. */
 /** A call the model asked for, handed to whoever will run it.
  *
- * Deliberately without the arguments. This crosses a durable boundary twice, once as the model
- * call's result and once as the tool call's input, so carrying them puts every `write` body and
- * every `edit` string into history twice over. A large step could pass the payload limit, and the
- * retry re-streams and re-pays the model call for a result that is rejected the same way. The
- * dispatch reads them off the recorded call instead, which is where they already are. */
+ * It carries the arguments, and it has to. A deferred call is recorded as pending with `input: ""`
+ * (message-updater.ts), because the streaming path leaves `Tool.Called` to whoever dispatches it:
+ * that publish is the dispatch record the no-double-run rule reads, so it cannot happen before a
+ * dispatch. The log therefore does not hold the arguments at hand-off time, and reading them from
+ * there gave the tool an empty string.
+ *
+ * The cost is real and unfixed: this crosses a durable boundary twice, once as the model call's
+ * result and once as the tool call's input, so a step with large `write` bodies puts them into
+ * history twice and a big enough one passes the payload limit. Fixing it means recording the
+ * arguments at stream time without recording a dispatch, which is a change to the pending state
+ * rather than to this shape. */
 export interface DeferredToolCall {
   readonly id: string
   readonly name: string
+  readonly input: unknown
   readonly assistantMessageID: string
 }
 
