@@ -340,6 +340,12 @@ what makes any worker able to serve any session, and turning affinity on is choo
 
 Two consequences to plan for, both silent:
 
+- **The key is the directory, not the host.** In a container fleet where every worker's project is
+  the same path, affinity is a no-op: they all poll the same queue and a step's tools still land
+  wherever. It is a real routing decision only where hosts serve genuinely different paths, which
+  is why `OPENCODE_TEMPORAL_SERIAL_TOOLS` is the thing that actually keeps a step's writes together
+  in the shared-store deployment.
+
 - **A worker serves one tree.** In the default `role=both` deployment the embedded worker polls the
   queue for the process directory, so a session in another project has no poller. Point
   `OPENCODE_TEMPORAL_WORKTREE` at the project root, not at a subfolder, since the key is the project
@@ -569,13 +575,26 @@ and dependencies are not captured, so a rebuilt tree may need an install step be
 identically. Worker affinity (below) or a shared volume skips the materialization latency on warm
 paths; the packs are the portable baseline that works with neither.
 
-Two rules bound what that refresh may touch, because checking a stored tree out over the wrong one
-destroys work. A tree is moved only when a host-local note (`snapshot/tip.ts`) says this host is
-behind the store, so a host holding a capture that never shipped is left as it is. And it is moved
-only when this host built the tree from packs, so a checkout the host already had, a developer's own
-working copy, is never rewritten: that case is logged and left alone. What stays open is the tools
-of ONE step running on two hosts, since nothing captures their writes until the step is sealed.
-Affinity is what keeps a step's tools on one tree.
+The rules that bound it, because checking a stored tree out over the wrong one destroys work:
+
+- **Newest is decided by the chain, not by a clock.** Each pack names the one it was built on, and
+  that order no host can get wrong. `time_created` is whichever host wrote the row, so a worker
+  five minutes behind used to make its older tree the newest one that everybody else checked out.
+- **Only a host standing on the newest state may add to it.** A host that never caught up used to
+  pack its older files, become the newest by time, and revert everyone. It refuses now, ahead of
+  its own tip note and outside the packing (which swallows its failures on purpose, so a guard
+  inside it would only have logged).
+- **A tree is moved only when this host built it from packs**, so a developer's own checkout is
+  never rewritten. That refusal fails the drain rather than warning and running anyway: a step
+  against files the store has moved past tells the model a stale tree is the project, which is
+  worse than not running.
+- **A tool ships from the host that ran it.** The seal can land anywhere, and it used to be the only
+  thing that captured, so a tool's writes reached the store only when the seal happened to be on
+  the same host.
+- **A step's tools run one at a time wherever the store is shared** (`OPENCODE_TEMPORAL_SERIAL_TOOLS`,
+  on by default when `OPENCODE_DB_URL` is set and affinity is off). Two on two hosts each publish a
+  tree without the other's work, and the second is refused rather than reverting the first, which
+  leaves its work stranded there. Turn it off when affinity already keeps a step on one worker.
 
 Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
 
