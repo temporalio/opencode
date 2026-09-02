@@ -116,17 +116,20 @@ const runtime: SupervisorRuntime = {
 }
 
 // Same supervisor, different step body: wake, interrupt, idle timeout and continue-as-new are
-// unchanged, and only what "one step" means differs.
-const steppedRuntime: SupervisorRuntime = {
+// unchanged, and only what "one step" means differs. Built per run rather than once, because
+// whether a step's tools may overlap rides the workflow input: the sandbox cannot read env.
+const steppedRuntime = (serial: boolean): SupervisorRuntime => ({
   ...runtime,
   runTurnStep: makeSteppedTurn({
     activities: { runModelCall, runToolCall, sealStep },
     isCancellation,
     isHalt: isHaltFailure,
+    serial,
+    nonCancellable: (fn) => CancellationScope.nonCancellable(fn),
     // The SDK's logger, so a line carries its workflow and run id and is suppressed on replay.
     log: (message, attributes) => log.info(message, attributes),
   }),
-}
+})
 
 // The scope of the drain currently running, so an interrupt signal can cancel exactly that turn.
 let activeDrainScope: CancellationScope | undefined
@@ -145,6 +148,10 @@ export interface SessionTurnOptions {
   /** Drive each step as a provider attempt, one activity per tool call, and a seal, instead of one
    * activity for the whole step. Off by default: the whole-step mode is what runs today. */
   readonly stepped?: boolean
+  /** Run a step's tool calls one at a time. Each ships the tree from the host that ran it, so two
+   * on two hosts each publish a tree without the other's work. The client decides, because only it
+   * can read whether the store is shared. */
+  readonly serialTools?: boolean
 }
 
 export async function sessionTurn(sessionID: string, options?: SessionTurnOptions): Promise<void> {
@@ -152,14 +159,20 @@ export async function sessionTurn(sessionID: string, options?: SessionTurnOption
   const startWithWake = options?.startWithWake ?? true
   const idleTimeout = options?.idleTimeout
   const stepped = options?.stepped === true
+  const serialTools = options?.serialTools === true
   if (!idleTimeout && !stepped) return workflows.sessionTurn(sessionID, startWithWake)
   return makeSupervisor(
     {
-      ...(stepped ? steppedRuntime : runtime),
+      ...(stepped ? steppedRuntime(serialTools) : runtime),
       // The mode has to survive the boundary, or a long session silently reverts to whole-step
       // activities the first time it rolls over.
       continueAsNew: (id, wake) =>
-        continueAsNew<typeof sessionTurn>(id, { startWithWake: wake, idleTimeout, stepped }),
+        continueAsNew<typeof sessionTurn>(id, {
+          startWithWake: wake,
+          idleTimeout,
+          stepped,
+          serialTools,
+        }),
     },
     idleTimeout ? { idleTimeout } : undefined,
   ).sessionTurn(sessionID, startWithWake)

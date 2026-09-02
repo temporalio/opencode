@@ -26,6 +26,7 @@ import { Global } from "../../global"
 import { AppProcess } from "../../process"
 import { AbsolutePath } from "../../schema"
 import { SnapshotPackTable } from "../../snapshot/sql"
+import { chainHead, isBehind, orderChain } from "../../snapshot/chain"
 import { readWorktreeTip, writeWorktreeTip } from "../../snapshot/tip"
 
 export interface Interface {
@@ -70,13 +71,15 @@ const layer = Layer.effect(
         .create({ worktree, gitDirectory: AbsolutePath.make(path.join(worktree, ".git")) })
         .pipe(Effect.orDie)
       // Index every pack shipped for this worktree; objects accumulate, the newest tree wins.
-      const rows = yield* db
+      const stored = yield* db
         .select()
         .from(SnapshotPackTable)
         .where(eq(SnapshotPackTable.worktree, tip.worktree))
-        .orderBy(asc(SnapshotPackTable.time_created))
         .all()
         .pipe(Effect.orDie)
+      // A pack cannot be indexed before the one it was built on, and the write clock does not order
+      // them: two hosts disagree about the time, and one behind puts its pack first.
+      const rows = orderChain(stored)
       const packDirectory = path.join(repository.gitDirectory, "objects", "pack")
       yield* fs.ensureDir(packDirectory).pipe(Effect.orDie)
       for (const row of rows) {
@@ -129,15 +132,13 @@ const layer = Layer.effect(
     const behind = Effect.fnUntraced(function* (tip: typeof SnapshotPackTable.$inferSelect) {
       const held = yield* readWorktreeTip(global.data, tip.worktree)
       if (!held || held === tip.tree) return false
-      const shipped = yield* db
-        .select({ time: SnapshotPackTable.time_created })
+      const rows = yield* db
+        .select()
         .from(SnapshotPackTable)
-        .where(and(eq(SnapshotPackTable.worktree, tip.worktree), eq(SnapshotPackTable.tree, held)))
-        .orderBy(desc(SnapshotPackTable.time_created))
-        .limit(1)
-        .get()
+        .where(eq(SnapshotPackTable.worktree, tip.worktree))
+        .all()
         .pipe(Effect.orDie)
-      return shipped !== undefined && shipped.time < tip.time_created
+      return isBehind(rows, held)
     })
 
     // Whether this tree is one we built from packs. A checkout the host already had is somebody's
@@ -167,14 +168,14 @@ const layer = Layer.effect(
     const ensure = Effect.fn("WorktreeMaterializer.ensure")(function* (directory: string) {
       // The newest capture whose session ran in this directory decides which worktree to rebuild,
       // and which state a tree that is already here has to be brought to.
-      const tip = yield* db
-        .select()
-        .from(SnapshotPackTable)
-        .where(eq(SnapshotPackTable.directory, directory))
-        .orderBy(desc(SnapshotPackTable.time_created))
-        .limit(1)
-        .get()
-        .pipe(Effect.orDie)
+      const tip = chainHead(
+        yield* db
+          .select()
+          .from(SnapshotPackTable)
+          .where(eq(SnapshotPackTable.directory, directory))
+          .all()
+          .pipe(Effect.orDie),
+      )
       if (!tip) return
       // An empty directory is not somebody's working copy, so the rule that protects one does not
       // apply to it. Treating it as present is what stops a fresh host from ever building the tree:

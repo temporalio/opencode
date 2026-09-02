@@ -29,6 +29,13 @@ export interface Interface {
   /** The worktree this worker serves, when affinity is on. Defaults to the process directory, which
    * is what a serve process with an embedded worker is already sitting in. */
   readonly worktree?: string
+  /** Run a step's tool calls one at a time instead of together. Tools of one step write the same
+   * tree and each ships from the host that ran it, so two on two hosts each publish a tree without
+   * the other's work: the second is refused rather than reverting the first, which leaves its work
+   * stranded there. On by default wherever the store is shared, because that is the deployment
+   * where a step's tools land on different hosts. `OPENCODE_TEMPORAL_SERIAL_TOOLS=0` turns it off,
+   * which is right when affinity already keeps a step on one worker. */
+  readonly serialTools?: boolean
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/temporal/Config") {}
@@ -42,4 +49,9 @@ export const fromEnv = (): Interface => ({
   stepped: process.env.OPENCODE_TEMPORAL_STEPPED === "1",
   worktreeAffinity: process.env.OPENCODE_TEMPORAL_WORKTREE_AFFINITY === "1",
   worktree: process.env.OPENCODE_TEMPORAL_WORKTREE,
+  serialTools:
+    process.env.OPENCODE_TEMPORAL_SERIAL_TOOLS === "1" ||
+    (process.env.OPENCODE_TEMPORAL_SERIAL_TOOLS !== "0" &&
+      process.env.OPENCODE_TEMPORAL_WORKTREE_AFFINITY !== "1" &&
+      !!process.env.OPENCODE_DB_URL),
 })
