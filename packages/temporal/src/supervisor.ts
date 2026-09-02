@@ -93,10 +93,17 @@ export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions)
           for (;;) {
             const r: StepDrainResult = await rt.runTurnStep({ sessionID, step, promotion, first, force })
             // Inside the loop as well, because one drain is a whole turn: a long one outgrows the
-            // history without ever reaching the next drain's check. Only the flag is set here; the
-            // rollover still waits for the drain to finish and the session to be quiet.
+            // history without ever reaching the next drain's check.
             if (rt.historyWantsRollover?.()) rolloverPending = true
             if (!r.continue) break
+            // A queued prompt continues this same drain as a fresh turn, so a session fed without a
+            // gap never goes quiet and the rollover it is waiting for never happens. Stop at that
+            // boundary instead and let the new run pick the queue up: the work is not lost, it is
+            // one turn later. A steer is not a boundary, so it still rides this drain through.
+            if (rolloverPending && r.promotion === "queue") {
+              pendingWake = true
+              break
+            }
             step = r.step
             promotion = r.promotion
             first = false

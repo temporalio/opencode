@@ -94,15 +94,14 @@ const layer = Layer.effect(
           )
         }
       }
-      // Noted before the packing, which is best-effort: what this host holds is true whether or not
-      // the pack reaches the store, and a note left behind would let a later drain check out an
-      // older tree over work only this host has.
-      if (source) yield* writeWorktreeTip(global.data, worktree, tree)
       yield* Effect.gen(function* () {
         if (!source) return
         const latest = yield* newest()
-        // The newest shipped state already is this tree: nothing to pack.
-        if (latest?.tree === tree) return
+        // The newest shipped state already is this tree: nothing to pack, and the note is true.
+        if (latest?.tree === tree) {
+          yield* writeWorktreeTip(global.data, worktree, tree)
+          return
+        }
         // Chain onto the previous sync commit only when this host has it; a base absent locally
         // would produce a delta pack the pack builder cannot compute.
         const base =
@@ -139,6 +138,12 @@ const layer = Layer.effect(
           .onConflictDoNothing()
           .run()
           .pipe(Effect.orDie)
+        // After the insert, never before it. The packing below swallows its failures, so a note
+        // written first and an insert that then failed named a tree the store never saw: `isBehind`
+        // finds no row for it and leaves the host where it is, while the ship guard compares that
+        // note with a head it can never match, so every later push from this host dies. Left at the
+        // last state the store agreed on, both keep working and the next push chains from there.
+        yield* writeWorktreeTip(global.data, worktree, tree)
       }).pipe(
         Effect.catchCauseIf(
           (cause) => !Cause.hasInterrupts(cause),

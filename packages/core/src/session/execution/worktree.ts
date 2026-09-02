@@ -14,7 +14,7 @@ export * as WorktreeMaterializer from "./worktree"
 
 import { readdir, rm, writeFile } from "node:fs/promises"
 import path from "path"
-import { Cause, Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Layer, Schema } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { and, asc, desc, eq } from "drizzle-orm"
 import { Database } from "../../database/database"
@@ -43,8 +43,15 @@ export class Service extends Context.Service<Service, Interface>()(
   "@opencode/v2/WorktreeMaterializer",
 ) {}
 
-// HEAD of a rebuilt tree, which doubles as the mark that says the tree is ours to move.
+// HEAD of a rebuilt tree, so the rebuilt repo reads as a clean checkout rather than an unborn
+// branch over a full untracked tree.
 const RESTORED = "refs/heads/opencode-restore"
+
+/** A rebuild that did not finish. Tagged so the boundary can tell it from a refusal and retry it. */
+export class WorktreeMaterializeError extends Schema.TaggedErrorClass<WorktreeMaterializeError>()(
+  "WorktreeMaterializer.MaterializeError",
+  { message: Schema.String },
+) {}
 
 // Nothing in it at all, so there is no work to protect and nothing to lose by checking a tree out
 // over it. Unreadable counts as not empty: a directory we cannot look into is not one to overwrite.
@@ -141,30 +148,6 @@ const layer = Layer.effect(
       return isBehind(rows, held)
     })
 
-    // Whether this tree is one we built from packs. A checkout the host already had is somebody's
-    // working copy: reading its captures is fine, but checking a stored tree out over it would
-    // rewrite files and HEAD under whoever owns it.
-    const rebuilt = (worktree: string) =>
-      proc
-        .run(
-          ChildProcess.make(
-            "git",
-            [
-              "--git-dir",
-              path.join(worktree, ".git"),
-              "rev-parse",
-              "--verify",
-              "--quiet",
-              RESTORED,
-            ],
-            { cwd: worktree, extendEnv: true },
-          ),
-        )
-        .pipe(
-          Effect.map((result) => result.exitCode === 0),
-          Effect.catchCause(() => Effect.succeed(false)),
-        )
-
     const ensure = Effect.fn("WorktreeMaterializer.ensure")(function* (directory: string) {
       // The newest capture whose session ran in this directory decides which worktree to rebuild,
       // and which state a tree that is already here has to be brought to.
@@ -183,20 +166,15 @@ const layer = Layer.effect(
       // path that exists but holds nothing is the ordinary shape of a host that has never seen this
       // project, which is exactly the case the packs are for.
       const present = (yield* fs.existsSafe(tip.worktree)) && !(yield* isEmptyDir(tip.worktree))
-      if (present) {
-        if (!(yield* behind(tip))) return
-        if (!(yield* rebuilt(tip.worktree))) {
-          // Not a warning. Returning here leaves the drain running against files the store has
-          // moved past, and the model is then told a stale tree is the project, which is worse
-          // than not running at all. Failing sends the work to a host that can do it.
-          return yield* Effect.die(
-            new Error(
-              `worktree ${tip.worktree} is behind the store (${tip.tree}) and was not built ` +
-                `from it, so it will not be moved`,
-            ),
-          )
-        }
-      }
+      // `behind` is already the whole rule. It is false unless this host has a note of its own, and
+      // a note means this host agreed to that state: either it built the tree from packs or it
+      // captured the tree from here. Moving it forward from a state it agreed to loses nothing.
+      //
+      // What used to gate this as well was whether the tree carried the marker `materialize`
+      // writes. Only a rebuilt tree ever has that, so a host that seeded the session from its own
+      // checkout never did, and once any other host shipped, every activity that host drew died
+      // here. A developer's checkout is protected by having no note at all, not by the marker.
+      if (present && !(yield* behind(tip))) return
       yield* locks.withLock(tip.worktree)(
         Effect.gen(function* () {
           // Re-check inside the lock: a concurrent drain may have done this already. Same notion of
@@ -220,9 +198,13 @@ const layer = Layer.effect(
                     cause,
                   })
                   // Swallowing this ran the step against whatever was in the directory, which for
-                  // a fresh host is nothing at all.
+                  // a fresh host is nothing at all. Tagged, so the activity boundary can retry it:
+                  // git and the filesystem fail for reasons that pass, and the alternative is a
+                  // turn that fails for good because one worker had a bad minute.
                   return yield* Effect.die(
-                    new Error(`could not materialize ${tip.worktree} at ${tip.tree}`),
+                    new WorktreeMaterializeError({
+                      message: `could not materialize ${tip.worktree} at ${tip.tree}`,
+                    }),
                   )
                 }),
             ),

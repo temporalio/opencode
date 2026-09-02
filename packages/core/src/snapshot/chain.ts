@@ -19,18 +19,22 @@ export interface ChainRow {
 const depths = <T extends ChainRow>(rows: readonly T[]): Map<string, number> => {
   const byID = new Map(rows.map((row) => [row.id, row]))
   const depth = new Map<string, number>()
-  const of = (row: T): number => {
-    const known = depth.get(row.id)
-    if (known !== undefined) return known
-    // Seeded before recursing, so a row that somehow names an ancestor of itself terminates here
-    // instead of running the stack out.
-    depth.set(row.id, 0)
-    const parent = row.base ? byID.get(row.base) : undefined
-    const found = parent ? of(parent as T) + 1 : 0
-    depth.set(row.id, found)
-    return found
+  // Iterative, because the chain is one link per capture and nothing prunes it: a long session
+  // would put a stack frame per tool call that changed a file.
+  for (const start of rows) {
+    if (depth.has(start.id)) continue
+    const pending: T[] = []
+    const seen = new Set<string>()
+    let at: T | undefined = start
+    while (at && !depth.has(at.id) && !seen.has(at.id)) {
+      seen.add(at.id)
+      pending.push(at)
+      at = at.base ? (byID.get(at.base) as T | undefined) : undefined
+    }
+    // A root, a row whose base is not in the store, or a cycle: all start the count at zero.
+    let below = at && depth.has(at.id) ? depth.get(at.id)! : -1
+    for (const row of pending.reverse()) depth.set(row.id, ++below)
   }
-  for (const row of rows) of(row)
   return depth
 }
 
