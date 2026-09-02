@@ -18,6 +18,7 @@ import {
   CancellationScope,
   isCancellation,
   allHandlersFinished,
+  workflowInfo,
   log,
 } from "@temporalio/workflow"
 import type { StepActivities, SteppedTurnActivities } from "./activities"
@@ -109,6 +110,9 @@ const runtime: SupervisorRuntime = {
   allHandlersFinished,
   continueAsNew: (sessionID, startWithWake) =>
     continueAsNew<typeof sessionTurn>(sessionID, { startWithWake }),
+  // The server's own read of whether this run has grown enough to roll over. The drain count alone
+  // misses it: a stepped turn is thousands of events, so a handful of drains can cross the limit.
+  historyWantsRollover: () => workflowInfo().continueAsNewSuggested,
 }
 
 // Same supervisor, different step body: wake, interrupt, idle timeout and continue-as-new are

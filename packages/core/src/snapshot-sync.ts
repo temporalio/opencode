@@ -21,7 +21,7 @@ import { AppProcess } from "./process"
 import { AbsolutePath } from "./schema"
 import type { Snapshot } from "./snapshot"
 import { SnapshotPackTable } from "./snapshot/sql"
-import { writeWorktreeTip } from "./snapshot/tip"
+import { readWorktreeTip, writeWorktreeTip } from "./snapshot/tip"
 import { Hash } from "./util/hash"
 
 export interface Interface {
@@ -62,21 +62,45 @@ const layer = Layer.effect(
         { stdin },
       )
 
+    // The newest state the store holds for this worktree.
+    const newest = () =>
+      db
+        .select()
+        .from(SnapshotPackTable)
+        .where(eq(SnapshotPackTable.worktree, worktree))
+        .orderBy(desc(SnapshotPackTable.time_created))
+        .limit(1)
+        .get()
+        .pipe(Effect.orDie)
+
     const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID) {
+      // Only a host standing on the store's newest state may add to it. One that never caught up
+      // packs its older files, becomes the newest by time, and every other host then checks that
+      // out over the work they were shipped to carry.
+      //
+      // Ahead of the note and outside the packing below, both deliberately. The note must not be
+      // moved for a ship that is not allowed, and the packing swallows its failures on purpose: a
+      // pack that does not reach the store costs the next host a rebuild from further back, where
+      // this is a host saying something untrue about the project.
+      if (source) {
+        const stoodOn = yield* readWorktreeTip(global.data, worktree)
+        const ahead = yield* newest()
+        if (ahead && ahead.tree !== tree && stoodOn !== ahead.tree) {
+          yield* Effect.die(
+            new Error(
+              `refusing to ship ${worktree}: this host stood on ${stoodOn ?? "nothing"}, ` +
+                `and the store is at ${ahead.tree}`,
+            ),
+          )
+        }
+      }
       // Noted before the packing, which is best-effort: what this host holds is true whether or not
       // the pack reaches the store, and a note left behind would let a later drain check out an
       // older tree over work only this host has.
       if (source) yield* writeWorktreeTip(global.data, worktree, tree)
       yield* Effect.gen(function* () {
         if (!source) return
-        const latest = yield* db
-          .select()
-          .from(SnapshotPackTable)
-          .where(eq(SnapshotPackTable.worktree, worktree))
-          .orderBy(desc(SnapshotPackTable.time_created))
-          .limit(1)
-          .get()
-          .pipe(Effect.orDie)
+        const latest = yield* newest()
         // The newest shipped state already is this tree: nothing to pack.
         if (latest?.tree === tree) return
         // Chain onto the previous sync commit only when this host has it; a base absent locally

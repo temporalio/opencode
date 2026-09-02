@@ -216,6 +216,71 @@ describe("WorktreeMaterializer", () => {
     }),
   )
 
+  // The write direction. A host the store has moved past used to pack its older files, become the
+  // newest by time, and every other host then checked that out over the work they were shipped to
+  // carry. This is the same rule the read direction already had, in the direction nothing checked.
+  it.live("refuses to ship from a host the store has moved past", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const root = realpathSync(tmp.path)
+      const worktree = path.join(root, "project")
+      const file = path.join(root, "shared.db")
+      yield* Effect.promise(async () => {
+        await mkdir(worktree, { recursive: true })
+        await $`git init -q ${worktree}`.quiet()
+        await $`git -C ${worktree} config user.email t@t`.quiet()
+        await $`git -C ${worktree} config user.name t`.quiet()
+        await writeFile(path.join(worktree, "f.txt"), "v1\n")
+        await $`git -C ${worktree} add .`.quiet()
+        await $`git -C ${worktree} commit -qm seed`.quiet()
+      })
+
+      const A = yield* Layer.build(captureStack(file, worktree, path.join(root, "a-data")))
+      const first = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
+      yield* SnapshotSync.Service.use((s) => s.push(first!)).pipe(Effect.provide(A))
+
+      // Another host ships while this one is not looking. Written straight into the store, because
+      // two capture stacks for one worktree resolve to the same host: the node builder keys them by
+      // location, so the second host has to be the row rather than a second stack.
+      const elsewhere = "e".repeat(40)
+      yield* Effect.sleep(10)
+      yield* Database.Service.use(({ db }) =>
+        db
+          .insert(SnapshotPackTable)
+          .values([
+            {
+              id: "d".repeat(40),
+              directory: worktree,
+              worktree,
+              tree: elsewhere,
+              pack: Buffer.from([0x50, 0x41, 0x43, 0x4b]),
+            },
+          ])
+          .run(),
+      ).pipe(Effect.orDie, Effect.provide(Database.layerFromPath(file)), Effect.scoped)
+
+      // This host is still standing on `first`, so what it holds is not built on what the store now
+      // says the project is. Shipping it would revert the other host.
+      yield* Effect.promise(() => writeFile(path.join(worktree, "f.txt"), "stale\n"))
+      const stale = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
+      const exit = yield* SnapshotSync.Service.use((s) => s.push(stale!)).pipe(
+        Effect.provide(A),
+        Effect.exit,
+      )
+      expect(exit._tag).toBe("Failure")
+
+      // Nothing was added, and the note was not moved either: a refused ship must leave this host
+      // saying what it actually holds.
+      const rows = yield* Database.Service.use(({ db }) =>
+        db.select().from(SnapshotPackTable).orderBy(asc(SnapshotPackTable.time_created)).all(),
+      ).pipe(Effect.orDie, Effect.provide(Database.layerFromPath(file)), Effect.scoped)
+      expect(rows).toHaveLength(2)
+      expect(rows[1]?.tree).toBe(elsewhere)
+
+      yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
+    }),
+  )
+
   // The shared-store deployment uses the libsql backend, so the pack blob has to survive that
   // driver's parameter path too, not only bun's.
   it.live("round-trips a pack blob through the libsql backend", () =>
