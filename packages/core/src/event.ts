@@ -188,6 +188,19 @@ export interface LayerOptions {
 /** Chosen to be well under what a person notices in a transcript while staying one cheap indexed
  * read per subscribed session. In-process commits still wake instantly; this only catches what the
  * wake cannot see, so it is worth its cost only where another process writes: see `pollingNode`. */
+// Whether the token already on the row is a later attempt of the same activity execution than the
+// one claiming. Tokens are `run:activityId:attempt`, so only the attempt is comparable: two
+// different activity ids are two different units of work and neither supersedes the other.
+const supersededBy = (held: string, claimer: string): boolean => {
+  const split = (token: string) => {
+    const cut = token.lastIndexOf(":")
+    return { head: token.slice(0, cut), attempt: Number(token.slice(cut + 1)) }
+  }
+  const a = split(held)
+  const b = split(claimer)
+  return a.head === b.head && Number.isInteger(a.attempt) && Number.isInteger(b.attempt) && a.attempt > b.attempt
+}
+
 const DEFAULT_LIVE_POLL = Duration.seconds(1)
 
 // An operator's override, in milliseconds, for either node. Read at layer build rather than at
@@ -570,13 +583,33 @@ export const layerWith = (options?: LayerOptions) =>
           .pipe(Effect.orDie)
       }
 
+      // A compare and set, not a write. Two attempts of one activity can be alive at once and they
+      // do not arrive in order: a paused attempt 1 that resumes after attempt 2 has claimed used to
+      // take the log back, and then every publish from attempt 2's tool activities died on the
+      // fence for a step that was going fine.
       function claim(aggregateID: string, ownerID: string) {
-        return db
-          .update(EventSequenceTable)
-          .set({ owner_id: ownerID })
-          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
-          .run()
-          .pipe(Effect.orDie)
+        return Effect.gen(function* () {
+          const row = yield* db
+            .select({ ownerID: EventSequenceTable.owner_id })
+            .from(EventSequenceTable)
+            .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+            .get()
+            .pipe(Effect.orDie)
+          if (row?.ownerID != null && supersededBy(row.ownerID, ownerID)) {
+            yield* Effect.die(
+              new InvalidDurableEventError({
+                type: "session.claim",
+                message: `Stale claim for aggregate ${aggregateID}: held by ${row.ownerID}, claimer ${ownerID}`,
+              }),
+            )
+          }
+          yield* db
+            .update(EventSequenceTable)
+            .set({ owner_id: ownerID })
+            .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+            .run()
+            .pipe(Effect.orDie)
+        })
       }
 
       const subscribe = <D extends Definition>(definition: D): Stream.Stream<Payload<D>> =>

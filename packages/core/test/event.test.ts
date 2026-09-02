@@ -775,6 +775,34 @@ describe("EventV2", () => {
     }),
   )
 
+  // Two attempts of one activity can be alive at once, and they do not arrive in order. A paused
+  // attempt 1 resuming after attempt 2 has claimed used to take the log back, which fenced out the
+  // tool activities of the step that was actually going.
+  it.effect("a resumed earlier attempt cannot take the log back", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
+
+      yield* events.claim(aggregateID, "run:model-1:1")
+      yield* events.claim(aggregateID, "run:model-1:2")
+      const stale = yield* events.claim(aggregateID, "run:model-1:1").pipe(Effect.exit)
+      expect(Exit.isFailure(stale)).toBe(true)
+
+      const { db } = yield* Database.Service
+      const row = yield* db
+        .select({ ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+        .get()
+      expect(row?.ownerID).toBe("run:model-1:2")
+
+      // A different activity is a different unit of work, so it still takes the log: this is the
+      // seal claiming after the model call, not a zombie.
+      yield* events.claim(aggregateID, "run:seal-1:1")
+    }),
+  )
+
   it.effect("claim fences replay owners", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
