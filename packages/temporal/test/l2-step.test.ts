@@ -35,7 +35,7 @@ const INPUT: StepDrainInput = {
   force: false,
 }
 const SEALED: StepDrainResult = { ran: true, continue: true, step: 3, promotion: "steer" }
-const call = (id: string, name = "probe_write") => ({ id, name, assistantMessageID: "msg_1" })
+const call = (id: string, name = "probe_write") => ({ id, name, input: {}, assistantMessageID: "msg_1" })
 
 const fakes = (
   model: ModelCallDrainResult,

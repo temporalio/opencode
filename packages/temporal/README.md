@@ -584,10 +584,15 @@ The rules that bound it, because checking a stored tree out over the wrong one d
   pack its older files, become the newest by time, and revert everyone. It refuses now, ahead of
   its own tip note and outside the packing (which swallows its failures on purpose, so a guard
   inside it would only have logged).
-- **A tree is moved only when this host built it from packs**, so a developer's own checkout is
-  never rewritten. That refusal fails the drain rather than warning and running anyway: a step
-  against files the store has moved past tells the model a stale tree is the project, which is
-  worse than not running.
+- **A tree is moved only when this host has a note for it**, which means this host agreed to that
+  state: it either built the tree from packs or captured the tree from there. A developer's own
+  checkout has no note, so it is never rewritten. Gating this on whether the tree carried the marker
+  a rebuild writes was wrong in the other direction: a host that seeded the session from its own
+  checkout never has that marker, so once anyone else shipped, every activity that host drew failed
+  for good.
+- **The tip note is written after the insert, never before.** The packing swallows its own failures,
+  so a note written first and an insert that then failed named a tree the store never saw: the host
+  was behind nothing it could see, and every later ship from it was refused.
 - **A tool ships from the host that ran it.** The seal can land anywhere, and it used to be the only
   thing that captured, so a tool's writes reached the store only when the seal happened to be on
   the same host.

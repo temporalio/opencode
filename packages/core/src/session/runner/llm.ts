@@ -319,7 +319,7 @@ const layer = Layer.effect(
             // the
             // stream does and the overlap between the model and its tools is lost.
             if (deferTools) {
-              deferred.push({ id: event.id, name: event.name, assistantMessageID })
+              deferred.push({ id: event.id, name: event.name, input: event.input, assistantMessageID })
               return
             }
             yield* Effect.uninterruptibleMask((restore) =>
@@ -813,9 +813,7 @@ const layer = Layer.effect(
         assistantMessageID,
         callID: input.call.id,
         tool: input.call.name,
-        // Off the recorded call, not off the hand-off: the arguments are already in the log and
-        // sending them through history a second time is what makes a big step unrunnable.
-        input: record(part.state.input),
+        input: record(input.call.input),
         // Deferred calls are never provider-executed: those are filtered out before the hand-off.
         provider: { executed: false },
       })
@@ -827,7 +825,7 @@ const layer = Layer.effect(
           call: LLMEvent.toolCall({
             id: input.call.id,
             name: input.call.name,
-            input: part.state.input,
+            input: input.call.input,
           }),
         })
         .pipe(
