@@ -66,6 +66,9 @@ const layer = Layer.effect(
     // override as a workflow argument.
     const IDLE_TIMEOUT = config.idleTimeout
     const STEPPED = config.stepped === true
+    // Only the client can read whether the store is shared, so whether a step's tools may overlap
+    // is decided here and rides the workflow input.
+    const SERIAL_TOOLS = config.serialTools === true
     const AFFINITY = config.worktreeAffinity === true
     // The tree this process serves when affinity is on. A serve process with an embedded worker is
     // already sitting in it, so the process directory is the right default.
@@ -178,6 +181,7 @@ const layer = Layer.effect(
                 startWithWake: true,
                 idleTimeout: IDLE_TIMEOUT,
                 stepped: STEPPED,
+                serialTools: SERIAL_TOOLS,
               } satisfies WF.SessionTurnOptions,
             ],
             signal: WF.wake,
@@ -247,6 +251,7 @@ const layer = Layer.effect(
                       startWithWake: false,
                       idleTimeout: IDLE_TIMEOUT,
                       stepped: STEPPED,
+                      serialTools: SERIAL_TOOLS,
                     } satisfies WF.SessionTurnOptions,
                   ],
                   workflowIdConflictPolicy: "USE_EXISTING",

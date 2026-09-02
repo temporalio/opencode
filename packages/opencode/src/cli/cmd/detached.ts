@@ -164,47 +164,76 @@ export const SessionWatchCommand = cmd({
   handler: async (args) => {
     const r = remote(args)
     const sessionID = args.sessionID
+
+    // A step ending is where a turn usually ends, from the model's own finish reason: `tool-calls`
+    // is the one that means another step follows. It is not on its own proof the turn is over,
+    // because a steer or a queued prompt continues it, so the executor's own answer decides.
+    const looksDone = (event: { type?: string; data?: any }) =>
+      event.type === "session.next.step.failed" ||
+      (event.type === "session.next.step.ended" && event.data?.finish !== "tool-calls")
+
+    // The running set cannot end a `watch` on its own, because a session stays in it while the
+    // supervisor waits out its idle timeout. It can say the opposite: still there means the turn
+    // did not stop, so a step that ended into a steer is not the end.
+    const stillRunning = async () => {
+      const active = await call<Record<string, unknown>>(r, "/session/active").catch(() => undefined)
+      // Unreachable is not finished, which is the whole point of this command.
+      return active === undefined || sessionID in active
+    }
+
+    // The stream ends when the serve this is attached to restarts, which is the event this command
+    // exists for. Exiting 0 there reports a turn that is still running as done.
+    const attempts = 30
     try {
-      const response = await fetch(`${r.url}/api/session/${sessionID}/event`, { headers: r.headers })
-      if (!response.ok || !response.body) throw new Error(`cannot follow ${sessionID}: ${response.status}`)
-
-      // Where a turn ends, from the model's own finish reason: `tool-calls` is the one that means
-      // another step follows. The running-session set cannot answer this, because a session stays
-      // in it while its supervisor waits out the idle timeout with nothing left to do.
-      const turnOver = (event: { type?: string; data?: any }) =>
-        event.type === "session.next.step.failed" ||
-        (event.type === "session.next.step.ended" && event.data?.finish !== "tool-calls")
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ""
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split("\n")
-        buffer = lines.pop() ?? ""
-        for (const raw of lines) {
-          const line = raw.startsWith("data:") ? raw.slice(5).trim() : raw.trim()
-          if (!line.startsWith("{")) continue
-          let event: { type?: string; data?: any }
-          try {
-            event = JSON.parse(line)
-          } catch {
-            continue
-          }
-          if (args.json) {
-            emit(line)
-          } else {
-            const render = event.type ? INTERESTING[event.type] : undefined
-            const text = render?.(event.data ?? {})
-            if (text) UI.println(`${stamp(event.data?.timestamp)}  ${text}`)
-          }
-          if (args.wait && turnOver(event)) {
-            await reader.cancel().catch(() => {})
-            return
-          }
+      for (let attempt = 0; ; attempt++) {
+        const response = await fetch(`${r.url}/api/session/${sessionID}/event`, {
+          headers: r.headers,
+        }).catch(() => undefined)
+        if (!response?.ok || !response.body) {
+          if (attempt >= attempts)
+            throw new Error(`cannot follow ${sessionID}: ${response?.status ?? "unreachable"}`)
+          await new Promise((resolve) => setTimeout(resolve, 1000))
+          continue
         }
+
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ""
+        let ended = false
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split("\n")
+          buffer = lines.pop() ?? ""
+          for (const raw of lines) {
+            const line = raw.startsWith("data:") ? raw.slice(5).trim() : raw.trim()
+            if (!line.startsWith("{")) continue
+            let event: { type?: string; data?: any }
+            try {
+              event = JSON.parse(line)
+            } catch {
+              continue
+            }
+            if (args.json) {
+              emit(line)
+            } else {
+              const render = event.type ? INTERESTING[event.type] : undefined
+              const text = render?.(event.data ?? {})
+              if (text) UI.println(`${stamp(event.data?.timestamp)}  ${text}`)
+            }
+            if (args.wait && looksDone(event) && !(await stillRunning())) {
+              ended = true
+              break
+            }
+          }
+          if (ended) break
+        }
+        await reader.cancel().catch(() => {})
+        if (ended) return
+        // The stream dropped with the turn still going. Reconnect and keep following.
+        if (attempt >= attempts) throw new Error(`lost the stream for ${sessionID}`)
+        await new Promise((resolve) => setTimeout(resolve, 1000))
       }
     } catch (error) {
       UI.error(error instanceof Error ? error.message : String(error))

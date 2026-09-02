@@ -56,6 +56,14 @@ export interface SteppedTurnDeps {
    * a tool, or could not keep its result, is a step's most surprising outcome and the least
    * visible: it reads as an ordinary success everywhere else. */
   readonly log?: (message: string, attributes: Record<string, unknown>) => void
+  /** Run the calls one at a time. Each tool ships the tree from the host that ran it, so two on two
+   * hosts each publish a tree without the other's work and the second is refused, leaving its work
+   * stranded there. Serial is what moving files between hosts costs. */
+  readonly serial?: boolean
+  /** Run something where the driver's cancellation cannot reach it. An interrupt landing during the
+   * tool phase otherwise leaves the step with no ending published at all, so a follower waiting on
+   * the turn never hears it stop. */
+  readonly nonCancellable?: <A>(fn: () => Promise<A>) => Promise<A>
 }
 
 /**
@@ -64,7 +72,7 @@ export interface SteppedTurnDeps {
  * of a whole-step activity.
  */
 export const makeSteppedTurn =
-  ({ activities, isCancellation, isHalt, log }: SteppedTurnDeps) =>
+  ({ activities, isCancellation, isHalt, log, serial, nonCancellable }: SteppedTurnDeps) =>
   async (input: StepDrainInput): Promise<StepDrainResult> => {
     const model = await activities.runModelCall(input)
     // A crashed step finalized from the log, or the recovery gate finding no work: the step is over
@@ -74,14 +82,51 @@ export const makeSteppedTurn =
     // Each call is its own unit of work. A tool that fails outright does not take the turn with it:
     // the seal closes its call as an error and the model gets to react, which is better than losing
     // the step. A cancel and a user halt are different, and both have to propagate.
-    const dispatched = await Promise.allSettled(
-      model.calls.map((call) =>
-        activities.runToolCall({ sessionID: input.sessionID, call, owner: model.owner }),
-      ),
-    )
+    const dispatch = (call: (typeof model.calls)[number]) =>
+      activities.runToolCall({ sessionID: input.sessionID, call, owner: model.owner })
+    const dispatched: PromiseSettledResult<ToolCallDrainResult>[] = []
+    if (serial) {
+      // One at a time, and still settled rather than thrown, so a tool that fails does not take the
+      // rest of the batch with it. The loop keeps going: the seal closes each call and the model
+      // reacts to what it is told.
+      for (const call of model.calls) {
+        dispatched.push(
+          await dispatch(call).then(
+            (value) => ({ status: "fulfilled", value }) as const,
+            (reason) => ({ status: "rejected", reason }) as const,
+          ),
+        )
+      }
+    } else {
+      dispatched.push(...(await Promise.allSettled(model.calls.map(dispatch))))
+    }
+    const seal = (needsContinuation: boolean | undefined) =>
+      activities.sealStep({
+        sessionID: input.sessionID,
+        step: model.step,
+        settlement: model.settlement,
+        assistantMessageID: model.assistantMessageID,
+        needsContinuation,
+        owner: model.owner,
+      })
+
     for (const outcome of dispatched) {
       if (outcome.status !== "rejected") continue
-      if (isCancellation(outcome.reason) || isHalt(outcome.reason)) throw outcome.reason
+      if (isCancellation(outcome.reason) || isHalt(outcome.reason)) {
+        // Seal on the way out, out of reach of the cancellation, so the calls that did return keep
+        // their results and the step is recorded as ended. Without it a stop landing during the
+        // tools publishes no step event at all: the interrupt is only visible during the model
+        // call, and a follower waiting on the turn hangs.
+        //
+        // Explicitly with no continuation. Letting the seal decide is what once carried the agent
+        // on past a declined permission, because it re-derived "keep going" from the tool parts.
+        // The reason the turn is stopping is rethrown either way, and a seal that fails here must
+        // not replace it.
+        await (nonCancellable ?? ((fn: () => Promise<unknown>) => fn()))(() => seal(false)).catch(
+          (err) => log?.("could not seal an interrupted step", { step: model.step, error: String(err) }),
+        )
+        throw outcome.reason
+      }
     }
 
     // A dispatch that settled its call needs no telling. The rest are what an operator is looking
@@ -100,12 +145,5 @@ export const makeSteppedTurn =
     if (unsettled.length > 0)
       log?.("step did not settle every call it dispatched", { step: model.step, calls: unsettled })
 
-    return activities.sealStep({
-      sessionID: input.sessionID,
-      step: model.step,
-      settlement: model.settlement,
-      assistantMessageID: model.assistantMessageID,
-      needsContinuation: model.needsContinuation,
-      owner: model.owner,
-    })
+    return seal(model.needsContinuation)
   }

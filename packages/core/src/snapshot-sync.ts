@@ -21,6 +21,7 @@ import { AppProcess } from "./process"
 import { AbsolutePath } from "./schema"
 import type { Snapshot } from "./snapshot"
 import { SnapshotPackTable } from "./snapshot/sql"
+import { chainHead } from "./snapshot/chain"
 import { readWorktreeTip, writeWorktreeTip } from "./snapshot/tip"
 import { Hash } from "./util/hash"
 
@@ -62,16 +63,15 @@ const layer = Layer.effect(
         { stdin },
       )
 
-    // The newest state the store holds for this worktree.
+    // The newest state the store holds for this worktree, read off the chain the packs form rather
+    // than off `time_created`, which is whichever host wrote the row.
     const newest = () =>
       db
         .select()
         .from(SnapshotPackTable)
         .where(eq(SnapshotPackTable.worktree, worktree))
-        .orderBy(desc(SnapshotPackTable.time_created))
-        .limit(1)
-        .get()
-        .pipe(Effect.orDie)
+        .all()
+        .pipe(Effect.orDie, Effect.map(chainHead))
 
     const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID) {
       // Only a host standing on the store's newest state may add to it. One that never caught up

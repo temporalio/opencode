@@ -39,10 +39,16 @@ export interface StepResult {
 /** A tool call the provider asked for, recorded but not run, handed to the caller to dispatch.
  * Every id comes from the provider or the publisher and is carried, never regenerated: a second run
  * of the same step would mint different ones and the results would not match the log. */
+/** A call the model asked for, handed to whoever will run it.
+ *
+ * Deliberately without the arguments. This crosses a durable boundary twice, once as the model
+ * call's result and once as the tool call's input, so carrying them puts every `write` body and
+ * every `edit` string into history twice over. A large step could pass the payload limit, and the
+ * retry re-streams and re-pays the model call for a result that is rejected the same way. The
+ * dispatch reads them off the recorded call instead, which is where they already are. */
 export interface DeferredToolCall {
   readonly id: string
   readonly name: string
-  readonly input: unknown
   readonly assistantMessageID: string
 }
 
