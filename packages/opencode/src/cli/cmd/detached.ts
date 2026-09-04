@@ -191,6 +191,11 @@ export const SessionWatchCommand = cmd({
     const r = remote(args)
     const sessionID = args.sessionID
 
+    // The turn saying so itself, which is the only thing that knows: a step ending is not a turn
+    // ending, because a steer or a queued prompt continues the same turn. It covers the ordinary
+    // ending only, so the reasons below are still what a stopped or failed turn ends this on.
+    const turnEnded = (event: { type?: string }) => event.type === "session.next.turn.ended"
+
     // A step ending is where a turn usually ends, from the model's own finish reason: `tool-calls`
     // is the one that means another step follows. It is not on its own proof the turn is over,
     // because a steer or a queued prompt continues it, so the executor's own answer decides.
@@ -292,6 +297,12 @@ export const SessionWatchCommand = cmd({
               if (text) UI.println(`${stamp(event.data?.timestamp)}  ${text}`)
             }
             if (args.wait) {
+              // The turn saying it is over ends this now: there is nothing to wait out, and the
+              // grace window exists only because nothing used to say it.
+              if (turnEnded(event)) {
+                ended = true
+                break
+              }
               if (carriesOn(event)) settleAt = undefined
               else if (looksDone(event)) settleAt = Date.now() + GRACE_MS
             }
