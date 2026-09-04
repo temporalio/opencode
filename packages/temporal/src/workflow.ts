@@ -22,7 +22,7 @@ import {
   log,
 } from "@temporalio/workflow"
 import type { StepActivities, SteppedTurnActivities } from "./activities"
-import { isHaltFailure, makeSteppedTurn } from "./l2-step"
+import { isHaltFailure, isUnclaimedFailure, makeSteppedTurn } from "./l2-step"
 import { SIGNALS, RESUME_UPDATE } from "./protocol"
 import { makeSupervisor, type SupervisorRuntime } from "./supervisor"
 
@@ -47,9 +47,29 @@ const { runTurnStep } = proxyActivities<StepActivities>(activityOptions)
 const { runModelCall } = proxyActivities<SteppedTurnActivities>(activityOptions)
 const { runToolCall } = proxyActivities<SteppedTurnActivities>(activityOptions)
 // Sealing is a snapshot, a diff and one event. It should not inherit a turn-sized backstop.
-const { sealStep } = proxyActivities<SteppedTurnActivities>({
-  ...activityOptions,
-  startToCloseTimeout: "10 minutes",
+const sealOptions = { ...activityOptions, startToCloseTimeout: "10 minutes" } as const
+const { sealStep } = proxyActivities<SteppedTurnActivities>(sealOptions)
+
+// How long a pinned activity waits for the worker that ran the model call to take it. It is polling
+// its own queue, so this is the time to notice it is gone rather than a queueing delay: nobody else
+// can take the work while it stands. Long enough to ride out a restart, short enough that a dead
+// worker does not hold the step for a noticeable part of a turn.
+const PINNED_SCHEDULE_TO_START = "30 seconds"
+
+/** The same two activities, addressed to one worker's own queue. Built per queue rather than once,
+ * because the queue is not known until the model call reports it; that report comes out of history,
+ * so this is deterministic on replay. */
+const pinnedTo = (taskQueue: string) => ({
+  runToolCall: proxyActivities<SteppedTurnActivities>({
+    ...activityOptions,
+    taskQueue,
+    scheduleToStartTimeout: PINNED_SCHEDULE_TO_START,
+  }).runToolCall,
+  sealStep: proxyActivities<SteppedTurnActivities>({
+    ...sealOptions,
+    taskQueue,
+    scheduleToStartTimeout: PINNED_SCHEDULE_TO_START,
+  }).sealStep,
 })
 
 export const wake = defineSignal(SIGNALS.wake)
@@ -124,6 +144,8 @@ const steppedRuntime = (serial: boolean): SupervisorRuntime => ({
     activities: { runModelCall, runToolCall, sealStep },
     isCancellation,
     isHalt: isHaltFailure,
+    isUnclaimed: isUnclaimedFailure,
+    pinnedTo,
     serial,
     nonCancellable: (fn) => CancellationScope.nonCancellable(fn),
     // The SDK's logger, so a line carries its workflow and run id and is suppressed on replay.

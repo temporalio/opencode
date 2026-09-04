@@ -39,6 +39,11 @@ export type ModelCallDrainResult =
       /** The event-log token this attempt claimed. The tool and seal activities of this step must
        * publish under it, so it travels with the calls instead of being minted again. */
       readonly owner: string
+      /** The queue this worker polls on its own, when it has one. The tools of this step write the
+       * tree this worker is standing in, so sending them here keeps them on it. Absent when the
+       * worker was not given a queue of its own, and never required: the step falls back to the
+       * shared queue and the tree is rebuilt there. */
+      readonly queue?: string
     }
 
 export interface ToolCallDrainInput {
@@ -66,9 +71,12 @@ export interface L2DrainDeps {
   readonly ctx: Context.Context<SessionStore.Service | LocationServiceMap.Service>
   readonly events: EventV2.Interface
   readonly worktrees: WorktreeMaterializer.Interface
+  /** The queue this worker polls on its own, reported by the model call so the rest of the step can
+   * be sent back to it. Absent when the worker has none. */
+  readonly stepQueue?: string
 }
 
-export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2DrainDeps) => {
+export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQueue }: L2DrainDeps) => {
   // One session, one owner, a present project tree. `claim` is true only for the model call: it is
   // the writer that supersedes a previous attempt, and the rest of the step rides its token.
   const inSession = <A>(
@@ -135,6 +143,7 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
                     assistantMessageID: result.assistantMessageID,
                     needsContinuation: result.needsContinuation,
                     owner: input.owner,
+                    ...(stepQueue === undefined ? {} : { queue: stepQueue }),
                   },
         ),
       ),

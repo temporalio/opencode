@@ -52,6 +52,7 @@ import { DEFAULT_MAX_STEPS, REPEAT_LIMIT, REPEATED_CALLS_PROMPT, trailingIdentic
 import { Snapshot } from "../../snapshot"
 import { SnapshotSync } from "../../snapshot-sync"
 import { makeLocationNode } from "../../effect/app-node"
+import { KeyedMutex } from "../../effect/keyed-mutex"
 import { llmClient } from "../../effect/app-node-platform"
 
 /**
@@ -107,6 +108,13 @@ import { llmClient } from "../../effect/app-node-platform"
  * explicit loop starts the next provider turn after local settlement. Configured agent step limits
  * bound the loop.
  */
+
+// Shipping the tree, one at a time per directory. Two tools of one step run at once and both end by
+// capturing and pushing: a capture writes the git index and a push compares against the store's
+// head, so two of them in one directory race on both, and the loser's work is refused rather than
+// shipped. Module-level, because what has to be excluded is two activities in one process, and each
+// builds its own runner.
+const shipping = KeyedMutex.makeUnsafe<string>()
 
 const layer = Layer.effect(
   Service,
@@ -887,8 +895,12 @@ const layer = Layer.effect(
       // did. The seal can land anywhere, and a capture there would ship a tree that never saw this
       // write. Best effort in the same sense the seal's is: the result is already durable, and a
       // pack that does not reach the store costs the next host a rebuild from further back.
-      const afterTool = yield* snapshots.capture().pipe(Effect.catch(() => Effect.succeed(undefined)))
-      if (afterTool) yield* snapshotSync.push(afterTool)
+      yield* shipping.withLock(location.directory)(
+        Effect.gen(function* () {
+          const afterTool = yield* snapshots.capture().pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (afterTool) yield* snapshotSync.push(afterTool)
+        }),
+      )
       return { outcome: "settled" } as ToolCallResult
     })
 

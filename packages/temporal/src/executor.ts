@@ -1,6 +1,7 @@
 export * as SessionExecutionTemporal from "./executor"
 
 import { fileURLToPath } from "node:url"
+import { hostname } from "node:os"
 import { Effect, Layer, Option } from "effect"
 import { Client, Connection, WithStartWorkflowOperation } from "@temporalio/client"
 // Imported lazily inside the worker branch: the worker package drags webpack and swc (it bundles
@@ -16,7 +17,7 @@ import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { makeStepActivities, makeSteppedTurnActivities } from "./activities"
 import { makeDrains } from "./drain"
 import { makeL2Drains } from "./l2-drain"
-import { queueForWorktree } from "./queue"
+import { queueForWorktree, queueForWorker } from "./queue"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { eq } from "drizzle-orm"
@@ -76,6 +77,13 @@ const layer = Layer.effect(
     // Which queue a worker polls. With affinity off this is the one shared queue and any worker can
     // draw any session, rebuilding the tree if it has to.
     const POLL_QUEUE = AFFINITY ? queueForWorktree(TASK_QUEUE, SERVED_WORKTREE) : TASK_QUEUE
+    // The queue this worker polls on its own, so a step can be sent back to it. Keyed by host as
+    // well as directory: two containers serve `/project` and share none of it. Only workers have
+    // one, and only they report it, so a client-only process never pins a step to itself.
+    const STEP_QUEUE =
+      HOST_WORKER && config.stepAffinity !== false
+        ? queueForWorker(TASK_QUEUE, hostname(), SERVED_WORKTREE)
+        : undefined
     // Which queue a session's workflow runs on. Keyed on the PROJECT worktree, not the session's
     // directory: `worktrees.ensure` rebuilds the project tree, so keying on the directory a session
     // happened to start in would split one physical tree across a queue per subdirectory, and a
@@ -102,7 +110,7 @@ const layer = Layer.effect(
     const { stepDrain } = makeDrains({ store, locations, ctx, events, worktrees })
     // The stepped mode's three drains. Registered unconditionally: which mode a session runs is a
     // property of its workflow input, so a worker has to be able to serve either.
-    const l2 = makeL2Drains({ store, locations, ctx, events, worktrees })
+    const l2 = makeL2Drains({ store, locations, ctx, events, worktrees, stepQueue: STEP_QUEUE })
 
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
@@ -138,6 +146,29 @@ const layer = Layer.effect(
           await runHandle.catch(() => {})
         }),
       )
+
+      // A second poller, on this worker's own queue, for the steps pinned to it. Activities only:
+      // the workflow runs wherever it was started, and only the work that has to come back here is
+      // addressed here. Without it a pin has nobody to answer it and every step pays the
+      // schedule-to-start wait before falling back.
+      if (STEP_QUEUE) {
+        const pinnedWorker = yield* Effect.promise(() =>
+          Worker.create({
+            connection: nativeConn,
+            namespace: NAMESPACE,
+            taskQueue: STEP_QUEUE,
+            activities: { ...makeStepActivities(stepDrain), ...makeSteppedTurnActivities(l2) },
+          }),
+        )
+        const pinnedHandle = pinnedWorker.run()
+        pinnedHandle.catch(() => {})
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(async () => {
+            pinnedWorker.shutdown()
+            await pinnedHandle.catch(() => {})
+          }),
+        )
+      }
     }
 
     // Worker-only process: it hosts activities but drives no workflows, so the client methods are
