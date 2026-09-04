@@ -141,12 +141,22 @@ export const preflight = (config: Interface): string[] => {
     problems.push("an API key is set but TEMPORAL_NAMESPACE is `default`, which is not a Cloud namespace")
   if (!!process.env.OPENCODE_TEMPORAL_TLS_CERT !== !!process.env.OPENCODE_TEMPORAL_TLS_KEY)
     problems.push("OPENCODE_TEMPORAL_TLS_CERT and OPENCODE_TEMPORAL_TLS_KEY come as a pair")
-  if (!LOOPBACK.test(config.address) && !config.apiKey && !config.tls)
-    problems.push(
-      `TEMPORAL_ADDRESS is ${config.address} with no credentials: set OPENCODE_TEMPORAL_API_KEY ` +
-        "for Cloud, or OPENCODE_TEMPORAL_TLS_CERT and OPENCODE_TEMPORAL_TLS_KEY for mTLS",
-    )
   return problems
+}
+
+/**
+ * Worth saying, not worth refusing. Only what cannot work belongs in `preflight`, because a process
+ * that exits takes a deployment with it, and plaintext to an address that is not loopback is a
+ * private network in most deployments and a mistake in some. Nothing here can tell which.
+ */
+export const notes = (config: Interface): string[] => {
+  const said: string[] = []
+  if (!LOOPBACK.test(config.address) && !config.apiKey && !config.tls)
+    said.push(
+      `reaching ${config.address} in plaintext. For Temporal Cloud set OPENCODE_TEMPORAL_API_KEY; ` +
+        "for a cluster with mTLS set OPENCODE_TEMPORAL_TLS_CERT and OPENCODE_TEMPORAL_TLS_KEY",
+    )
+  return said
 }
 
 /** Every setting that decides how this process behaves, and nothing that is a credential. */
