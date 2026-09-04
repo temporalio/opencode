@@ -177,12 +177,27 @@ export const SessionWatchCommand = cmd({
     const carriesOn = (event: { type?: string }) =>
       event.type === "session.next.step.started" || event.type === "session.next.prompted"
 
-    // The running set cannot end a `watch`. It holds a session for the whole idle timeout after the
-    // work is done, so gating the exit on it means never exiting. Nothing publishes a turn-level
-    // ending either, so what is left is the wire going quiet: a terminal step, then no continuation
-    // within a grace window. A steer arrives in milliseconds, so the window only has to outlast the
-    // hop between two activities.
+    // The running set cannot end a `watch` on its own. It holds a session for the whole idle
+    // timeout after the work is done, so gating the exit on it means never exiting. Nothing
+    // publishes a turn-level ending either, so what usually ends this is the wire going quiet: a
+    // terminal step, then no continuation within a grace window. A steer arrives in milliseconds,
+    // so the window only has to outlast the hop between two activities.
     const GRACE_MS = Number(process.env.OPENCODE_WATCH_GRACE_MS ?? 5_000)
+    // The wire cannot answer the other case. A turn that ends while this is reconnecting publishes
+    // its last step into a gap, and the stream has no replay, so nothing arrives afterwards and the
+    // quiet means nothing. Absence from the running set is slow but certain, and it is the one
+    // reading that only ever says "finished", so it can end a watch without being able to hang one.
+    const POLL_MS = Number(process.env.OPENCODE_WATCH_POLL_MS ?? 30_000)
+    const inactive = async () => {
+      const active = await call<Record<string, unknown>>(r, "/session/active").catch(() => undefined)
+      // Unreachable is not finished, which is the whole point of this command.
+      return active !== undefined && !(sessionID in active)
+    }
+
+    // Kept across reconnects. The terminal step lands on one connection and the quiet that follows
+    // it on the next, and starting this again per connection is what followed a finished turn for
+    // as long as the terminal stayed open.
+    let settleAt: number | undefined
 
     // The stream ends when the serve this is attached to restarts, which is the event this command
     // exists for. Exiting 0 there reports a turn that is still running as done.
@@ -203,21 +218,32 @@ export const SessionWatchCommand = cmd({
         const decoder = new TextDecoder()
         let buffer = ""
         let ended = false
-        // Set by a terminal step, cleared by anything that shows the turn carrying on.
-        let settling = false
+        // Held across iterations rather than started fresh each time: a read that loses the race is
+        // still queued on the stream, and dropping it drops whatever it goes on to deliver.
+        let pending: ReturnType<typeof reader.read> | undefined
         for (;;) {
-          const next = reader.read()
-          const chunk = settling
+          const next = (pending ??= reader.read())
+          let timer: ReturnType<typeof setTimeout> | undefined
+          const chunk = args.wait
             ? await Promise.race([
                 next,
-                new Promise<"quiet">((resolve) => setTimeout(() => resolve("quiet"), GRACE_MS)),
+                new Promise<"quiet">((resolve) => {
+                  const wait = settleAt ? Math.max(0, settleAt - Date.now()) : POLL_MS
+                  timer = setTimeout(() => resolve("quiet"), wait)
+                }),
               ])
             : await next
-          // A terminal step and then nothing: the turn is over.
+          if (timer) clearTimeout(timer)
           if (chunk === "quiet") {
-            ended = true
-            break
+            // A terminal step and then nothing: the turn is over. Otherwise this is the periodic
+            // ask, and only the running set can end the wait.
+            if ((settleAt && Date.now() >= settleAt) || (await inactive())) {
+              ended = true
+              break
+            }
+            continue
           }
+          pending = undefined
           const { done, value } = chunk
           if (done) break
           buffer += decoder.decode(value, { stream: true })
@@ -240,13 +266,14 @@ export const SessionWatchCommand = cmd({
               if (text) UI.println(`${stamp(event.data?.timestamp)}  ${text}`)
             }
             if (args.wait) {
-              if (carriesOn(event)) settling = false
-              else if (looksDone(event)) settling = true
+              if (carriesOn(event)) settleAt = undefined
+              else if (looksDone(event)) settleAt = Date.now() + GRACE_MS
             }
           }
         }
         await reader.cancel().catch(() => {})
-        if (ended) return
+        // Without `--wait` the stream itself is the whole command, so its end is this one's too.
+        if (ended || !args.wait) return
         // The stream dropped with the turn still going. Reconnect and keep following.
         if (attempt >= attempts) throw new Error(`lost the stream for ${sessionID}`)
         await new Promise((resolve) => setTimeout(resolve, 1000))
