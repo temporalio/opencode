@@ -4,6 +4,7 @@ import { cmd } from "./cmd"
 import {
   SessionDoctorCommand,
   SessionRunningCommand,
+  SessionScheduleCommand,
   SessionStartCommand,
   SessionWatchCommand,
 } from "./detached"
@@ -57,6 +58,7 @@ export const SessionCommand = cmd({
       .command(SessionStartCommand)
       .command(SessionRunningCommand)
       .command(SessionWatchCommand)
+      .command(SessionScheduleCommand)
       .command(SessionDoctorCommand)
       .demandCommand(),
   async handler() {},
