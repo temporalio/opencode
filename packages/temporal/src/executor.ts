@@ -102,6 +102,12 @@ const layer = Layer.effect(
             return project ? queueForWorktree(TASK_QUEUE, project.worktree) : TASK_QUEUE
           })
         : Effect.succeed(TASK_QUEUE)
+    // Before anything is accepted, not after: every one of these fails as something else later, and
+    // the failure lands on whoever prompted the session rather than on whoever deployed it.
+    const problems = TemporalConfig.preflight(config)
+    for (const problem of problems) yield* Effect.logError(`configuration: ${problem}`)
+    if (problems.length > 0) yield* Effect.die(`this deployment cannot serve sessions: ${problems[0]}`)
+
     const events = yield* EventV2.Service
     const worktrees = yield* WorktreeMaterializer.Service
 
@@ -126,7 +132,7 @@ const layer = Layer.effect(
         ),
       )
       const nativeConn = yield* Effect.acquireRelease(
-        Effect.promise(() => NativeConnection.connect({ address: ADDRESS })),
+        Effect.promise(() => NativeConnection.connect(TemporalConfig.connectionOptions(config))),
         (conn) => Effect.promise(() => conn.close().catch(() => {})),
       )
       const worker = yield* Effect.promise(() =>
@@ -195,7 +201,7 @@ const layer = Layer.effect(
 
     // Client connection drives the per-session workflows.
     const clientConn = yield* Effect.acquireRelease(
-      Effect.promise(() => Connection.connect({ address: ADDRESS })),
+      Effect.promise(() => Connection.connect(TemporalConfig.connectionOptions(config))),
       (conn) => Effect.promise(() => conn.close().catch(() => {})),
     )
     const client = new Client({ connection: clientConn, namespace: NAMESPACE })

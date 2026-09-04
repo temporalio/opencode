@@ -457,6 +457,47 @@ later. Verified by `packages/core/test/session-runner-resume.test.ts`.
 Resume is verified end to end: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
 
+### Picking a deployment rather than assembling one
+
+The settings below are not independent, and getting them wrong fails as something else later: a
+store only one process can see reads as a worker that never picks anything up. `OPENCODE_TEMPORAL_PROFILE`
+picks one deployment and the rest follow.
+
+| | `local` (default) | `fleet` |
+|---|---|---|
+| what it is | one serve, worker inside it | serve processes and workers, separate |
+| store | this process only | **you set** `OPENCODE_DB_URL` |
+| role | `both` | `client` for serve, `worker` for workers |
+| unit of work | a whole step | the model call, each tool call, the seal |
+
+Anything can still be set on its own; the profile decides only what it is when you do not. A fleet
+cannot be talked out of the two that make it one, and a process that fails preflight refuses to
+build rather than accepting work it cannot do.
+
+Reaching a server that is not the dev server:
+
+```bash
+TEMPORAL_ADDRESS=your-ns.a1b2c.tmprl.cloud:7233 TEMPORAL_NAMESPACE=your-ns.a1b2c \
+  OPENCODE_TEMPORAL_API_KEY_FILE=/run/secrets/temporal-key     # Temporal Cloud
+TEMPORAL_ADDRESS=temporal.internal:7233 \
+  OPENCODE_TEMPORAL_TLS_CERT=/run/secrets/tls.crt \
+  OPENCODE_TEMPORAL_TLS_KEY=/run/secrets/tls.key               # a cluster with mTLS
+```
+
+The key comes from a file rather than from argv, and nothing prints it. Both halves build the
+connection from one function, so a client and a worker cannot disagree about how the cluster is
+reached.
+
+Ask before deploying rather than after:
+
+```bash
+opencode session doctor
+```
+
+It prints what this process resolved and names what is wrong: an API key against a dev server, a
+Cloud key with the `default` namespace, an address that is not loopback with no credentials, half a
+certificate pair, a fleet with a store nobody else can read.
+
 ### Running workers separately
 
 By default the serve process hosts both the Temporal activity worker and the workflow client
