@@ -312,7 +312,7 @@ const layer = Layer.effect(
             // the
             // stream does and the overlap between the model and its tools is lost.
             if (deferTools) {
-              deferred.push({ id: event.id, name: event.name, input: event.input, assistantMessageID })
+              deferred.push({ id: event.id, name: event.name, assistantMessageID })
               return
             }
             yield* Effect.uninterruptibleMask((restore) =>
@@ -797,6 +797,24 @@ const layer = Layer.effect(
         })
         return { outcome: "unknown" } as ToolCallResult
       }
+      // The arguments, off the log rather than off the hand-off. A pending call holds the provider's
+      // raw JSON text, which is what the stream delivered; a re-dispatch of a running one reads the
+      // object the first dispatch recorded. A defect either way if the text is not JSON, because
+      // only the recording path could have written that, and a tool handed a string it cannot parse
+      // reports a wrong reason to the model.
+      const recorded = part.state
+      const args =
+        recorded.status === "pending"
+          ? yield* Effect.try({
+              try: () => JSON.parse(recorded.input) as unknown,
+              catch: () =>
+                new Error(
+                  recorded.input === ""
+                    ? `Tool call ${input.call.id} has no recorded input to run it with`
+                    : `Tool call ${input.call.id} has a recorded input that is not JSON`,
+                ),
+            }).pipe(Effect.orDie)
+          : recorded.input
       // The durable record that this call is being run, published before the tool can do anything.
       // It is also the last point a fenced dispatch dies at: under a superseded owner this publish
       // fails and the tool never runs, instead of running and losing its result.
@@ -806,7 +824,7 @@ const layer = Layer.effect(
         assistantMessageID,
         callID: input.call.id,
         tool: input.call.name,
-        input: record(input.call.input),
+        input: record(args),
         // Deferred calls are never provider-executed: those are filtered out before the hand-off.
         provider: { executed: false },
       })
@@ -818,7 +836,7 @@ const layer = Layer.effect(
           call: LLMEvent.toolCall({
             id: input.call.id,
             name: input.call.name,
-            input: input.call.input,
+            input: args,
           }),
         })
         .pipe(

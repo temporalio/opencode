@@ -124,6 +124,27 @@ const callsCrashingIdempotentTool: LLMClientShape["stream"] = () =>
     LLMEvent.toolCall({ id: "call_probe", name: "probe_crashes_read", input: {} }),
     LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
   ])
+// The two shapes a provider delivers arguments in, against a tool that actually wants some. The
+// hand-off names the call and nothing else, so what the tool receives comes off the log, and both
+// shapes have to leave the same thing there. Whole first: no input deltas at all, which is what the
+// fragment buffer would otherwise record as an empty input.
+const callsEchoWhole: LLMClientShape["stream"] = () =>
+  Stream.fromIterable([
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolCall({ id: "call_probe", name: "probe_echo", input: { text: "hello" } }),
+    LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+  ])
+// Streamed, in pieces, which is what a provider that emits partial JSON does.
+const callsEchoStreamed: LLMClientShape["stream"] = () =>
+  Stream.fromIterable([
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolInputStart({ id: "call_probe", name: "probe_echo" }),
+    LLMEvent.toolInputDelta({ id: "call_probe", name: "probe_echo", text: '{"text":' }),
+    LLMEvent.toolInputDelta({ id: "call_probe", name: "probe_echo", text: '"hello"}' }),
+    LLMEvent.toolInputEnd({ id: "call_probe", name: "probe_echo" }),
+    LLMEvent.toolCall({ id: "call_probe", name: "probe_echo", input: { text: "hello" } }),
+    LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+  ])
 // A provider turn that publishes nothing at all: no text, no reasoning, no tool call. The publisher
 // mints the assistant message lazily on first content, so after this stream there is no message in
 // the log for a seal to find. The whole-step path survives it because Step.Ended mints one on the
@@ -221,9 +242,22 @@ const seedSession = Effect.gen(function* () {
 // checked against the tools themselves rather than only against the projection. The read probes
 // declare themselves repeatable; the write probes do not, which is what decides whether a second
 // dispatch runs the tool again.
-const registerProbes = (ran: { write: number; read: number }) =>
+const registerProbes = (ran: { write: number; read: number; echoed?: string }) =>
   Effect.gen(function* () {
     yield* (yield* ApplicationTools.Service).register({
+      // The one probe that wants an argument. Every other schema here is an empty struct, which
+      // accepts anything, so none of them can tell whether a tool was handed what the model asked
+      // for. This one records it.
+      probe_echo: Tool.make({
+        description: "echo probe",
+        input: Schema.Struct({ text: Schema.String }),
+        output: Schema.String,
+        execute: (args: { readonly text: string }) =>
+          Effect.sync(() => {
+            ran.echoed = args.text
+            return args.text
+          }),
+      }),
       probe_write: Tool.make({
         description: "write probe",
         input: Schema.Struct({}),
@@ -282,7 +316,7 @@ const registerProbes = (ran: { write: number; read: number }) =>
     })
   })
 
-const counters = () => ({ write: 0, read: 0 })
+const counters = () => ({ write: 0, read: 0 }) as { write: number; read: number; echoed?: string }
 
 const toolPart = (messages: ReadonlyArray<SessionMessage.Message>, callID: string) => {
   for (const message of messages) {
@@ -424,6 +458,42 @@ describe("SessionRunner tool dispatch", () => {
       expect(ran.write).toBe(1)
       const part = toolPart(yield* store.context(sessionID), "call_probe")
       expect(part?.type === "tool" ? part.state.status : undefined).toBe("completed")
+    }),
+  )
+
+  // What the hand-off no longer carries. The arguments come off the recorded call, so a dispatch
+  // that reads them wrongly hands the tool something its schema refuses, and the model spends a
+  // turn being told its own input was not an object. Every other probe here takes an empty struct,
+  // which accepts that silently.
+  harness(callsEchoWhole).effect("hands the tool the arguments the model asked with", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const call = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+
+      const result = yield* runner.runToolCall({ sessionID, call })
+
+      expect(result.outcome).toBe("settled")
+      expect(ran.echoed).toBe("hello")
+    }),
+  )
+
+  // The same call, streamed in pieces instead of delivered whole. Both shapes have to leave the
+  // arguments in the log, because the dispatcher cannot tell which one produced the call.
+  harness(callsEchoStreamed).effect("and the same when the provider streamed them", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const call = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+
+      const result = yield* runner.runToolCall({ sessionID, call })
+
+      expect(result.outcome).toBe("settled")
+      expect(ran.echoed).toBe("hello")
     }),
   )
 
