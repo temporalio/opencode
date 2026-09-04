@@ -34,9 +34,21 @@ export interface Interface {
    * Make sure the session's directory holds the newest state the shared store has for it,
    * rebuilding its worktree from stored snapshot packs when it is missing or behind. A directory
    * with no stored packs, and a tree this host has neither built nor captured from, are left
-   * alone. Never fails the caller.
+   * alone.
+   *
+   * A rebuild that fails dies with `WorktreeMaterializeError` rather than returning: running the
+   * step against whatever is in the directory tells the model those files are the project, and for
+   * a fresh host that is nothing at all. Tagged so the activity boundary retries it elsewhere.
+   *
+   * `pauseBeforeLock` waits between reading the directory and taking the lock. Zero everywhere but
+   * the check that reproduces what a concurrent drain does in that gap: nothing outside this module
+   * can hold a caller there, and what the check asserts is the real outcome, whether a failed
+   * rebuild removes a directory this call did not create.
    */
-  readonly ensure: (directory: string) => Effect.Effect<void>
+  readonly ensure: (
+    directory: string,
+    options?: { readonly pauseBeforeLock?: number },
+  ) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()(
@@ -148,7 +160,10 @@ const layer = Layer.effect(
       return isBehind(rows, held)
     })
 
-    const ensure = Effect.fn("WorktreeMaterializer.ensure")(function* (directory: string) {
+    const ensure = Effect.fn("WorktreeMaterializer.ensure")(function* (
+      directory: string,
+      options?: { readonly pauseBeforeLock?: number },
+    ) {
       // The newest capture whose session ran in this directory decides which worktree to rebuild,
       // and which state a tree that is already here has to be brought to.
       const tip = chainHead(
@@ -175,6 +190,7 @@ const layer = Layer.effect(
       // checkout never did, and once any other host shipped, every activity that host drew died
       // here. A developer's checkout is protected by having no note at all, not by the marker.
       if (present && !(yield* behind(tip))) return
+      if (options?.pauseBeforeLock) yield* Effect.sleep(options.pauseBeforeLock)
       yield* locks.withLock(tip.worktree)(
         Effect.gen(function* () {
           // Re-check inside the lock: a concurrent drain may have done this already. Same notion of
