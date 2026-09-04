@@ -659,6 +659,13 @@ worker, and serve B (which never saw the session) reports it running and replays
 Then `session start` returns without waiting, `session running` lists it, and `session watch`
 follows it live from a cold client and exits when the turn ends.
 
+How it decides that has been wrong in both directions, so it is worth stating. Nothing publishes a
+turn-level ending, and the running set holds a session for the supervisor's whole idle period, so
+neither answers the question on its own. What ends a watch is a terminal step and then a quiet wire,
+with the settling state kept across reconnects: the stream has no replay, and a turn that ends while
+the client is reconnecting publishes into a gap. Absence from the running set, asked periodically,
+is the backstop for that gap, and it is only ever allowed to end the wait, never to prolong it.
+
 The shared store is load-bearing, and the check proves it rather than assuming it: give serve B its
 own `OPENCODE_DB` and the three cross-process assertions fail (`active` returns `{}`, the replay is
 empty, the follower hangs) while the serve-A-and-worker ones still pass.
