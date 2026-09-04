@@ -13,6 +13,8 @@ import { cmd } from "./cmd"
 import { UI } from "../ui"
 import { ServerAuth } from "@/server/auth"
 import { TemporalConfig } from "@opencode-ai/temporal/config"
+// Type-only: the SDK types a duration as a template literal, and this takes one from a person.
+import type { Duration } from "@temporalio/common"
 
 const DEFAULT_URL = "http://127.0.0.1:4096"
 
@@ -125,6 +127,77 @@ export const SessionDoctorCommand = cmd({
       return
     }
     UI.println("this deployment looks consistent")
+  },
+})
+
+// A turn nobody starts. `start` still needs something running to hand the prompt to; a schedule
+// does not, which is the difference between a session you can walk away from and one that runs
+// without you. The session is created once, here, over HTTP like everything else in this file; the
+// firing itself reaches only Temporal, and a deployment with no serve process at all still runs it.
+export const SessionScheduleCommand = cmd({
+  command: "schedule <prompt>",
+  describe: "run a prompt on a schedule, with no client at firing time",
+  builder: (yargs: Argv) =>
+    remoteOptions(yargs)
+      .positional("prompt", { type: "string", describe: "what the agent should do", demandOption: true })
+      .option("every", { type: "string", describe: "interval, e.g. 1h" })
+      .option("cron", { type: "string", describe: "cron expression, e.g. '0 9 * * *'" })
+      .option("id", { type: "string", describe: "schedule id (default: generated)" })
+      .option("session", { type: "string", describe: "an existing session to prompt (default: a new one)" })
+      .option("dir", { type: "string", describe: "session working directory (default: this one)" }),
+  handler: async (args) => {
+    const r = remote(args)
+    try {
+      if (!args.every && !args.cron) throw new Error("schedule wants --every=<duration> or --cron=<expression>")
+      const sessionID =
+        args.session ??
+        (
+          await call<SessionInfo>(r, "/session", {
+            method: "POST",
+            body: JSON.stringify({ directory: args.dir ?? process.cwd() }),
+          })
+        ).id
+      const config = TemporalConfig.fromEnv()
+      const { Client, Connection, ScheduleOverlapPolicy } = await import("@temporalio/client")
+      const connection = await Connection.connect(TemporalConfig.connectionOptions(config))
+      try {
+        const client = new Client({ connection, namespace: config.namespace })
+        const scheduleId = args.id ?? `opencode-${sessionID}`
+        await client.schedule.create({
+          scheduleId,
+          spec: {
+            ...(args.cron ? { cronExpressions: [args.cron] } : {}),
+            ...(args.every ? { intervals: [{ every: args.every as Duration }] } : {}),
+          },
+          // A firing that lands while the last one is still working is skipped rather than queued.
+          // An agent task is not a metrics scrape: two of them on one project is a bad day.
+          policies: { overlap: ScheduleOverlapPolicy.SKIP },
+          action: {
+            type: "startWorkflow",
+            workflowType: "scheduledPrompt",
+            taskQueue: config.taskQueue,
+            args: [
+              {
+                sessionID,
+                text: args.prompt,
+                session: { idleTimeout: config.idleTimeout, stepped: config.stepped === true },
+              },
+            ],
+          },
+        })
+        if (args.json) {
+          emit(JSON.stringify({ schedule: scheduleId, session: sessionID }))
+          return
+        }
+        emit(scheduleId)
+        UI.println(`  every firing prompts ${sessionID}; follow it with: opencode session watch ${sessionID}`)
+      } finally {
+        await connection.close()
+      }
+    } catch (error) {
+      UI.error(error instanceof Error ? error.message : String(error))
+      process.exitCode = 1
+    }
   },
 })
 

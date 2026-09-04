@@ -148,6 +148,30 @@ grep -q "WATCHED" "$RUN/logs/watch.txt" && ok "session watch followed the turn" 
 [ "$took" -lt 100 ] && ok "session watch stopped when the turn did (${took}s)" \
   || bad "session watch stopped when the turn did" "${took}s, so it hung"
 
+# --- 6. a turn nobody starts. The schedule is a Temporal object, so at firing time there is no
+# client and no HTTP call: the workflow admits the prompt itself and starts the session's own
+# supervisor. Prompted into a fresh session so what arrives can only have come from the firing.
+sched=$(timeout 90 bun run "$OC" session schedule \
+  "Use the bash tool to run exactly: echo SCHEDULED. Then report the output." \
+  --every 10s --attach "$B" --dir "$RUN/proj" --json 2>/dev/null)
+sid3=$(printf '%s' "$sched" | sed -n 's/.*"session":"\([^"]*\)".*/\1/p')
+scheduleId=$(printf '%s' "$sched" | sed -n 's/.*"schedule":"\([^"]*\)".*/\1/p')
+[ -n "$sid3" ] && ok "session schedule created one" || bad "session schedule created one" "$sched"
+
+# Long enough for a firing plus a turn, and nothing here prompts it.
+answered=""
+for _ in $(seq 1 24); do
+  sleep 5
+  answered=$(curl -s -u "$AUTH" "$B/api/session/$sid3/message" 2>/dev/null || true)
+  case "$answered" in *SCHEDULED*) break ;; esac
+done
+case "$answered" in
+  *SCHEDULED*) ok "a firing ran a turn with no client involved" ;;
+  *) bad "a firing ran a turn with no client involved" "$(printf '%s' "$answered" | head -c 200)" ;;
+esac
+[ -n "$scheduleId" ] && temporal schedule delete --schedule-id "$scheduleId" \
+  --address "127.0.0.1:$PORT_TEMPORAL" >/dev/null 2>&1
+
 echo
 [ "$fails" -eq 0 ] && echo "detached-session-check: OK" || echo "detached-session-check: $fails failed"
 exit $([ "$fails" -eq 0 ] && echo 0 || echo 1)

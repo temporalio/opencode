@@ -19,7 +19,10 @@ import type { DeferredToolCall, ToolCallOutcome } from "@opencode-ai/core/sessio
 import type { StepSettlement } from "@opencode-ai/core/session/runner/publish-llm-event"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionStore } from "@opencode-ai/core/session/store"
-import type { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { Prompt } from "@opencode-ai/schema/prompt"
+import type { Database } from "@opencode-ai/core/database/database"
 import { runAtBoundary } from "./boundary"
 import type { StepDrainInput, StepDrainResult } from "./drain"
 
@@ -75,6 +78,41 @@ export interface L2DrainDeps {
    * be sent back to it. Absent when the worker has none. */
   readonly stepQueue?: string
 }
+
+/**
+ * Admit a prompt to a session that already exists, without waking anything.
+ *
+ * This is what a start with no client is made of. A prompt is a durable row before it is work, and
+ * writing that row needs the store, which a workflow cannot reach; waking the session is the
+ * workflow's own job (it starts or signals the session's supervisor). Separating the two is what
+ * lets a schedule fire into a deployment where nothing is running but workers.
+ *
+ * Idempotent on the message id, which the workflow derives from the firing, so a re-driven activity
+ * admits nothing twice.
+ */
+export const makeScheduleDrains = ({
+  db,
+  events,
+  ctx,
+}: {
+  readonly db: Database.Interface["db"]
+  readonly events: EventV2.Interface
+  readonly ctx: Context.Context<SessionStore.Service | LocationServiceMap.Service>
+}) => ({
+  promptDrain: async (input: { readonly sessionID: string; readonly messageID: string; readonly text: string }) =>
+    SessionInput.admit(db, events, {
+      id: SessionMessage.ID.make(input.messageID),
+      sessionID: SessionSchema.ID.make(input.sessionID),
+      prompt: Prompt.make({ text: input.text }),
+      delivery: "queue",
+    }).pipe(
+      Effect.asVoid,
+      Effect.provideService(EventV2.EventOwner, `schedule:${input.messageID}`),
+      Effect.provide(ctx),
+      Effect.scoped,
+      Effect.runPromise,
+    ),
+})
 
 export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQueue }: L2DrainDeps) => {
   // One session, one owner, a present project tree. `claim` is true only for the model call: it is

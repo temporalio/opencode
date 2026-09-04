@@ -457,6 +457,17 @@ later. Verified by `packages/core/test/session-runner-resume.test.ts`.
 Resume is verified end to end: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
 
+### A turn nobody starts
+
+`session start` still needs something running to hand the prompt to. A schedule does not: it is a
+Temporal object, and what it fires is a workflow that admits the prompt itself and then starts the
+session's own supervisor. At firing time there is no client and no serve process, only workers.
+
+The session is created once, when the schedule is made, because a session is a row in the store
+before it is anything else. After that the firing reaches only Temporal. The prompt is admitted as
+queued rather than delivered, so a firing that lands while the last turn is still working is not
+lost: it is drained when that turn ends, and overlapping firings are skipped rather than stacked.
+
 ### Picking a deployment rather than assembling one
 
 The settings below are not independent, and getting them wrong fails as something else later: a
@@ -685,6 +696,9 @@ opencode session running --attach http://gateway:4096
 
 # follow one from anywhere, and stop when the turn stops
 opencode session watch ses_abc123 --attach http://gateway:4096
+
+# a turn nobody starts: the firing needs no client and no serve process
+opencode session schedule "review yesterday.s merges" --cron "0 9 * * *" --attach http://gateway:4096
 ```
 
 `--attach` takes any serve in the deployment, because they are interchangeable: each one reads the
@@ -710,7 +724,8 @@ OPENCODE_TEMPORAL_ROLE=client opencode serve --port 4096             # as many a
 serve A starts a turn and is killed with a tool still running, the turn finishes on a standalone
 worker, and serve B (which never saw the session) reports it running and replays the transcript.
 Then `session start` returns without waiting, `session running` lists it, and `session watch`
-follows it live from a cold client and exits when the turn ends.
+follows it live from a cold client and exits when the turn ends. `session schedule` then creates a
+schedule and the check waits for a firing to run a turn with no client involved at all.
 
 How it decides that has been wrong in both directions, so it is worth stating. Nothing publishes a
 turn-level ending, and the running set holds a session for the supervisor's whole idle period, so
