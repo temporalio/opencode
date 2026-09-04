@@ -52,7 +52,7 @@ import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { Auth } from "@opencode-ai/llm/route"
 import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Layer, Schema, Stream } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import { testEffect } from "./lib/effect"
 
 const model = OpenAIChat.route
@@ -421,6 +421,26 @@ describe("SessionRunner model-only attempt", () => {
       expect(part?.type === "tool" ? part.state.status : undefined).toBe("completed")
       const message = assistant(context)
       expect(message?.type === "assistant" ? Boolean(message.time.completed) : false).toBe(true)
+    }),
+  )
+
+  // The turn saying it is over, as opposed to a step saying it is. Everything watching a session
+  // from outside used to infer the difference from a finish reason and then a silence, because a
+  // steer or a queued prompt continues the same turn through another step.
+  harness(textOnly).effect("says the turn ended, once, when nothing follows it", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const events = yield* EventV2.Service
+      const ended = yield* events
+        .subscribe(SessionEvent.Turn.Ended)
+        .pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
+      const runner = yield* SessionRunner.Service
+
+      yield* runner.runStep({ sessionID, step: 2, promotion: undefined, first: false, force: false })
+
+      const seen = yield* Fiber.join(ended)
+      expect(seen.length).toBe(1)
+      expect(seen[0]?.data.sessionID).toBe(sessionID)
     }),
   )
 })
