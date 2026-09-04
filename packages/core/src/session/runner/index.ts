@@ -41,17 +41,18 @@ export interface StepResult {
  * of the same step would mint different ones and the results would not match the log. */
 /** A call the model asked for, handed to whoever will run it.
  *
- * It carries the arguments, and it has to. A deferred call is recorded as pending with `input: ""`
- * (message-updater.ts), because the streaming path leaves `Tool.Called` to whoever dispatches it:
- * that publish is the dispatch record the no-double-run rule reads, so it cannot happen before a
- * dispatch. The log therefore does not hold the arguments at hand-off time, and reading them from
- * there gave the tool an empty string.
+ * It carries the arguments. The cost of that is real: this crosses a durable boundary twice, once
+ * as the model call's result and once as the tool call's input, so a step with large `write` bodies
+ * puts them into history twice and a big enough one passes the payload limit.
  *
- * The cost is real and unfixed: this crosses a durable boundary twice, once as the model call's
- * result and once as the tool call's input, so a step with large `write` bodies puts them into
- * history twice and a big enough one passes the payload limit. Fixing it means recording the
- * arguments at stream time without recording a dispatch, which is a change to the pending state
- * rather than to this shape. */
+ * Taking them off has been tried once and reverted, and the reason it failed is worth keeping
+ * because it is not the one the revert first claimed. The log does hold them: the streaming path
+ * ends the input fragment before it defers, so `Tool.Input.Ended` lands on the deferred path too
+ * and the pending part holds the arguments. What it holds is the raw JSON *string*, and a
+ * dispatcher recording it back through `record()` wraps a non-object as `{ value }`, so every tool
+ * was handed a string where its schema wanted an object. Closing this needs that string parsed, and
+ * needs the one case where it is genuinely empty covered: a provider that delivers a call whole
+ * sends no input deltas, so the fragment end joins nothing. */
 export interface DeferredToolCall {
   readonly id: string
   readonly name: string
