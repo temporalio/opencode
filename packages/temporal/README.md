@@ -341,10 +341,10 @@ what makes any worker able to serve any session, and turning affinity on is choo
 Two consequences to plan for, both silent:
 
 - **The key is the directory, not the host.** In a container fleet where every worker's project is
-  the same path, affinity is a no-op: they all poll the same queue and a step's tools still land
-  wherever. It is a real routing decision only where hosts serve genuinely different paths, which
-  is why `OPENCODE_TEMPORAL_SERIAL_TOOLS` is the thing that actually keeps a step's writes together
-  in the shared-store deployment.
+  the same path, this affinity is a no-op: they all poll the same queue and a step's tools still
+  land wherever. It is a real routing decision only where hosts serve genuinely different paths.
+  What keeps a step's writes together in a container fleet is step affinity below, which is keyed by
+  host as well as by path.
 
 - **A worker serves one tree.** In the default `role=both` deployment the embedded worker polls the
   queue for the process directory, so a session in another project has no poller. Point
@@ -596,10 +596,22 @@ The rules that bound it, because checking a stored tree out over the wrong one d
 - **A tool ships from the host that ran it.** The seal can land anywhere, and it used to be the only
   thing that captured, so a tool's writes reached the store only when the seal happened to be on
   the same host.
-- **A step's tools run one at a time wherever the store is shared** (`OPENCODE_TEMPORAL_SERIAL_TOOLS`,
-  on by default when `OPENCODE_DB_URL` is set and affinity is off). Two on two hosts each publish a
-  tree without the other's work, and the second is refused rather than reverting the first, which
-  leaves its work stranded there. Turn it off when affinity already keeps a step on one worker.
+- **A step stays on the worker that ran its model call** (`OPENCODE_TEMPORAL_STEP_AFFINITY`, on by
+  default). Every worker polls a second queue of its own, keyed by host and directory, and the model
+  call reports it; the tools and the seal are addressed there. That worker is standing in the tree
+  the tools are about to write, so they see each other through the filesystem instead of shipping
+  the tree to each other, which is what lets them run at once again. What keeps this from being a
+  worse kind of stuck than the shared queue: the pinned dispatch carries a 30 second
+  `scheduleToStartTimeout`, and that failure means the activity never started, so the work moves to
+  the shared queue with nothing run twice. Whatever is left of that step then goes one at a time,
+  because on the shared queue it can land on two hosts again.
+- **A step's tools otherwise run one at a time wherever the store is shared**
+  (`OPENCODE_TEMPORAL_SERIAL_TOOLS=1`, and the default only when step affinity is off). Two on two
+  hosts each publish a tree without the other's work, and the second is refused rather than
+  reverting the first, which leaves its work stranded there.
+- **Capturing and shipping the tree is one at a time per directory.** Two tools of one step now run
+  at once on one host, and both end by capturing and pushing: a capture writes the git index and a
+  push compares against the store's head, so two of them in one directory race on both.
 
 Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
 

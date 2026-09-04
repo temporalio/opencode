@@ -35,7 +35,7 @@ const INPUT: StepDrainInput = {
   force: false,
 }
 const SEALED: StepDrainResult = { ran: true, continue: true, step: 3, promotion: "steer" }
-const call = (id: string, name = "probe_write") => ({ id, name, input: {}, assistantMessageID: "msg_1" })
+const call = (id: string, name = "probe_write") => ({ id, name, assistantMessageID: "msg_1" })
 
 const fakes = (
   model: ModelCallDrainResult,
@@ -219,6 +219,135 @@ describe("stepped turn", () => {
     await expect(run).rejects.toBeInstanceOf(FakeHalt)
     expect(seals).toHaveLength(1)
     expect(seals[0]?.needsContinuation).toBe(false)
+  })
+})
+
+// Pinning a step to the worker that made its model call, and what happens when that worker is gone.
+// The pin is what lets a step's tools run at once: they write one tree through one filesystem
+// instead of shipping it to each other. The fallback is what keeps that from being a worse kind of
+// stuck than the shared queue was.
+describe("stepped turn, pinned to a worker", () => {
+  const unclaimed = () =>
+    new ActivityFailure(
+      "activity failed",
+      "runToolCall",
+      "1",
+      1 as never,
+      undefined,
+      new TimeoutFailure("schedule to start timed out", undefined, "SCHEDULE_TO_START" as never),
+    )
+  const isUnclaimed = (error: unknown) =>
+    error instanceof ActivityFailure &&
+    error.cause instanceof TimeoutFailure &&
+    error.cause.timeoutType === "SCHEDULE_TO_START"
+
+  const called = (model: ModelCallDrainResult) => {
+    const shared = fakes(model)
+    const pinnedTools: ToolCallDrainInput[] = []
+    const pinnedSeals: SealDrainInput[] = []
+    let refuse = false
+    let refused = 0
+    const pinned = {
+      runToolCall: async (input: ToolCallDrainInput): Promise<ToolCallDrainResult> => {
+        if (refuse) {
+          refused++
+          throw unclaimed()
+        }
+        pinnedTools.push(input)
+        return { outcome: "settled" }
+      },
+      sealStep: async (input: SealDrainInput): Promise<StepDrainResult> => {
+        if (refuse) {
+          refused++
+          throw unclaimed()
+        }
+        pinnedSeals.push(input)
+        return SEALED
+      },
+    }
+    return {
+      ...shared,
+      pinnedTools,
+      pinnedSeals,
+      refusals: () => refused,
+      goneAfterModelCall: () => {
+        refuse = true
+      },
+      run: () =>
+        makeSteppedTurn({
+          activities: shared.activities,
+          isCancellation,
+          isHalt,
+          isUnclaimed,
+          pinnedTo: (queue) => {
+            expect(queue).toBe("queue-of-the-worker")
+            return pinned
+          },
+        })(INPUT),
+    }
+  }
+
+  const withQueue: ModelCallDrainResult = {
+    kind: "called",
+    step: 2,
+    calls: [call("call_a"), call("call_b")],
+    owner: "run:1:1",
+    queue: "queue-of-the-worker",
+  }
+
+  it("sends the tools and the seal back to the worker that made the model call", async () => {
+    const { run, pinnedTools, pinnedSeals, tools, seals } = called(withQueue)
+
+    await run()
+
+    expect(pinnedTools.map((t) => t.call.id)).toEqual(["call_a", "call_b"])
+    expect(pinnedSeals).toHaveLength(1)
+    // Nothing reached the shared queue, which is the point: the tree the tools wrote is on that
+    // worker and nowhere else until the step ships it.
+    expect(tools).toHaveLength(0)
+    expect(seals).toHaveLength(0)
+  })
+
+  it("moves the step to the shared queue when nobody takes the pinned work", async () => {
+    const { run, goneAfterModelCall, pinnedTools, tools, seals } = called(withQueue)
+    goneAfterModelCall()
+
+    const result = await run()
+
+    // Schedule-to-start is the one failure that says the activity never started, so moving the work
+    // cannot run a tool twice. Both calls end up on the shared queue, and the step still closes.
+    expect(pinnedTools).toHaveLength(0)
+    expect(tools.map((t) => t.call.id).sort()).toEqual(["call_a", "call_b"])
+    expect(seals).toHaveLength(1)
+    expect(result).toEqual(SEALED)
+  })
+
+  it("does not offer the pin again once the worker has failed to answer", async () => {
+    const { run, goneAfterModelCall, tools, seals, refusals } = called({
+      ...withQueue,
+      calls: [call("call_a")],
+    })
+    goneAfterModelCall()
+
+    await run()
+
+    // One refusal, from the tool. The seal that follows goes straight to the shared queue rather
+    // than spending another schedule-to-start bound on a worker already known to be gone. Counting
+    // the refusals is the assertion: the work reaches the shared queue either way, so where it
+    // ended up says nothing about how long the step spent finding out. Calls dispatched together
+    // do each pay it once, because none of them has learned anything yet when they start.
+    expect(refusals()).toBe(1)
+    expect(tools).toHaveLength(1)
+    expect(seals).toHaveLength(1)
+  })
+
+  it("uses the shared queue when the model call reported no queue of its own", async () => {
+    const { run, tools, pinnedTools } = called({ ...withQueue, queue: undefined })
+
+    await run()
+
+    expect(tools).toHaveLength(2)
+    expect(pinnedTools).toHaveLength(0)
   })
 })
 
