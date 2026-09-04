@@ -104,6 +104,7 @@ const layer = Layer.effect(
         : Effect.succeed(TASK_QUEUE)
     // Before anything is accepted, not after: every one of these fails as something else later, and
     // the failure lands on whoever prompted the session rather than on whoever deployed it.
+    for (const note of TemporalConfig.notes(config)) yield* Effect.logInfo(`configuration: ${note}`)
     const problems = TemporalConfig.preflight(config)
     for (const problem of problems) yield* Effect.logError(`configuration: ${problem}`)
     if (problems.length > 0) yield* Effect.die(`this deployment cannot serve sessions: ${problems[0]}`)

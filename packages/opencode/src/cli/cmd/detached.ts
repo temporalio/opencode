@@ -120,6 +120,7 @@ export const SessionDoctorCommand = cmd({
     for (const [name, value] of Object.entries(TemporalConfig.describe(config))) {
       UI.println(`  ${name}: ${value}`)
     }
+    for (const note of TemporalConfig.notes(config)) UI.println(`note: ${note}`)
     const problems = TemporalConfig.preflight(config)
     for (const problem of problems) UI.println(`problem: ${problem}`)
     if (problems.length > 0) {
