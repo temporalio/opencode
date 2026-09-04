@@ -41,22 +41,19 @@ export interface StepResult {
  * of the same step would mint different ones and the results would not match the log. */
 /** A call the model asked for, handed to whoever will run it.
  *
- * It carries the arguments. The cost of that is real: this crosses a durable boundary twice, once
- * as the model call's result and once as the tool call's input, so a step with large `write` bodies
- * puts them into history twice and a big enough one passes the payload limit.
+ * It names the call rather than carrying it. The arguments are already in the log when this is
+ * handed over: the streaming path ends the input fragment before it defers, so `Tool.Input.Ended`
+ * lands on the deferred path too and the dispatcher reads them off the pending call. Carrying them
+ * as well put them across a durable boundary twice, once as the model call's result and once as the
+ * tool call's input, so a step with large `write` bodies wrote them into history twice and a big
+ * enough one passed the payload limit.
  *
- * Taking them off has been tried once and reverted, and the reason it failed is worth keeping
- * because it is not the one the revert first claimed. The log does hold them: the streaming path
- * ends the input fragment before it defers, so `Tool.Input.Ended` lands on the deferred path too
- * and the pending part holds the arguments. What it holds is the raw JSON *string*, and a
- * dispatcher recording it back through `record()` wraps a non-object as `{ value }`, so every tool
- * was handed a string where its schema wanted an object. Closing this needs that string parsed, and
- * needs the one case where it is genuinely empty covered: a provider that delivers a call whole
- * sends no input deltas, so the fragment end joins nothing. */
+ * Taking them off failed once, and the reason is worth keeping: what the record holds is the raw
+ * JSON *string*, and handing that straight to a tool gave every one of them a string where its
+ * schema wanted an object. The dispatcher parses it. */
 export interface DeferredToolCall {
   readonly id: string
   readonly name: string
-  readonly input: unknown
   readonly assistantMessageID: string
 }
 
