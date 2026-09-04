@@ -813,9 +813,8 @@ describe("EventV2", () => {
   // What this pins is the outcome, not the race: whoever the row names is the one that was told it
   // won. It does NOT pin the compare-and-set that makes that true under a real interleaving. Two
   // claims started together here run to completion one after the other, so this passes with the
-  // condition on the write removed. Forcing the interleaving needs a seam between the read and the
-  // write that the production path does not have, and inventing one to test it would be testing the
-  // seam. Named for what it does.
+  // condition on the write removed. `event-claim.test.ts` forces that interleaving, with the seam
+  // at the database rather than in `claim`. Named for what it does.
   it.effect("two claims for one log leave a single owner, and it is one that was told so", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
