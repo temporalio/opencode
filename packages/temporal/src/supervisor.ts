@@ -45,6 +45,11 @@ export interface SupervisorRuntime {
   /** Restart the run with fresh history, carrying whether work is still pending. History-keeping
    * drivers only (Temporal). */
   readonly continueAsNew?: (sessionID: string, startWithWake: boolean) => Promise<never>
+  /** Whether the driver says this run's history is large enough to roll over. A drain count cannot
+   * answer this: one drain is a whole turn, and a stepped turn of 200 steps is thousands of events,
+   * so a handful of drains can cross the server's limit long before the count does. Optional:
+   * drivers without a history return false. */
+  readonly historyWantsRollover?: () => boolean
 }
 
 export interface WorkflowOptions {
@@ -81,12 +86,24 @@ export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions)
         .runInDrainScope(async () => {
           drains++
           if (drains >= MAX_DRAINS_PER_RUN) rolloverPending = true
+          if (rt.historyWantsRollover?.()) rolloverPending = true
           let step = 1
           let promotion: string | null = null
           let first = true
           for (;;) {
             const r: StepDrainResult = await rt.runTurnStep({ sessionID, step, promotion, first, force })
+            // Inside the loop as well, because one drain is a whole turn: a long one outgrows the
+            // history without ever reaching the next drain's check.
+            if (rt.historyWantsRollover?.()) rolloverPending = true
             if (!r.continue) break
+            // A queued prompt continues this same drain as a fresh turn, so a session fed without a
+            // gap never goes quiet and the rollover it is waiting for never happens. Stop at that
+            // boundary instead and let the new run pick the queue up: the work is not lost, it is
+            // one turn later. A steer is not a boundary, so it still rides this drain through.
+            if (rolloverPending && r.promotion === "queue") {
+              pendingWake = true
+              break
+            }
             step = r.step
             promotion = r.promotion
             first = false

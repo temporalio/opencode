@@ -52,6 +52,7 @@ import { DEFAULT_MAX_STEPS, REPEAT_LIMIT, REPEATED_CALLS_PROMPT, trailingIdentic
 import { Snapshot } from "../../snapshot"
 import { SnapshotSync } from "../../snapshot-sync"
 import { makeLocationNode } from "../../effect/app-node"
+import { KeyedMutex } from "../../effect/keyed-mutex"
 import { llmClient } from "../../effect/app-node-platform"
 
 /**
@@ -107,6 +108,13 @@ import { llmClient } from "../../effect/app-node-platform"
  * explicit loop starts the next provider turn after local settlement. Configured agent step limits
  * bound the loop.
  */
+
+// Shipping the tree, one at a time per directory. Two tools of one step run at once and both end by
+// capturing and pushing: a capture writes the git index and a push compares against the store's
+// head, so two of them in one directory race on both, and the loser's work is refused rather than
+// shipped. Module-level, because what has to be excluded is two activities in one process, and each
+// builds its own runner.
+const shipping = KeyedMutex.makeUnsafe<string>()
 
 const layer = Layer.effect(
   Service,
@@ -312,12 +320,7 @@ const layer = Layer.effect(
             // the
             // stream does and the overlap between the model and its tools is lost.
             if (deferTools) {
-              deferred.push({
-                id: event.id,
-                name: event.name,
-                input: event.input,
-                assistantMessageID,
-              })
+              deferred.push({ id: event.id, name: event.name, assistantMessageID })
               return
             }
             yield* Effect.uninterruptibleMask((restore) =>
@@ -681,6 +684,18 @@ const layer = Layer.effect(
         }
       const moreQueue = yield* SessionInput.hasPending(db, sessionID, "queue")
       if (moreQueue) return { ran: true, continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
+      // The turn is over, and this is the only place that knows it: a step ending is not a turn
+      // ending, because a steer or a queued prompt continues the same turn through another step.
+      // Everything watching from outside had to infer it from a finish reason and a silence. Said
+      // once, here, for both modes, since both come through this function.
+      //
+      // Only the ordinary ending. A turn the user stopped, or one a provider error ended, does not
+      // reach here, so a follower still needs its other reasons to stop waiting.
+      yield* events.publish(SessionEvent.Turn.Ended, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        finish: "stop",
+      })
       return { ran: true, continue: false, step: step + 1, promotion: undefined }
     })
 
@@ -802,6 +817,24 @@ const layer = Layer.effect(
         })
         return { outcome: "unknown" } as ToolCallResult
       }
+      // The arguments, off the log rather than off the hand-off. A pending call holds the provider's
+      // raw JSON text, which is what the stream delivered; a re-dispatch of a running one reads the
+      // object the first dispatch recorded. A defect either way if the text is not JSON, because
+      // only the recording path could have written that, and a tool handed a string it cannot parse
+      // reports a wrong reason to the model.
+      const recorded = part.state
+      const args =
+        recorded.status === "pending"
+          ? yield* Effect.try({
+              try: () => JSON.parse(recorded.input) as unknown,
+              catch: () =>
+                new Error(
+                  recorded.input === ""
+                    ? `Tool call ${input.call.id} has no recorded input to run it with`
+                    : `Tool call ${input.call.id} has a recorded input that is not JSON`,
+                ),
+            }).pipe(Effect.orDie)
+          : recorded.input
       // The durable record that this call is being run, published before the tool can do anything.
       // It is also the last point a fenced dispatch dies at: under a superseded owner this publish
       // fails and the tool never runs, instead of running and losing its result.
@@ -811,7 +844,7 @@ const layer = Layer.effect(
         assistantMessageID,
         callID: input.call.id,
         tool: input.call.name,
-        input: record(input.call.input),
+        input: record(args),
         // Deferred calls are never provider-executed: those are filtered out before the hand-off.
         provider: { executed: false },
       })
@@ -823,7 +856,7 @@ const layer = Layer.effect(
           call: LLMEvent.toolCall({
             id: input.call.id,
             name: input.call.name,
-            input: input.call.input,
+            input: args,
           }),
         })
         .pipe(
@@ -870,6 +903,16 @@ const layer = Layer.effect(
         // Deferred calls are never provider-executed: those are filtered out before the hand-off.
         provider: { executed: false },
       }))
+      // Shipped from the host that ran the tool, because it is the only one holding what the tool
+      // did. The seal can land anywhere, and a capture there would ship a tree that never saw this
+      // write. Best effort in the same sense the seal's is: the result is already durable, and a
+      // pack that does not reach the store costs the next host a rebuild from further back.
+      yield* shipping.withLock(location.directory)(
+        Effect.gen(function* () {
+          const afterTool = yield* snapshots.capture().pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (afterTool) yield* snapshotSync.push(afterTool)
+        }),
+      )
       return { outcome: "settled" } as ToolCallResult
     })
 

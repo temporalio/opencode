@@ -21,7 +21,8 @@ import { AppProcess } from "./process"
 import { AbsolutePath } from "./schema"
 import type { Snapshot } from "./snapshot"
 import { SnapshotPackTable } from "./snapshot/sql"
-import { writeWorktreeTip } from "./snapshot/tip"
+import { chainHead } from "./snapshot/chain"
+import { readWorktreeTip, writeWorktreeTip } from "./snapshot/tip"
 import { Hash } from "./util/hash"
 
 export interface Interface {
@@ -62,23 +63,45 @@ const layer = Layer.effect(
         { stdin },
       )
 
+    // The newest state the store holds for this worktree, read off the chain the packs form rather
+    // than off `time_created`, which is whichever host wrote the row.
+    const newest = () =>
+      db
+        .select()
+        .from(SnapshotPackTable)
+        .where(eq(SnapshotPackTable.worktree, worktree))
+        .all()
+        .pipe(Effect.orDie, Effect.map(chainHead))
+
     const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID) {
-      // Noted before the packing, which is best-effort: what this host holds is true whether or not
-      // the pack reaches the store, and a note left behind would let a later drain check out an
-      // older tree over work only this host has.
-      if (source) yield* writeWorktreeTip(global.data, worktree, tree)
+      // Only a host standing on the store's newest state may add to it. One that never caught up
+      // packs its older files, becomes the newest by time, and every other host then checks that
+      // out over the work they were shipped to carry.
+      //
+      // Ahead of the note and outside the packing below, both deliberately. The note must not be
+      // moved for a ship that is not allowed, and the packing swallows its failures on purpose: a
+      // pack that does not reach the store costs the next host a rebuild from further back, where
+      // this is a host saying something untrue about the project.
+      if (source) {
+        const stoodOn = yield* readWorktreeTip(global.data, worktree)
+        const ahead = yield* newest()
+        if (ahead && ahead.tree !== tree && stoodOn !== ahead.tree) {
+          yield* Effect.die(
+            new Error(
+              `refusing to ship ${worktree}: this host stood on ${stoodOn ?? "nothing"}, ` +
+                `and the store is at ${ahead.tree}`,
+            ),
+          )
+        }
+      }
       yield* Effect.gen(function* () {
         if (!source) return
-        const latest = yield* db
-          .select()
-          .from(SnapshotPackTable)
-          .where(eq(SnapshotPackTable.worktree, worktree))
-          .orderBy(desc(SnapshotPackTable.time_created))
-          .limit(1)
-          .get()
-          .pipe(Effect.orDie)
-        // The newest shipped state already is this tree: nothing to pack.
-        if (latest?.tree === tree) return
+        const latest = yield* newest()
+        // The newest shipped state already is this tree: nothing to pack, and the note is true.
+        if (latest?.tree === tree) {
+          yield* writeWorktreeTip(global.data, worktree, tree)
+          return
+        }
         // Chain onto the previous sync commit only when this host has it; a base absent locally
         // would produce a delta pack the pack builder cannot compute.
         const base =
@@ -115,6 +138,12 @@ const layer = Layer.effect(
           .onConflictDoNothing()
           .run()
           .pipe(Effect.orDie)
+        // After the insert, never before it. The packing below swallows its failures, so a note
+        // written first and an insert that then failed named a tree the store never saw: `isBehind`
+        // finds no row for it and leaves the host where it is, while the ship guard compares that
+        // note with a head it can never match, so every later push from this host dies. Left at the
+        // last state the store agreed on, both keep working and the next push chains from there.
+        yield* writeWorktreeTip(global.data, worktree, tree)
       }).pipe(
         Effect.catchCauseIf(
           (cause) => !Cause.hasInterrupts(cause),

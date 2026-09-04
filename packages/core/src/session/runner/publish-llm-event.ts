@@ -114,6 +114,9 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     {
       readonly assistantMessageID: SessionMessage.ID
       readonly name: string
+      // Whether the provider streamed the arguments. One that delivers the call whole sends none,
+      // and the fragment end would then record an empty input for a call that has one.
+      inputSeen: boolean
       inputEnded: boolean
       called: boolean
       settled: boolean
@@ -225,6 +228,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     tools.set(event.id, {
       assistantMessageID,
       name: event.name,
+      inputSeen: false,
       inputEnded: false,
       called: false,
       settled: false,
@@ -354,6 +358,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
         if (tool.name !== event.name)
           return yield* Effect.die(`Tool input name changed for ${event.id}: ${tool.name} -> ${event.name}`)
         if (tool.inputEnded) return yield* Effect.die(`Tool input delta after end: ${event.id}`)
+        tool.inputSeen = true
         yield* toolInput.append(event.id, event.text)
         yield* events.publish(SessionEvent.Tool.Input.Delta, {
           sessionID: input.sessionID,
@@ -370,6 +375,11 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       case "tool-call": {
         if (!tools.has(event.id)) yield* startToolInput(event)
         const tool = tools.get(event.id)!
+        // The call carries the arguments whether or not they were streamed, and the record has to
+        // hold them either way: it is what a dispatcher reads to run the tool, and the fragment end
+        // would otherwise write an empty input for a provider that sends no deltas.
+        if (!tool.inputEnded && !tool.inputSeen)
+          yield* toolInput.append(event.id, JSON.stringify(event.input ?? {}))
         if (!tool.inputEnded) yield* endToolInput(event)
         if (tool.name !== event.name)
           return yield* Effect.die(`Tool call name changed for ${event.id}: ${tool.name} -> ${event.name}`)

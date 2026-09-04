@@ -1,0 +1,103 @@
+# Two workers that are two machines, not two processes on one.
+#
+# What they share is what an operator is told to share: one Temporal cluster and one libSQL store.
+# What they do not share is the session's working tree. `worker-a` has the project, `worker-b` gets
+# an empty volume, so a session that moves between them has to rebuild the tree from the snapshot
+# packs in the store. That is the part a single host can never really test, because there the tree
+# is already sitting on the disk the other process is reading.
+#
+#   docker compose -f packages/temporal/docker/compose.yml up -d temporal sqld serve worker-a
+#
+# Not covered: one libSQL server, so this shows a shared store over a network rather than a store
+# that survives losing a node.
+
+name: opencode-l3
+
+# A mapping rather than a list, because a list cannot be merged: a service that adds one variable
+# would otherwise replace the whole set and silently lose the store.
+x-env: &env
+  OPENCODE_SESSION_EXECUTION: temporal
+  TEMPORAL_ADDRESS: temporal:7233
+  # One store for every host. Without it a session belongs to whichever machine holds its file.
+  OPENCODE_DB_URL: http://sqld:8080
+  OPENCODE_TEMPORAL_STEPPED: "1"
+  OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:-l3-check}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}
+
+x-app: &app
+  image: opencode-temporal:l3
+  # The engine's own source, over the copy baked into the image. bun runs TypeScript directly, so
+  # this is the same code the image would have had; mounting it keeps a one-file change from
+  # costing a full dependency install, which is most of the build.
+  volumes:
+    - ../../core/src:/app/packages/core/src:ro
+    - ../src:/app/packages/temporal/src:ro
+  depends_on:
+    temporal:
+      condition: service_healthy
+    sqld:
+      condition: service_started
+
+services:
+  temporal:
+    image: temporalio/admin-tools:1.29
+    # The image's own entrypoint is `sleep infinity`, so a command alone becomes arguments to sleep.
+    entrypoint: ["temporal"]
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--log-level", "warn"]
+    ports:
+      - "7243:7233"
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  sqld:
+    image: ghcr.io/tursodatabase/libsql-server:latest
+    environment:
+      - SQLD_NODE=primary
+    ports:
+      - "8081:8080"
+
+  # Drives workflows, hosts no worker, and is the only thing with an HTTP surface.
+  serve:
+    <<: *app
+    environment:
+      <<: *env
+      OPENCODE_TEMPORAL_ROLE: client
+    # Absolute, because working_dir is the project rather than the checkout: a relative entry path
+    # would be looked for inside the session's tree.
+    command: ["bun", "run", "/app/packages/cli/src/index.ts", "serve", "--port", "4096", "--hostname", "0.0.0.0"]
+    working_dir: /project
+    ports:
+      - "4096:4096"
+    volumes:
+      - ../../core/src:/app/packages/core/src:ro
+      - ../src:/app/packages/temporal/src:ro
+      - project-a:/project
+
+  worker-a:
+    <<: *app
+    environment:
+      <<: *env
+      OPENCODE_TEMPORAL_ROLE: worker
+    volumes:
+      - ../../core/src:/app/packages/core/src:ro
+      - ../src:/app/packages/temporal/src:ro
+      - project-a:/project
+
+  # No project volume of its own that has ever seen this session: an empty tree, so the worktree has
+  # to come from the packs in the store.
+  worker-b:
+    <<: *app
+    environment:
+      <<: *env
+      OPENCODE_TEMPORAL_ROLE: worker
+    volumes:
+      - ../../core/src:/app/packages/core/src:ro
+      - ../src:/app/packages/temporal/src:ro
+      - project-b:/project
+
+volumes:
+  project-a:
+  project-b:

@@ -340,6 +340,12 @@ what makes any worker able to serve any session, and turning affinity on is choo
 
 Two consequences to plan for, both silent:
 
+- **The key is the directory, not the host.** In a container fleet where every worker's project is
+  the same path, this affinity is a no-op: they all poll the same queue and a step's tools still
+  land wherever. It is a real routing decision only where hosts serve genuinely different paths.
+  What keeps a step's writes together in a container fleet is step affinity below, which is keyed by
+  host as well as by path.
+
 - **A worker serves one tree.** In the default `role=both` deployment the embedded worker polls the
   queue for the process directory, so a session in another project has no poller. Point
   `OPENCODE_TEMPORAL_WORKTREE` at the project root, not at a subfolder, since the key is the project
@@ -450,6 +456,58 @@ later. Verified by `packages/core/test/session-runner-resume.test.ts`.
 
 Resume is verified end to end: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
+
+### A turn nobody starts
+
+`session start` still needs something running to hand the prompt to. A schedule does not: it is a
+Temporal object, and what it fires is a workflow that admits the prompt itself and then starts the
+session's own supervisor. At firing time there is no client and no serve process, only workers.
+
+The session is created once, when the schedule is made, because a session is a row in the store
+before it is anything else. After that the firing reaches only Temporal. The prompt is admitted as
+queued rather than delivered, so a firing that lands while the last turn is still working is not
+lost: it is drained when that turn ends, and overlapping firings are skipped rather than stacked.
+
+### Picking a deployment rather than assembling one
+
+The settings below are not independent, and getting them wrong fails as something else later: a
+store only one process can see reads as a worker that never picks anything up. `OPENCODE_TEMPORAL_PROFILE`
+picks one deployment and the rest follow.
+
+| | `local` (default) | `fleet` |
+|---|---|---|
+| what it is | one serve, worker inside it | serve processes and workers, separate |
+| store | this process only | **you set** `OPENCODE_DB_URL` |
+| role | `both` | `client` for serve, `worker` for workers |
+| unit of work | a whole step | the model call, each tool call, the seal |
+
+Anything can still be set on its own; the profile decides only what it is when you do not. A fleet
+cannot be talked out of the two that make it one, and a process that fails preflight refuses to
+build rather than accepting work it cannot do.
+
+Reaching a server that is not the dev server:
+
+```bash
+TEMPORAL_ADDRESS=your-ns.a1b2c.tmprl.cloud:7233 TEMPORAL_NAMESPACE=your-ns.a1b2c \
+  OPENCODE_TEMPORAL_API_KEY_FILE=/run/secrets/temporal-key     # Temporal Cloud
+TEMPORAL_ADDRESS=temporal.internal:7233 \
+  OPENCODE_TEMPORAL_TLS_CERT=/run/secrets/tls.crt \
+  OPENCODE_TEMPORAL_TLS_KEY=/run/secrets/tls.key               # a cluster with mTLS
+```
+
+The key comes from a file rather than from argv, and nothing prints it. Both halves build the
+connection from one function, so a client and a worker cannot disagree about how the cluster is
+reached.
+
+Ask before deploying rather than after:
+
+```bash
+opencode session doctor
+```
+
+It prints what this process resolved and names what is wrong: an API key against a dev server, a
+Cloud key with the `default` namespace, an address that is not loopback with no credentials, half a
+certificate pair, a fleet with a store nobody else can read.
 
 ### Running workers separately
 
@@ -569,13 +627,43 @@ and dependencies are not captured, so a rebuilt tree may need an install step be
 identically. Worker affinity (below) or a shared volume skips the materialization latency on warm
 paths; the packs are the portable baseline that works with neither.
 
-Two rules bound what that refresh may touch, because checking a stored tree out over the wrong one
-destroys work. A tree is moved only when a host-local note (`snapshot/tip.ts`) says this host is
-behind the store, so a host holding a capture that never shipped is left as it is. And it is moved
-only when this host built the tree from packs, so a checkout the host already had, a developer's own
-working copy, is never rewritten: that case is logged and left alone. What stays open is the tools
-of ONE step running on two hosts, since nothing captures their writes until the step is sealed.
-Affinity is what keeps a step's tools on one tree.
+The rules that bound it, because checking a stored tree out over the wrong one destroys work:
+
+- **Newest is decided by the chain, not by a clock.** Each pack names the one it was built on, and
+  that order no host can get wrong. `time_created` is whichever host wrote the row, so a worker
+  five minutes behind used to make its older tree the newest one that everybody else checked out.
+- **Only a host standing on the newest state may add to it.** A host that never caught up used to
+  pack its older files, become the newest by time, and revert everyone. It refuses now, ahead of
+  its own tip note and outside the packing (which swallows its failures on purpose, so a guard
+  inside it would only have logged).
+- **A tree is moved only when this host has a note for it**, which means this host agreed to that
+  state: it either built the tree from packs or captured the tree from there. A developer's own
+  checkout has no note, so it is never rewritten. Gating this on whether the tree carried the marker
+  a rebuild writes was wrong in the other direction: a host that seeded the session from its own
+  checkout never has that marker, so once anyone else shipped, every activity that host drew failed
+  for good.
+- **The tip note is written after the insert, never before.** The packing swallows its own failures,
+  so a note written first and an insert that then failed named a tree the store never saw: the host
+  was behind nothing it could see, and every later ship from it was refused.
+- **A tool ships from the host that ran it.** The seal can land anywhere, and it used to be the only
+  thing that captured, so a tool's writes reached the store only when the seal happened to be on
+  the same host.
+- **A step stays on the worker that ran its model call** (`OPENCODE_TEMPORAL_STEP_AFFINITY`, on by
+  default). Every worker polls a second queue of its own, keyed by host and directory, and the model
+  call reports it; the tools and the seal are addressed there. That worker is standing in the tree
+  the tools are about to write, so they see each other through the filesystem instead of shipping
+  the tree to each other, which is what lets them run at once again. What keeps this from being a
+  worse kind of stuck than the shared queue: the pinned dispatch carries a 30 second
+  `scheduleToStartTimeout`, and that failure means the activity never started, so the work moves to
+  the shared queue with nothing run twice. Whatever is left of that step then goes one at a time,
+  because on the shared queue it can land on two hosts again.
+- **A step's tools otherwise run one at a time wherever the store is shared**
+  (`OPENCODE_TEMPORAL_SERIAL_TOOLS=1`, and the default only when step affinity is off). Two on two
+  hosts each publish a tree without the other's work, and the second is refused rather than
+  reverting the first, which leaves its work stranded there.
+- **Capturing and shipping the tree is one at a time per directory.** Two tools of one step now run
+  at once on one host, and both end by capturing and pushing: a capture writes the git index and a
+  push compares against the store's head, so two of them in one directory race on both.
 
 Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
 
@@ -587,6 +675,92 @@ Host-local state that does NOT ride the DB, so it is not reconstructed on a diff
   the file. They only affect the diff/restore/revert features and full-output viewing. Point
   `${data}`
   (the XDG data dir) at shared storage to make them portable.
+
+## A session that outlives its client
+
+Everything above makes a session survive a worker. Together the same pieces make it survive the
+*client*, which is the part a user can feel: start something, close the laptop, and pick it up from
+a machine that has never seen it.
+
+Nothing new is needed underneath. A session is already a workflow rather than a process, the
+running set already comes from Temporal visibility, the store is already shared, and a live tail
+already re-reads so a subscriber sees work another process is doing. What was missing was a way to
+say so from a command line, which is these three:
+
+```bash
+# hand over a prompt and walk away; prints the session id and exits
+opencode session start "port the auth module to the new API" --attach http://gateway:4096
+
+# what is this deployment running right now, across every client that ever connected
+opencode session running --attach http://gateway:4096
+
+# follow one from anywhere, and stop when the turn stops
+opencode session watch ses_abc123 --attach http://gateway:4096
+
+# a turn nobody starts: the firing needs no client and no serve process
+opencode session schedule "review yesterday.s merges" --cron "0 9 * * *" --attach http://gateway:4096
+```
+
+`--attach` takes any serve in the deployment, because they are interchangeable: each one reads the
+same store and signals the same workflows. There is no "the server that owns this session". That is
+the property, and it is why these commands are plain HTTP clients with no Temporal dependency.
+`$OPENCODE_SERVER` sets the endpoint once. For an interactive terminal instead of a follower,
+`opencode attach <url> --session <id>` already puts the TUI on a remote session.
+
+To run it as a deployment rather than a laptop:
+
+```bash
+export OPENCODE_SESSION_EXECUTION=temporal
+export OPENCODE_DB_URL=libsql://...     # one store, so any worker resumes any session
+export TEMPORAL_ADDRESS=...
+
+OPENCODE_TEMPORAL_ROLE=worker bun run packages/server/src/worker.ts   # as many as you want
+OPENCODE_TEMPORAL_ROLE=client opencode serve --port 4096             # as many as you want
+```
+
+### Verified
+
+`packages/temporal/scripts/detached-session-check.sh` runs the whole claim against real processes:
+serve A starts a turn and is killed with a tool still running, the turn finishes on a standalone
+worker, and serve B (which never saw the session) reports it running and replays the transcript.
+Then `session start` returns without waiting, `session running` lists it, and `session watch`
+follows it live from a cold client and exits when the turn ends. `session schedule` then creates a
+schedule and the check waits for a firing to run a turn with no client involved at all.
+
+How it decides that has been wrong in both directions, so it is worth stating. Nothing publishes a
+turn-level ending, and the running set holds a session for the supervisor's whole idle period, so
+neither answers the question on its own. What ends a watch is a terminal step and then a quiet wire,
+with the settling state kept across reconnects: the stream has no replay, and a turn that ends while
+the client is reconnecting publishes into a gap. Absence from the running set, asked periodically,
+is the backstop for that gap, and it is only ever allowed to end the wait, never to prolong it.
+
+The shared store is load-bearing, and the check proves it rather than assuming it: give serve B its
+own `OPENCODE_DB` and the three cross-process assertions fail (`active` returns `{}`, the replay is
+empty, the follower hangs) while the serve-A-and-worker ones still pass.
+
+### Across two machines
+
+`packages/temporal/scripts/cross-host-check.sh` runs the claim against containers, where each worker
+has its own filesystem and hostname and the store is a real libSQL server. A session writes a file
+on worker A, worker A's host is killed, and worker B, whose project volume is empty, continues the
+same session and reads that file back.
+
+That check found a bug a single host cannot show. `WorktreeMaterializer.ensure` treated any existing
+directory as somebody's working copy, and a fresh host has no tip note, so `behind` said no and the
+tree was never built. The tools then ran against an empty directory and the model was told a wrong
+answer, which is worse than a failure. On one host the case never appears: worker B either has the
+project already or has no directory at all, and an absent directory materializes fine. A mounted
+empty directory is the shape of a machine that has never seen the session, and it now materializes
+too (`packages/core/test/worktree-materialize.test.ts` covers it).
+
+The compose file mounts the engine's source over the image, so a code change does not need a new
+image. One libSQL server, so this shows a shared store over a network rather than one that survives
+losing a node.
+
+Still to do. A turn started from a schedule or a webhook needs an entry point of its own;
+`session start` is a command, so something has to run it. And the deployment above is a set of
+environment variables rather than a supported mode, so defaults, migration-on-deploy, and
+credential distribution are still the operator's problem.
 
 ## Porting this pattern
 

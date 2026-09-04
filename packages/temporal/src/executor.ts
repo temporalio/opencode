@@ -1,6 +1,7 @@
 export * as SessionExecutionTemporal from "./executor"
 
 import { fileURLToPath } from "node:url"
+import { hostname } from "node:os"
 import { Effect, Layer, Option } from "effect"
 import { Client, Connection, WithStartWorkflowOperation } from "@temporalio/client"
 // Imported lazily inside the worker branch: the worker package drags webpack and swc (it bundles
@@ -15,8 +16,8 @@ import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { makeStepActivities, makeSteppedTurnActivities } from "./activities"
 import { makeDrains } from "./drain"
-import { makeL2Drains } from "./l2-drain"
-import { queueForWorktree } from "./queue"
+import { makeL2Drains, makeScheduleDrains } from "./l2-drain"
+import { queueForWorktree, queueForWorker } from "./queue"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { eq } from "drizzle-orm"
@@ -66,6 +67,9 @@ const layer = Layer.effect(
     // override as a workflow argument.
     const IDLE_TIMEOUT = config.idleTimeout
     const STEPPED = config.stepped === true
+    // Only the client can read whether the store is shared, so whether a step's tools may overlap
+    // is decided here and rides the workflow input.
+    const SERIAL_TOOLS = config.serialTools === true
     const AFFINITY = config.worktreeAffinity === true
     // The tree this process serves when affinity is on. A serve process with an embedded worker is
     // already sitting in it, so the process directory is the right default.
@@ -73,6 +77,13 @@ const layer = Layer.effect(
     // Which queue a worker polls. With affinity off this is the one shared queue and any worker can
     // draw any session, rebuilding the tree if it has to.
     const POLL_QUEUE = AFFINITY ? queueForWorktree(TASK_QUEUE, SERVED_WORKTREE) : TASK_QUEUE
+    // The queue this worker polls on its own, so a step can be sent back to it. Keyed by host as
+    // well as directory: two containers serve `/project` and share none of it. Only workers have
+    // one, and only they report it, so a client-only process never pins a step to itself.
+    const STEP_QUEUE =
+      HOST_WORKER && config.stepAffinity !== false
+        ? queueForWorker(TASK_QUEUE, hostname(), SERVED_WORKTREE)
+        : undefined
     // Which queue a session's workflow runs on. Keyed on the PROJECT worktree, not the session's
     // directory: `worktrees.ensure` rebuilds the project tree, so keying on the directory a session
     // happened to start in would split one physical tree across a queue per subdirectory, and a
@@ -91,6 +102,13 @@ const layer = Layer.effect(
             return project ? queueForWorktree(TASK_QUEUE, project.worktree) : TASK_QUEUE
           })
         : Effect.succeed(TASK_QUEUE)
+    // Before anything is accepted, not after: every one of these fails as something else later, and
+    // the failure lands on whoever prompted the session rather than on whoever deployed it.
+    for (const note of TemporalConfig.notes(config)) yield* Effect.logInfo(`configuration: ${note}`)
+    const problems = TemporalConfig.preflight(config)
+    for (const problem of problems) yield* Effect.logError(`configuration: ${problem}`)
+    if (problems.length > 0) yield* Effect.die(`this deployment cannot serve sessions: ${problems[0]}`)
+
     const events = yield* EventV2.Service
     const worktrees = yield* WorktreeMaterializer.Service
 
@@ -99,7 +117,10 @@ const layer = Layer.effect(
     const { stepDrain } = makeDrains({ store, locations, ctx, events, worktrees })
     // The stepped mode's three drains. Registered unconditionally: which mode a session runs is a
     // property of its workflow input, so a worker has to be able to serve either.
-    const l2 = makeL2Drains({ store, locations, ctx, events, worktrees })
+    const l2 = makeL2Drains({ store, locations, ctx, events, worktrees, stepQueue: STEP_QUEUE })
+    // What a schedule fires into: admitting a prompt is a row in the store, and a workflow cannot
+    // write one. Registered on every worker, because a firing lands wherever one is polling.
+    const schedules = makeScheduleDrains({ db, events, ctx })
 
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
@@ -115,7 +136,7 @@ const layer = Layer.effect(
         ),
       )
       const nativeConn = yield* Effect.acquireRelease(
-        Effect.promise(() => NativeConnection.connect({ address: ADDRESS })),
+        Effect.promise(() => NativeConnection.connect(TemporalConfig.connectionOptions(config))),
         (conn) => Effect.promise(() => conn.close().catch(() => {})),
       )
       const worker = yield* Effect.promise(() =>
@@ -124,7 +145,11 @@ const layer = Layer.effect(
           namespace: NAMESPACE,
           taskQueue: POLL_QUEUE,
           workflowsPath: fileURLToPath(new URL("./workflow.ts", import.meta.url)),
-          activities: { ...makeStepActivities(stepDrain), ...makeSteppedTurnActivities(l2) },
+          activities: {
+            ...makeStepActivities(stepDrain),
+            ...makeSteppedTurnActivities(l2),
+            promptSession: schedules.promptDrain,
+          },
         }),
       )
       const runHandle = worker.run()
@@ -135,6 +160,33 @@ const layer = Layer.effect(
           await runHandle.catch(() => {})
         }),
       )
+
+      // A second poller, on this worker's own queue, for the steps pinned to it. Activities only:
+      // the workflow runs wherever it was started, and only the work that has to come back here is
+      // addressed here. Without it a pin has nobody to answer it and every step pays the
+      // schedule-to-start wait before falling back.
+      if (STEP_QUEUE) {
+        const pinnedWorker = yield* Effect.promise(() =>
+          Worker.create({
+            connection: nativeConn,
+            namespace: NAMESPACE,
+            taskQueue: STEP_QUEUE,
+            activities: {
+              ...makeStepActivities(stepDrain),
+              ...makeSteppedTurnActivities(l2),
+              promptSession: schedules.promptDrain,
+            },
+          }),
+        )
+        const pinnedHandle = pinnedWorker.run()
+        pinnedHandle.catch(() => {})
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(async () => {
+            pinnedWorker.shutdown()
+            await pinnedHandle.catch(() => {})
+          }),
+        )
+      }
     }
 
     // Worker-only process: it hosts activities but drives no workflows, so the client methods are
@@ -161,7 +213,7 @@ const layer = Layer.effect(
 
     // Client connection drives the per-session workflows.
     const clientConn = yield* Effect.acquireRelease(
-      Effect.promise(() => Connection.connect({ address: ADDRESS })),
+      Effect.promise(() => Connection.connect(TemporalConfig.connectionOptions(config))),
       (conn) => Effect.promise(() => conn.close().catch(() => {})),
     )
     const client = new Client({ connection: clientConn, namespace: NAMESPACE })
@@ -178,6 +230,7 @@ const layer = Layer.effect(
                 startWithWake: true,
                 idleTimeout: IDLE_TIMEOUT,
                 stepped: STEPPED,
+                serialTools: SERIAL_TOOLS,
               } satisfies WF.SessionTurnOptions,
             ],
             signal: WF.wake,
@@ -247,6 +300,7 @@ const layer = Layer.effect(
                       startWithWake: false,
                       idleTimeout: IDLE_TIMEOUT,
                       stepped: STEPPED,
+                      serialTools: SERIAL_TOOLS,
                     } satisfies WF.SessionTurnOptions,
                   ],
                   workflowIdConflictPolicy: "USE_EXISTING",

@@ -145,6 +145,24 @@ export namespace Shell {
   export type Ended = typeof Ended.Type
 }
 
+// The turn, as opposed to the steps it was made of. A step ending is not a turn ending: a steer or
+// a queued prompt continues the same turn through another step, and everything watching a session
+// from outside had to guess at the difference from a finish reason plus a silence. Live-only, and
+// deliberately: it says nothing the durable events do not already say, and the record of what a
+// turn did is those events. What it adds is a boundary, published by the one thing that knows it.
+export namespace Turn {
+  export const Ended = Event.define({
+    type: "session.next.turn.ended",
+    schema: {
+      ...Base,
+      // What the last step of the turn came to, so a follower can say why it stopped rather than
+      // only that it did.
+      finish: Schema.String,
+    },
+  })
+  export type Ended = typeof Ended.Type
+}
+
 export namespace Step {
   export const Started = Event.define({
     type: "session.next.step.started",
@@ -458,6 +476,7 @@ export const DurableDefinitions = Event.inventory(
   Step.Started,
   Step.Ended,
   Step.Failed,
+  Turn.Ended,
   Text.Started,
   Text.Ended,
   Tool.Input.Started,

@@ -36,6 +36,20 @@ const halted = (sessionID: string, declined?: SessionRunDeclinedError) => {
   })
 }
 
+// Failures that say something about the moment rather than about the work: storage that was not
+// reachable, a defect from a database call that `orDie` turned into one. Everything else stays
+// non-retryable, because re-running a step whose input the model already answered is worse than
+// failing it. Without this a libsql blip during a seal failed the step for good rather than moving
+// it to another worker.
+const TRANSIENT = new Set([
+  "ToolOutputStore.StorageError",
+  "SqlError",
+  "SqliteError",
+  // A rebuild that did not finish. git and the filesystem fail for reasons that pass, and the
+  // alternative is a turn failing for good because one worker had a bad minute.
+  "WorktreeMaterializer.MaterializeError",
+])
+
 export const runAtBoundary = async <A>(
   sessionID: string,
   signal: AbortSignal,
@@ -63,7 +77,7 @@ export const runAtBoundary = async <A>(
   throw ApplicationFailure.create({
     message: squashed?.message ?? Cause.pretty(cause),
     type: squashed?._tag ?? "SessionRunError",
-    nonRetryable: true,
+    nonRetryable: !(squashed?._tag !== undefined && TRANSIENT.has(squashed._tag)),
     details: encoded === undefined ? undefined : [encoded],
   })
 }

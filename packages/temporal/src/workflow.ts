@@ -18,11 +18,16 @@ import {
   CancellationScope,
   isCancellation,
   allHandlersFinished,
+  workflowInfo,
   log,
+  startChild,
+  getExternalWorkflowHandle,
+  ParentClosePolicy,
 } from "@temporalio/workflow"
+import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common"
 import type { StepActivities, SteppedTurnActivities } from "./activities"
-import { isHaltFailure, makeSteppedTurn } from "./l2-step"
-import { SIGNALS, RESUME_UPDATE } from "./protocol"
+import { isHaltFailure, isUnclaimedFailure, makeSteppedTurn } from "./l2-step"
+import { SIGNALS, RESUME_UPDATE, WORKFLOW_ID_PREFIX } from "./protocol"
 import { makeSupervisor, type SupervisorRuntime } from "./supervisor"
 
 const activityOptions = {
@@ -46,9 +51,39 @@ const { runTurnStep } = proxyActivities<StepActivities>(activityOptions)
 const { runModelCall } = proxyActivities<SteppedTurnActivities>(activityOptions)
 const { runToolCall } = proxyActivities<SteppedTurnActivities>(activityOptions)
 // Sealing is a snapshot, a diff and one event. It should not inherit a turn-sized backstop.
-const { sealStep } = proxyActivities<SteppedTurnActivities>({
-  ...activityOptions,
-  startToCloseTimeout: "10 minutes",
+const sealOptions = { ...activityOptions, startToCloseTimeout: "10 minutes" } as const
+const { sealStep } = proxyActivities<SteppedTurnActivities>(sealOptions)
+
+// How long a pinned activity waits for the worker that ran the model call to take it. It is polling
+// its own queue, so this is the time to notice it is gone rather than a queueing delay: nobody else
+// can take the work while it stands. Long enough to ride out a restart, short enough that a dead
+// worker does not hold the step for a noticeable part of a turn.
+const PINNED_SCHEDULE_TO_START = "30 seconds"
+
+/** The same two activities, addressed to one worker's own queue. Built per queue rather than once,
+ * because the queue is not known until the model call reports it; that report comes out of history,
+ * so this is deterministic on replay. */
+const pinnedTo = (taskQueue: string) => ({
+  runToolCall: proxyActivities<SteppedTurnActivities>({
+    ...activityOptions,
+    taskQueue,
+    scheduleToStartTimeout: PINNED_SCHEDULE_TO_START,
+  }).runToolCall,
+  sealStep: proxyActivities<SteppedTurnActivities>({
+    ...sealOptions,
+    taskQueue,
+    scheduleToStartTimeout: PINNED_SCHEDULE_TO_START,
+  }).sealStep,
+})
+
+// Admitting a prompt is a row in the store, so it is an activity; it is small and it must not hold
+// a firing open if no worker is polling.
+const { promptSession } = proxyActivities<{
+  promptSession(input: { sessionID: string; messageID: string; text: string }): Promise<void>
+}>({
+  startToCloseTimeout: "2 minutes",
+  scheduleToCloseTimeout: "30 minutes",
+  retry: { maximumAttempts: 10 },
 })
 
 export const wake = defineSignal(SIGNALS.wake)
@@ -109,20 +144,28 @@ const runtime: SupervisorRuntime = {
   allHandlersFinished,
   continueAsNew: (sessionID, startWithWake) =>
     continueAsNew<typeof sessionTurn>(sessionID, { startWithWake }),
+  // The server's own read of whether this run has grown enough to roll over. The drain count alone
+  // misses it: a stepped turn is thousands of events, so a handful of drains can cross the limit.
+  historyWantsRollover: () => workflowInfo().continueAsNewSuggested,
 }
 
 // Same supervisor, different step body: wake, interrupt, idle timeout and continue-as-new are
-// unchanged, and only what "one step" means differs.
-const steppedRuntime: SupervisorRuntime = {
+// unchanged, and only what "one step" means differs. Built per run rather than once, because
+// whether a step's tools may overlap rides the workflow input: the sandbox cannot read env.
+const steppedRuntime = (serial: boolean): SupervisorRuntime => ({
   ...runtime,
   runTurnStep: makeSteppedTurn({
     activities: { runModelCall, runToolCall, sealStep },
     isCancellation,
     isHalt: isHaltFailure,
+    isUnclaimed: isUnclaimedFailure,
+    pinnedTo,
+    serial,
+    nonCancellable: (fn) => CancellationScope.nonCancellable(fn),
     // The SDK's logger, so a line carries its workflow and run id and is suppressed on replay.
     log: (message, attributes) => log.info(message, attributes),
   }),
-}
+})
 
 // The scope of the drain currently running, so an interrupt signal can cancel exactly that turn.
 let activeDrainScope: CancellationScope | undefined
@@ -141,6 +184,10 @@ export interface SessionTurnOptions {
   /** Drive each step as a provider attempt, one activity per tool call, and a seal, instead of one
    * activity for the whole step. Off by default: the whole-step mode is what runs today. */
   readonly stepped?: boolean
+  /** Run a step's tool calls one at a time. Each ships the tree from the host that ran it, so two
+   * on two hosts each publish a tree without the other's work. The client decides, because only it
+   * can read whether the store is shared. */
+  readonly serialTools?: boolean
 }
 
 export async function sessionTurn(sessionID: string, options?: SessionTurnOptions): Promise<void> {
@@ -148,15 +195,56 @@ export async function sessionTurn(sessionID: string, options?: SessionTurnOption
   const startWithWake = options?.startWithWake ?? true
   const idleTimeout = options?.idleTimeout
   const stepped = options?.stepped === true
+  const serialTools = options?.serialTools === true
   if (!idleTimeout && !stepped) return workflows.sessionTurn(sessionID, startWithWake)
   return makeSupervisor(
     {
-      ...(stepped ? steppedRuntime : runtime),
+      ...(stepped ? steppedRuntime(serialTools) : runtime),
       // The mode has to survive the boundary, or a long session silently reverts to whole-step
       // activities the first time it rolls over.
       continueAsNew: (id, wake) =>
-        continueAsNew<typeof sessionTurn>(id, { startWithWake: wake, idleTimeout, stepped }),
+        continueAsNew<typeof sessionTurn>(id, {
+          startWithWake: wake,
+          idleTimeout,
+          stepped,
+          serialTools,
+        }),
     },
     idleTimeout ? { idleTimeout } : undefined,
   ).sessionTurn(sessionID, startWithWake)
+}
+
+/**
+ * A turn nobody started.
+ *
+ * A schedule fires this, and it runs where no client and no serve process exist: the prompt is
+ * admitted by an activity, because it is a row in the store, and the session's own supervisor is
+ * started as an abandoned child (or signalled, when it is already running). Nothing here waits for
+ * the turn: this workflow's job is to hand the work over and finish, which is what makes a firing
+ * cheap and a missed one visible in the schedule rather than in a run that never ends.
+ *
+ * The message id comes from the firing's own workflow id, so a re-drive admits the same prompt
+ * rather than a second one.
+ */
+export async function scheduledPrompt(input: {
+  readonly sessionID: string
+  readonly text: string
+  readonly session?: SessionTurnOptions
+}): Promise<void> {
+  const messageID = `msg_sched_${workflowInfo().workflowId}`.slice(0, 60)
+  await promptSession({ sessionID: input.sessionID, messageID, text: input.text })
+  const options: SessionTurnOptions = { ...input.session, startWithWake: true }
+  try {
+    await startChild(sessionTurn, {
+      workflowId: `${WORKFLOW_ID_PREFIX}${input.sessionID}`,
+      args: [input.sessionID, options],
+      parentClosePolicy: ParentClosePolicy.ABANDON,
+    })
+  } catch (error) {
+    // The session is already being driven, which is the ordinary case for a schedule that fires
+    // faster than a turn takes. The prompt is admitted either way; what it needs is a wake, because
+    // a supervisor waiting out its idle period is not watching the store.
+    if (!(error instanceof WorkflowExecutionAlreadyStartedError)) throw error
+    await getExternalWorkflowHandle(`${WORKFLOW_ID_PREFIX}${input.sessionID}`).signal(wake)
+  }
 }

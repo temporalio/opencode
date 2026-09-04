@@ -19,7 +19,10 @@ import type { DeferredToolCall, ToolCallOutcome } from "@opencode-ai/core/sessio
 import type { StepSettlement } from "@opencode-ai/core/session/runner/publish-llm-event"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionStore } from "@opencode-ai/core/session/store"
-import type { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { Prompt } from "@opencode-ai/schema/prompt"
+import type { Database } from "@opencode-ai/core/database/database"
 import { runAtBoundary } from "./boundary"
 import type { StepDrainInput, StepDrainResult } from "./drain"
 
@@ -39,6 +42,11 @@ export type ModelCallDrainResult =
       /** The event-log token this attempt claimed. The tool and seal activities of this step must
        * publish under it, so it travels with the calls instead of being minted again. */
       readonly owner: string
+      /** The queue this worker polls on its own, when it has one. The tools of this step write the
+       * tree this worker is standing in, so sending them here keeps them on it. Absent when the
+       * worker was not given a queue of its own, and never required: the step falls back to the
+       * shared queue and the tree is rebuilt there. */
+      readonly queue?: string
     }
 
 export interface ToolCallDrainInput {
@@ -66,9 +74,47 @@ export interface L2DrainDeps {
   readonly ctx: Context.Context<SessionStore.Service | LocationServiceMap.Service>
   readonly events: EventV2.Interface
   readonly worktrees: WorktreeMaterializer.Interface
+  /** The queue this worker polls on its own, reported by the model call so the rest of the step can
+   * be sent back to it. Absent when the worker has none. */
+  readonly stepQueue?: string
 }
 
-export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2DrainDeps) => {
+/**
+ * Admit a prompt to a session that already exists, without waking anything.
+ *
+ * This is what a start with no client is made of. A prompt is a durable row before it is work, and
+ * writing that row needs the store, which a workflow cannot reach; waking the session is the
+ * workflow's own job (it starts or signals the session's supervisor). Separating the two is what
+ * lets a schedule fire into a deployment where nothing is running but workers.
+ *
+ * Idempotent on the message id, which the workflow derives from the firing, so a re-driven activity
+ * admits nothing twice.
+ */
+export const makeScheduleDrains = ({
+  db,
+  events,
+  ctx,
+}: {
+  readonly db: Database.Interface["db"]
+  readonly events: EventV2.Interface
+  readonly ctx: Context.Context<SessionStore.Service | LocationServiceMap.Service>
+}) => ({
+  promptDrain: async (input: { readonly sessionID: string; readonly messageID: string; readonly text: string }) =>
+    SessionInput.admit(db, events, {
+      id: SessionMessage.ID.make(input.messageID),
+      sessionID: SessionSchema.ID.make(input.sessionID),
+      prompt: Prompt.make({ text: input.text }),
+      delivery: "queue",
+    }).pipe(
+      Effect.asVoid,
+      Effect.provideService(EventV2.EventOwner, `schedule:${input.messageID}`),
+      Effect.provide(ctx),
+      Effect.scoped,
+      Effect.runPromise,
+    ),
+})
+
+export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQueue }: L2DrainDeps) => {
   // One session, one owner, a present project tree. `claim` is true only for the model call: it is
   // the writer that supersedes a previous attempt, and the rest of the step rides its token.
   const inSession = <A>(
@@ -135,6 +181,7 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
                     assistantMessageID: result.assistantMessageID,
                     needsContinuation: result.needsContinuation,
                     owner: input.owner,
+                    ...(stepQueue === undefined ? {} : { queue: stepQueue }),
                   },
         ),
       ),
