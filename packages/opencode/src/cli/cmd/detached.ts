@@ -4,12 +4,15 @@
 // These are thin HTTP clients on purpose. In a durable deployment the serve processes are
 // interchangeable (any of them reads the shared store and signals the same workflows), so a client
 // needs an endpoint and a session id, never a particular host. That is the whole reason a session
-// can outlive the process that started it, and it is why nothing here imports Temporal.
+// can outlive the process that started it, and it is why nothing here talks to Temporal. The one
+// exception is `doctor`, which reads the driver's own configuration module: it answers what this
+// deployment resolved, and a second copy of those rules living here is how the two would disagree.
 
 import type { Argv } from "yargs"
 import { cmd } from "./cmd"
 import { UI } from "../ui"
 import { ServerAuth } from "@/server/auth"
+import { TemporalConfig } from "@opencode-ai/temporal/config"
 
 const DEFAULT_URL = "http://127.0.0.1:4096"
 
@@ -99,6 +102,29 @@ export const SessionStartCommand = cmd({
       UI.error(error instanceof Error ? error.message : String(error))
       process.exitCode = 1
     }
+  },
+})
+
+// What this process resolved, and what is wrong with it. Deploying was a handful of variables that
+// have to agree, with no way to ask whether they did: every mistake in them fails as something
+// else, hours later, on whoever prompted the session rather than on whoever deployed it.
+export const SessionDoctorCommand = cmd({
+  command: "doctor",
+  describe: "what this deployment resolved, and what is wrong with it",
+  builder: (yargs: Argv) => yargs,
+  handler: async () => {
+    const config = TemporalConfig.fromEnv()
+    UI.println("opencode, temporal execution")
+    for (const [name, value] of Object.entries(TemporalConfig.describe(config))) {
+      UI.println(`  ${name}: ${value}`)
+    }
+    const problems = TemporalConfig.preflight(config)
+    for (const problem of problems) UI.println(`problem: ${problem}`)
+    if (problems.length > 0) {
+      process.exitCode = 1
+      return
+    }
+    UI.println("this deployment looks consistent")
   },
 })
 
