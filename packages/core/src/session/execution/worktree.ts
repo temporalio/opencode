@@ -190,8 +190,11 @@ const layer = Layer.effect(
                 Effect.gen(function* () {
                   // A half-built tree would pass the exists check forever, so what we created is
                   // removed. A tree that was already here is not ours to remove: a failed refresh
-                  // leaves it as stale as it was.
-                  if (!present)
+                  // leaves it as stale as it was. Asked of the reading taken inside the lock, which
+                  // is the only one that describes the directory this attempt started from: the
+                  // outer one is why the re-check exists, and a drain that materialized while this
+                  // one waited makes it name a directory that no longer exists.
+                  if (!here)
                     yield* Effect.promise(() => rm(tip.worktree, { recursive: true, force: true }))
                   yield* Effect.logError("failed to materialize worktree", {
                     worktree: tip.worktree,
