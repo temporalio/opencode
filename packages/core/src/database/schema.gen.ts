@@ -87,6 +87,18 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`permission_request\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`agent\` text,
+          \`payload\` text NOT NULL,
+          \`status\` text DEFAULT 'pending' NOT NULL,
+          \`message\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`permission\` (
           \`id\` text PRIMARY KEY,
           \`project_id\` text NOT NULL,
@@ -122,6 +134,17 @@ export default {
           \`time_initialized\` integer,
           \`sandboxes\` text NOT NULL,
           \`commands\` text
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`question_request\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`payload\` text NOT NULL,
+          \`status\` text DEFAULT 'pending' NOT NULL,
+          \`answers\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
         );
       `)
       yield* tx.run(`
@@ -236,11 +259,31 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(`
+        CREATE TABLE \`snapshot_pack\` (
+          \`id\` text PRIMARY KEY,
+          \`directory\` text NOT NULL,
+          \`worktree\` text NOT NULL,
+          \`tree\` text NOT NULL,
+          \`base\` text,
+          \`pack\` blob NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
+        );
+      `)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(
+        `CREATE INDEX \`permission_request_session_status_idx\` ON \`permission_request\` (\`session_id\`,\`status\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`permission_request_status_idx\` ON \`permission_request\` (\`status\`);`)
+      yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )
+      yield* tx.run(
+        `CREATE INDEX \`question_request_session_status_idx\` ON \`question_request\` (\`session_id\`,\`status\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`question_request_status_idx\` ON \`question_request\` (\`status\`);`)
       yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
@@ -269,6 +312,10 @@ export default {
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`snapshot_pack_directory_idx\` ON \`snapshot_pack\` (\`directory\`,\`time_created\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`snapshot_pack_worktree_idx\` ON \`snapshot_pack\` (\`worktree\`,\`time_created\`);`)
     })
   },
 } satisfies Omit<DatabaseMigration.Migration, "id">

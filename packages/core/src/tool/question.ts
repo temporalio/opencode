@@ -56,6 +56,10 @@ const layer = Layer.effectDiscard(
           description,
           input: Input,
           output: Output,
+          // Re-running the ask is safe: the durable question row has a deterministic id, so a
+          // crash-resume adopts the pending row (or returns answers that already landed) instead
+          // of failing the user's open questions.
+          idempotent: true,
           toModelOutput: ({ input, output }) => [
             { type: "text", text: toModelOutput(input.questions, output.answers) },
           ],
