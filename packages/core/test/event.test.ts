@@ -1,5 +1,7 @@
 import { describe, expect } from "bun:test"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
+import {
+  Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Stream,
+} from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
 import { Session } from "@opencode-ai/schema/session"
@@ -1128,6 +1130,100 @@ describe("EventV2", () => {
         durableData(aggregateID, "seed").messageID,
         durableData(aggregateID, "fresh").messageID,
       ])
+    }),
+  )
+
+  it.effect("admits every writer holding the claimed token, concurrently", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      // One step's writers share the token its model attempt claimed: the model call, each tool
+      // call, and the seal. They run as separate activities, so the fence has to admit all of them
+      // while still rejecting the attempt they superseded.
+      const step = "run-1:model-1:1"
+      const superseded = "run-1:model-1:0"
+
+      yield* events.claim(aggregateID, step)
+      yield* Effect.all(
+        ["model", "tool-a", "tool-b", "seal"].map((writer) =>
+          events
+            .publish(DurableMessage, durableData(aggregateID, writer))
+            .pipe(Effect.provideService(EventV2.EventOwner, step)),
+        ),
+        { concurrency: "unbounded" },
+      )
+      const stale = yield* events
+        .publish(DurableMessage, durableData(aggregateID, "zombie"))
+        .pipe(Effect.provideService(EventV2.EventOwner, superseded), Effect.exit)
+
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(String(stale)).toContain("Owner fence")
+      expect(rows.map((row) => row.seq)).toEqual([0, 1, 2, 3])
+      expect(rows.map((row) => (row.data as { messageID: string }).messageID).sort()).toEqual(
+        ["model", "tool-a", "tool-b", "seal"]
+          .map((writer) => durableData(aggregateID, writer).messageID)
+          .sort(),
+      )
+    }),
+  )
+
+  it.live("tails another writer's events only when the layer asked for a tick", () =>
+    Effect.gen(function* () {
+      // A second service over the SAME database with its OWN pubsub: exactly what a standalone
+      // worker is to the HTTP server. Its commits cannot reach the reader's wake map, so a tail
+      // that only listens for wakes sits there forever.
+      const tailSees = (options: EventV2.LayerOptions) =>
+        Effect.gen(function* () {
+          const reader = yield* EventV2.Service.pipe(Effect.provide(EventV2.layerWith(options)))
+          const writer = yield* EventV2.Service.pipe(Effect.provide(EventV2.layerWith()))
+          const aggregateID = Session.ID.create()
+          const tail = yield* reader
+            .durable({ aggregateID, after: -1 })
+            .pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
+          yield* Effect.sleep("50 millis")
+          yield* writer.publish(DurableMessage, durableData(aggregateID, "from-elsewhere"))
+          const collected = yield* Fiber.join(tail).pipe(Effect.timeoutOption("1 second"))
+          return Option.isSome(collected)
+        })
+
+      expect(yield* tailSees({ livePollInterval: "50 millis" })).toBe(true)
+      // Off unless asked for. One process wakes its own subscribers, so a tick there is a query per
+      // second per subscribed session for events that cannot exist.
+      expect(yield* tailSees({})).toBe(false)
+    }),
+  )
+
+  it.live("ends a durable tail when the event layer is released under it", () =>
+    Effect.gen(function* () {
+      const aggregateID = Session.ID.create()
+      // The layer needs its own closeable scope, and the consumer has to be forked into a scope
+      // that
+      // OUTLIVES it. Fork into the test's own scope and closing that scope interrupts the consumer
+      // before the finalizer runs, so a hung tail and a killed one look the same.
+      const outer = yield* Effect.scope
+      const layerScope = yield* Scope.make()
+      const ctx = yield* Layer.buildWithScope(EventV2.layerWith(), layerScope)
+      const events = yield* EventV2.Service.pipe(Effect.provideContext(ctx as never))
+      yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
+
+      const tail = yield* events
+        .durable({ aggregateID, after: -1 })
+        .pipe(Stream.runDrain, Effect.forkIn(outer))
+      yield* Effect.sleep("150 millis")
+      yield* Scope.close(layerScope, Exit.void)
+
+      // The tick never ends on its own, so it must not become what holds the tail open: a
+      // subscriber
+      // would outlive the layer and keep reading a database being torn down.
+      const settled = yield* Fiber.await(tail).pipe(Effect.timeout("5 seconds"), Effect.exit)
+      expect(Exit.isSuccess(settled)).toBe(true)
     }),
   )
 

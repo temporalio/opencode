@@ -1,11 +1,13 @@
 export * as EventV2 from "./event"
 
-import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
+import { Cause, Context, Duration, Effect, Layer, Option, PubSub, Queue, Schema } from "effect"
+import { Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
 import { and, asc, eq, gt, inArray } from "drizzle-orm"
 import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
+import { Flag } from "./flag/flag"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { isDeepStrictEqual } from "node:util"
@@ -174,6 +176,27 @@ export const allBounded = (events: Interface, capacity: number) =>
 
 export interface LayerOptions {
   readonly beforeAggregateRead?: (aggregateID: string) => Effect.Effect<void>
+  /** How often a durable tail re-reads on its own, on top of the in-process wake. The wake only
+   * fires for commits made in THIS process, so without a tick a subscriber cannot see events
+   * another process appended: a standalone worker's whole turn is invisible to a tail on the
+   * HTTP server.
+   * Zero (the default) relies on the wake alone, which is the whole story for a deployment that
+   * runs in one process. */
+  readonly livePollInterval?: Duration.Input
+}
+
+/** Chosen to be well under what a person notices in a transcript while staying one cheap indexed
+ * read per subscribed session. In-process commits still wake instantly; this only catches what the
+ * wake cannot see, so it is worth its cost only where another process writes: see `pollingNode`. */
+const DEFAULT_LIVE_POLL = Duration.seconds(1)
+
+// An operator's override, in milliseconds, for either node. Read at layer build rather than at
+// import, so a test or a CLI that sets it late still gets it.
+const configuredPoll = (fallback: Duration.Input): Duration.Input => {
+  const raw = Flag.OPENCODE_EVENT_POLL_MS
+  if (raw === undefined) return fallback
+  const millis = Number(raw)
+  return Number.isFinite(millis) && millis >= 0 ? millis : fallback
 }
 
 export const layerWith = (options?: LayerOptions) =>
@@ -186,7 +209,8 @@ export const layerWith = (options?: LayerOptions) =>
         typed: new Map<string, PubSub.PubSub<Payload>>(),
       }
       const projectors = new Map<string, Subscriber[]>()
-      // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
+      // TODO: Bind durable projectors to exact type+version before supporting incompatible
+      // historical payloads.
       const listeners = new Array<Subscriber>()
       const { db } = yield* Database.Service
 
@@ -619,7 +643,18 @@ export const layerWith = (options?: LayerOptions) =>
               ),
             )
             const historical = yield* read
-            const live = Stream.fromSubscription(wakes).pipe(
+            // Wake on either an in-process commit or the tick. A tick that finds nothing new reads
+            // zero rows and emits nothing, so an idle subscriber costs one indexed query per
+            // period.
+            const pollInterval = configuredPoll(options?.livePollInterval ?? Duration.zero)
+            const woken = Stream.fromSubscription(wakes)
+            // haltStrategy "left" keeps the wake stream as what ends the tail. The tick never ends,
+            // so the default ("both") would leave a subscriber hanging past the layer's own
+            // PubSub.shutdown, still reading from a database being torn down.
+            const source = Duration.isZero(Duration.fromInputUnsafe(pollInterval))
+              ? woken
+              : woken.pipe(Stream.merge(Stream.tick(pollInterval), { haltStrategy: "left" }))
+            const live = source.pipe(
               Stream.mapEffect(() => read),
               Stream.flattenIterable,
             )
@@ -660,3 +695,13 @@ export const layerWith = (options?: LayerOptions) =>
 
 const layer = layerWith()
 export const node = makeGlobalNode({ service: Service, layer: layer, deps: [Database.node] })
+
+// For a deployment where the process serving subscribers is not the only one appending: a serve
+// process driving sessions on standalone workers. The wake is published in-process, so without the
+// tick a worker's whole turn is invisible to a tail on the server. Composition roots that know they
+// are in that shape swap this in for `node`; everything else keeps the wake alone.
+export const pollingNode = makeGlobalNode({
+  service: Service,
+  layer: layerWith({ livePollInterval: DEFAULT_LIVE_POLL }),
+  deps: [Database.node],
+})

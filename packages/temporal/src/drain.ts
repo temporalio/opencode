@@ -1,11 +1,11 @@
 // The per-step drain body for the Temporal layer: it runs inside the runTurnStep activity. It wraps
-// one SessionRunner.runStep, claims the event log for the attempt, ensures the worktree, and encodes
+// one SessionRunner.runStep, claims the event log for the attempt, ensures the worktree, and
+// encodes
 // the error for the activity boundary. Local mode does not use this: it runs whole turns through
 // SessionRunner.run on the SessionRunCoordinator (execution/local.ts). Both modes go through the
 // same SessionRunner and the same durable event log.
 
-import { Cause, Context, Effect, Exit, type LayerMap } from "effect"
-import { ApplicationFailure } from "@temporalio/activity"
+import { Context, Effect, type LayerMap } from "effect"
 import type { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import type { Location } from "@opencode-ai/core/location"
 import type { LocationError, LocationServices } from "@opencode-ai/core/location-services"
@@ -14,9 +14,8 @@ import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktr
 import { SessionRunner } from "@opencode-ai/core/session/runner"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionStore } from "@opencode-ai/core/session/store"
-import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import type { SessionInput } from "@opencode-ai/core/session/input"
-import { encodeRunError } from "@opencode-ai/core/session/execution/run-error-codec"
+import { runAtBoundary } from "./boundary"
 // One step of a turn, as any executor drives it. `promotion` is null (not undefined) so it
 // serializes cleanly across an executor's process boundary.
 export interface StepDrainInput {
@@ -50,8 +49,10 @@ export interface DrainDeps {
 
 export const makeDrains = ({ store, locations, ctx, events, worktrees }: DrainDeps) => {
   // Run exactly one step of the turn (the supervisor loops it); returns the next loop state.
-  const stepDrain = async (input: StepDrainInput, signal: AbortSignal): Promise<StepDrainResult> => {
-    const exit = await Effect.runPromiseExit(
+  const stepDrain = async (input: StepDrainInput, signal: AbortSignal): Promise<StepDrainResult> =>
+    runAtBoundary(
+      input.sessionID,
+      signal,
       Effect.gen(function* () {
         const session = yield* store.get(SessionSchema.ID.make(input.sessionID))
         if (!session) return { ran: false, continue: false, step: input.step, promotion: null }
@@ -70,39 +71,10 @@ export const makeDrains = ({ store, locations, ctx, events, worktrees }: DrainDe
         ).pipe(Effect.provide(locations.get(session.location)))
         return { ran: r.ran, continue: r.continue, step: r.step, promotion: r.promotion ?? null }
       }).pipe(Effect.provideService(EventV2.EventOwner, input.owner), Effect.provide(ctx), Effect.scoped),
-      { signal },
+      // A whole step turns a declined permission into an interrupt to halt its own loop, so an
+      // interrupt with nothing cancelling it is that refusal and nothing else.
+      { declineIsInterrupt: true },
     )
-    if (Exit.isSuccess(exit)) return exit.value
-    const cause = exit.cause
-    if (Cause.hasInterruptsOnly(cause)) {
-      // Two interrupt sources: driver cancellation (the AbortSignal fired; rethrow its reason so
-      // the attempt records Cancelled, not Failed) and an internal halt like a user declining a
-      // permission (the signal did NOT fire). The latter must be non-retryable, or the supervisor
-      // re-drives a turn the user explicitly stopped.
-      if (signal.aborted)
-        throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
-      const declined = encodeRunError(
-        new SessionRunDeclinedError({ sessionID: SessionSchema.ID.make(input.sessionID) }),
-      )
-      throw ApplicationFailure.create({
-        message: "session run halted (user declined)",
-        type: "SessionRunDeclined",
-        nonRetryable: true,
-        details: declined === undefined ? undefined : [declined],
-      })
-    }
-    // A genuine run error is thrown non-retryable so Temporal surfaces it (to resume) rather than
-    // retrying; only crashes / task timeouts (never thrown here) go through the retry policy. The
-    // error is encoded faithfully in `details` so the caller can reconstruct the exact RunError.
-    const squashed = Cause.squash(cause) as { _tag?: string; message?: string }
-    const encoded = encodeRunError(squashed)
-    throw ApplicationFailure.create({
-      message: squashed?.message ?? Cause.pretty(cause),
-      type: squashed?._tag ?? "SessionRunError",
-      nonRetryable: true,
-      details: encoded === undefined ? undefined : [encoded],
-    })
-  }
 
   return { stepDrain }
 }

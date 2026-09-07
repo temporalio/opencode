@@ -18,8 +18,10 @@ import {
   CancellationScope,
   isCancellation,
   allHandlersFinished,
+  log,
 } from "@temporalio/workflow"
-import type { StepActivities } from "./activities"
+import type { StepActivities, SteppedTurnActivities } from "./activities"
+import { isHaltFailure, makeSteppedTurn } from "./l2-step"
 import { SIGNALS, RESUME_UPDATE } from "./protocol"
 import { makeSupervisor, type SupervisorRuntime } from "./supervisor"
 
@@ -27,7 +29,8 @@ const activityOptions = {
   // The heartbeat is the liveness bound (it stops within seconds of a worker death and Temporal
   // re-drives). startToClose is only the backstop for a drain that hangs while its process stays
   // alive, so it must comfortably exceed any legitimate turn: long tool runs, many steps, or a
-  // human taking their time over a permission ask. 30 minutes proved far too tight -- it hard-killed
+  // human taking their time over a permission ask. 30 minutes proved far too tight -- it
+  // hard-killed
   // legitimate turns and each kill opened a short two-writer window until the zombie attempt
   // noticed its heartbeat rejection.
   startToCloseTimeout: "12 hours",
@@ -36,6 +39,17 @@ const activityOptions = {
 } as const
 
 const { runTurnStep } = proxyActivities<StepActivities>(activityOptions)
+
+// The stepped mode's three activities, each with its own bounds. Separate proxies are the point of
+// the split, not an accident of it: a tool that hangs, or that is waiting on a human, no longer
+// holds the provider attempt and every other tool of the same step under one shared timeout.
+const { runModelCall } = proxyActivities<SteppedTurnActivities>(activityOptions)
+const { runToolCall } = proxyActivities<SteppedTurnActivities>(activityOptions)
+// Sealing is a snapshot, a diff and one event. It should not inherit a turn-sized backstop.
+const { sealStep } = proxyActivities<SteppedTurnActivities>({
+  ...activityOptions,
+  startToCloseTimeout: "10 minutes",
+})
 
 export const wake = defineSignal(SIGNALS.wake)
 export const interrupt = defineSignal(SIGNALS.interrupt)
@@ -46,7 +60,8 @@ const runtime: SupervisorRuntime = {
   // Short-circuit when the predicate already holds. Besides saving a round trip, this avoids a real
   // breakage: on @temporalio/workflow 1.21, calling condition(fn, timeout) when fn is already true
   // leaves the current CancellationScope cancelled, so the NEXT condition() throws CancelledFailure
-  // -- which the supervisor reads as an interrupt and the workflow completes without ever draining a
+  // -- which the supervisor reads as an interrupt and the workflow completes without ever draining
+  // a
   // turn. Checking fn() first keeps the timeout timer (and its scope) out of the already-true path.
   // A timed wait that does NOT use the SDK's condition(fn, timeout). On @temporalio/workflow 1.21
   // that variant cancels its internal timer scope on resolve and the cancellation LEAKS into the
@@ -87,12 +102,26 @@ const runtime: SupervisorRuntime = {
   cancelCurrentScope: () => activeDrainScope?.cancel(),
   isCancellation,
   // A per-turn interrupt cancels only the child drain scope; a real workflow cancellation cancels
-  // the root. Reliable now that the timed wait no longer cancels any scope (nothing contaminates the
+  // the root. Reliable now that the timed wait no longer cancels any scope (nothing contaminates
+  // the
   // root's consideredCancelled).
   isRootCancelled: () => rootScope?.consideredCancelled ?? false,
   allHandlersFinished,
   continueAsNew: (sessionID, startWithWake) =>
     continueAsNew<typeof sessionTurn>(sessionID, { startWithWake }),
+}
+
+// Same supervisor, different step body: wake, interrupt, idle timeout and continue-as-new are
+// unchanged, and only what "one step" means differs.
+const steppedRuntime: SupervisorRuntime = {
+  ...runtime,
+  runTurnStep: makeSteppedTurn({
+    activities: { runModelCall, runToolCall, sealStep },
+    isCancellation,
+    isHalt: isHaltFailure,
+    // The SDK's logger, so a line carries its workflow and run id and is suppressed on replay.
+    log: (message, attributes) => log.info(message, attributes),
+  }),
 }
 
 // The scope of the drain currently running, so an interrupt signal can cancel exactly that turn.
@@ -109,18 +138,25 @@ const workflows = makeSupervisor(runtime)
 export interface SessionTurnOptions {
   readonly startWithWake?: boolean
   readonly idleTimeout?: string
+  /** Drive each step as a provider attempt, one activity per tool call, and a seal, instead of one
+   * activity for the whole step. Off by default: the whole-step mode is what runs today. */
+  readonly stepped?: boolean
 }
 
 export async function sessionTurn(sessionID: string, options?: SessionTurnOptions): Promise<void> {
   rootScope = CancellationScope.current()
   const startWithWake = options?.startWithWake ?? true
   const idleTimeout = options?.idleTimeout
-  if (!idleTimeout) return workflows.sessionTurn(sessionID, startWithWake)
+  const stepped = options?.stepped === true
+  if (!idleTimeout && !stepped) return workflows.sessionTurn(sessionID, startWithWake)
   return makeSupervisor(
     {
-      ...runtime,
-      continueAsNew: (id, wake) => continueAsNew<typeof sessionTurn>(id, { startWithWake: wake, idleTimeout }),
+      ...(stepped ? steppedRuntime : runtime),
+      // The mode has to survive the boundary, or a long session silently reverts to whole-step
+      // activities the first time it rolls over.
+      continueAsNew: (id, wake) =>
+        continueAsNew<typeof sessionTurn>(id, { startWithWake: wake, idleTimeout, stepped }),
     },
-    { idleTimeout },
+    idleTimeout ? { idleTimeout } : undefined,
   ).sessionTurn(sessionID, startWithWake)
 }
