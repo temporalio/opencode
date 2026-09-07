@@ -66,11 +66,13 @@ const PINNED_SCHEDULE_TO_START = "30 seconds"
 const pinnedTo = (taskQueue: string) => ({
   runToolCall: proxyActivities<SteppedTurnActivities>({
     ...activityOptions,
+    retry: { maximumAttempts: 1 },
     taskQueue,
     scheduleToStartTimeout: PINNED_SCHEDULE_TO_START,
   }).runToolCall,
   sealStep: proxyActivities<SteppedTurnActivities>({
     ...sealOptions,
+    retry: { maximumAttempts: 1 },
     taskQueue,
     scheduleToStartTimeout: PINNED_SCHEDULE_TO_START,
   }).sealStep,
@@ -231,7 +233,7 @@ export async function scheduledPrompt(input: {
   readonly text: string
   readonly session?: SessionTurnOptions
 }): Promise<void> {
-  const messageID = `msg_sched_${workflowInfo().workflowId}`.slice(0, 60)
+  const messageID = `msg_sched_${workflowInfo().workflowId}`
   await promptSession({ sessionID: input.sessionID, messageID, text: input.text })
   const options: SessionTurnOptions = { ...input.session, startWithWake: true }
   try {

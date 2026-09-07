@@ -845,16 +845,27 @@ const layer = Layer.effect(
       // The durable record that this call is being run, published before the tool can do anything.
       // It is also the last point a fenced dispatch dies at: under a superseded owner this publish
       // fails and the tool never runs, instead of running and losing its result.
-      yield* events.publish(SessionEvent.Tool.Called, {
-        sessionID: input.sessionID,
-        timestamp: yield* DateTime.now,
-        assistantMessageID,
-        callID: input.call.id,
-        tool: input.call.name,
-        input: record(args),
-        // Deferred calls are never provider-executed: those are filtered out before the hand-off.
-        provider: { executed: false },
-      })
+      yield* events.publish(
+        SessionEvent.Tool.Called,
+        {
+          sessionID: input.sessionID,
+          timestamp: yield* DateTime.now,
+          assistantMessageID,
+          callID: input.call.id,
+          tool: input.call.name,
+          input: record(args),
+          // Deferred calls are never provider-executed: those are filtered out before the hand-off.
+          provider: { executed: false },
+        },
+        materialization.idempotent(input.call.name)
+          ? undefined
+          : {
+              // A shared step owner cannot distinguish overlapping dispatches of one call.
+              id: EventV2.ID.make(
+                `evt_dispatch_${JSON.stringify([input.sessionID, assistantMessageID, input.call.id])}`,
+              ),
+            },
+      )
       const settlement = yield* materialization
         .settle({
           sessionID: input.sessionID,

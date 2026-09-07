@@ -3,7 +3,7 @@
 // pinned here is the orchestration: the owner token reaches every writer, a settled step dispatches
 // nothing, a failed tool still lets the step close, and an interrupt is not swallowed.
 import { describe, it, expect } from "bun:test"
-import { isHaltFailure, makeSteppedTurn, type SteppedActivities } from "../src/l2-step"
+import { isHaltFailure, isUnclaimedFailure, makeSteppedTurn, type SteppedActivities } from "../src/l2-step"
 import { runAtBoundary } from "../src/boundary"
 import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
@@ -339,6 +339,73 @@ describe("stepped turn, pinned to a worker", () => {
     expect(refusals()).toBe(1)
     expect(tools).toHaveLength(1)
     expect(seals).toHaveLength(1)
+  })
+
+  it("waits for a started pinned sibling before moving another call to the shared queue", async () => {
+    const release = Promise.withResolvers<ToolCallDrainResult>()
+    const started = Promise.withResolvers<void>()
+    const refused = Promise.withResolvers<void>()
+    let completed = false
+    let overlap = false
+    const shared = fakes(withQueue, async () => {
+      overlap ||= !completed
+      return { outcome: "settled" }
+    })
+    const run = makeSteppedTurn({
+      activities: shared.activities,
+      isCancellation,
+      isHalt,
+      isUnclaimed: isUnclaimedFailure,
+      pinnedTo: () => ({
+        runToolCall: async (input) => {
+          if (input.call.id === "call_a") {
+            started.resolve()
+            const result = await release.promise
+            completed = true
+            return result
+          }
+          await started.promise
+          refused.resolve()
+          throw unclaimed()
+        },
+        sealStep: async () => SEALED,
+      }),
+    })(INPUT)
+    await refused.promise
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const sharedBeforeRelease = shared.tools.length
+    release.resolve({ outcome: "settled" })
+    await run
+
+    expect(sharedBeforeRelease).toBe(0)
+    expect(overlap).toBe(false)
+    expect(shared.tools.map((input) => input.call.id)).toEqual(["call_b"])
+    expect(shared.seals).toHaveLength(1)
+  })
+
+  it("does not migrate the tools or seal after a pinned sibling has an uncertain outcome", async () => {
+    const release = Promise.withResolvers<ToolCallDrainResult>()
+    const refused = Promise.withResolvers<void>()
+    const shared = fakes(withQueue)
+    const run = makeSteppedTurn({
+      activities: shared.activities,
+      isCancellation,
+      isHalt,
+      isUnclaimed: isUnclaimedFailure,
+      pinnedTo: () => ({
+        runToolCall: async (input) => {
+          if (input.call.id === "call_a") return release.promise
+          refused.resolve()
+          throw unclaimed()
+        },
+        sealStep: async () => SEALED,
+      }),
+    })(INPUT)
+    await refused.promise
+    release.reject(new Error("the started activity timed out"))
+    await expect(run).rejects.toThrow("the started activity timed out")
+    expect(shared.tools).toHaveLength(0)
+    expect(shared.seals).toHaveLength(0)
   })
 
   it("uses the shared queue when the model call reported no queue of its own", async () => {

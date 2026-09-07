@@ -51,8 +51,8 @@ import { SkillGuidance } from "@opencode-ai/core/skill/guidance"
 import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { Auth } from "@opencode-ai/llm/route"
-import { describe, expect } from "bun:test"
-import { Cause, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import { describe, expect, spyOn } from "bun:test"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import { testEffect } from "./lib/effect"
 
 const model = OpenAIChat.route
@@ -514,6 +514,41 @@ describe("SessionRunner tool dispatch", () => {
 
       expect(result.outcome).toBe("settled")
       expect(ran.echoed).toBe("hello")
+    }),
+  )
+
+  harness(callsTool).effect("executes one non-idempotent call once under overlapping dispatches", () =>
+    Effect.gen(function* () {
+      yield* seedSession
+      const ran = counters()
+      yield* registerProbes(ran)
+      const call = yield* deferOneCall
+      const runner = yield* SessionRunner.Service
+      const store = yield* SessionStore.Service
+      const read = store.message
+      const gate = yield* Deferred.make<void>()
+      let readers = 0
+      const spy = spyOn(store, "message").mockImplementation((id) =>
+        read(id).pipe(
+          Effect.tap((value) =>
+            Effect.gen(function* () {
+              if (readers >= 2) return
+              expect(toolPart(value ? [value.message] : [], call.id)?.state.status).toBe("pending")
+              readers++
+              if (readers === 2) yield* Deferred.succeed(gate, undefined)
+              yield* Deferred.await(gate)
+            }),
+          ),
+        ),
+      )
+      const outcomes = yield* Effect.all(
+        [runner.runToolCall({ sessionID, call }), runner.runToolCall({ sessionID, call })].map(Effect.exit),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())))
+
+      expect(readers).toBe(2)
+      expect(ran.write).toBe(1)
+      expect(outcomes.filter(Exit.isSuccess)).toHaveLength(1)
     }),
   )
 

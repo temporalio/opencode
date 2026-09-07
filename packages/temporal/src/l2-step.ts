@@ -36,12 +36,8 @@ export const isHaltFailure = (error: unknown) =>
   error instanceof ActivityFailure &&
   (error.cause as ApplicationFailure | undefined)?.type === HALTED_FAILURE_TYPE
 
-/**
- * Nobody took the work. This is the only failure a pinned dispatch is allowed to answer by moving
- * the work elsewhere: it means the queue was not polled, so the activity never started and no side
- * effect can have happened. Every other failure has to be reported as itself, because a tool that
- * ran and then failed must not be run again somewhere else.
- */
+// This permits migration only when pinned dispatches have no automatic retries.
+// A later attempt can time out in the queue after an earlier attempt took effect.
 export const isUnclaimedFailure = (error: unknown) =>
   error instanceof ActivityFailure &&
   error.cause instanceof TimeoutFailure &&
@@ -112,19 +108,21 @@ export const makeSteppedTurn =
     // step goes to it first, because it is the host holding the tree the tools are about to write.
     const pinned = model.queue && pinnedTo ? pinnedTo(model.queue) : undefined
     let unclaimed = false
-    // Pinned first, shared queue if nobody took it. `isUnclaimed` is the whole safety of that
-    // fallback: it is true only when the activity never started, so nothing can run twice. Once one
-    // dispatch has fallen back, the rest of the step goes straight to the shared queue: that worker
-    // is gone, and every later pin would pay the schedule-to-start wait to learn it again.
-    // What is left of a step whose worker is gone goes to the shared queue one at a time. There it
-    // can land on two hosts again, which is the case `serial` exists for, so the rule it applies
-    // from the start is applied here to the remainder.
+    let pinFailure: { reason: unknown } | undefined
+    // Shared dispatches must wait for the pinned batch because the hosts do not share a worktree.
     let shared: Promise<unknown> = Promise.resolve()
+    const pendingPins = new Set<Promise<unknown>>()
     const onShared = <A>(run: (on: SteppedActivities) => Promise<A>): Promise<A> => {
-      const next = shared.then(
-        () => run(activities),
-        () => run(activities),
-      )
+      const next = shared.then(async () => {
+        // Queue saturation can leave a sibling running on the pinned host.
+        const outcomes = await Promise.allSettled(pendingPins)
+        for (const outcome of outcomes) {
+          if (outcome.status === "rejected" && !isUnclaimed?.(outcome.reason))
+            pinFailure ??= { reason: outcome.reason }
+        }
+        if (pinFailure) throw pinFailure.reason
+        return run(activities)
+      })
       shared = next.then(
         () => undefined,
         () => undefined,
@@ -134,18 +132,27 @@ export const makeSteppedTurn =
     const viaPinned = async <A>(
       run: (on: Pick<SteppedActivities, "runToolCall" | "sealStep">) => Promise<A>,
     ): Promise<A> => {
+      if (pinFailure) throw pinFailure.reason
       if (!pinned || !isUnclaimed) return run(activities)
       if (unclaimed) return onShared(run)
+      const attempt = run(pinned)
+      pendingPins.add(attempt)
       try {
-        return await run(pinned)
+        return await attempt
       } catch (error) {
-        if (!isUnclaimed(error)) throw error
+        if (!isUnclaimed(error)) {
+          // A failed activity may still be writing, so neither a tool nor a seal may migrate.
+          pinFailure ??= { reason: error }
+          throw error
+        }
         unclaimed = true
-        log?.("the worker that ran the model call is gone; the step moves to the shared queue", {
+        log?.("the pinned queue did not start the activity; remaining calls move to the shared queue", {
           sessionID: input.sessionID,
           step: model.step,
         })
         return onShared(run)
+      } finally {
+        pendingPins.delete(attempt)
       }
     }
 

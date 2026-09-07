@@ -120,7 +120,7 @@ const layer = Layer.effect(
     const l2 = makeL2Drains({ store, locations, ctx, events, worktrees, stepQueue: STEP_QUEUE })
     // What a schedule fires into: admitting a prompt is a row in the store, and a workflow cannot
     // write one. Registered on every worker, because a firing lands wherever one is polling.
-    const schedules = makeScheduleDrains({ db, events, ctx })
+    const schedules = makeScheduleDrains({ db, events })
 
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.

@@ -93,11 +93,9 @@ export interface L2DrainDeps {
 export const makeScheduleDrains = ({
   db,
   events,
-  ctx,
 }: {
   readonly db: Database.Interface["db"]
   readonly events: EventV2.Interface
-  readonly ctx: Context.Context<SessionStore.Service | LocationServiceMap.Service>
 }) => ({
   promptDrain: async (input: { readonly sessionID: string; readonly messageID: string; readonly text: string }) =>
     SessionInput.admit(db, events, {
@@ -107,8 +105,8 @@ export const makeScheduleDrains = ({
       delivery: "queue",
     }).pipe(
       Effect.asVoid,
-      Effect.provideService(EventV2.EventOwner, `schedule:${input.messageID}`),
-      Effect.provide(ctx),
+      // Prompt admission must leave the active drain's ownership unchanged.
+      Effect.provideService(EventV2.EventOwner, undefined),
       Effect.scoped,
       Effect.runPromise,
     ),
