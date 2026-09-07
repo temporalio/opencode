@@ -676,6 +676,31 @@ Host-local state that does NOT ride the DB, so it is not reconstructed on a diff
   `${data}`
   (the XDG data dir) at shared storage to make them portable.
 
+### What recovers, and what a person has to answer for
+
+A review asked for the durability claims as a contract rather than as prose, with the check that
+fails without each answer. Local mode is the in-process coordinator (no server, no worker);
+Temporal mode is `OPENCODE_SESSION_EXECUTION=temporal`.
+
+| What fails | Local mode | Temporal mode | Pinned by |
+|---|---|---|---|
+| A prompt is accepted and nothing wakes to run it | the coordinator owns the wake, so a process that dies takes it | the prompt is an event in the shared log and the supervisor is signalled; a schedule firing admits the prompt itself and starts the supervisor, so nothing but workers has to be running | `scheduled-prompt-workflow.test.ts`, `schedule-drain.test.ts` |
+| The process dies mid-turn | nothing re-drives it; every step that finished is in the log | the step is re-driven on any worker and finalized from the log rather than re-run | `session-runner-resume.test.ts`, `scripts/detached-session-check.sh` |
+| A tool was in flight at the crash | the same rule decides, but nothing re-drives it | a tool that declares `idempotent: true` is re-run for a real result; every other one is marked interrupted and left for the model to redo | `session-runner-resume.test.ts` |
+| One call is dispatched twice | not reachable | the call runs once, and the admission event's id is derived from the session, the message and the call, so the repeat is the same row rather than a second one | `session-runner-model-call.test.ts` |
+| Two attempts of one step are alive at once | not reachable | claiming the event log is a compare and set, so the stale attempt is fenced out rather than fencing out the one that is running | `temporal-owner-token.test.ts`, `event-claim.test.ts` |
+| The user stops the turn | the coordinator owns the interrupt lifecycle | the drain's scope is cancelled and the supervisor keeps serving; a stop is reported as a stop and a crash as a crash | `session-run-coordinator.test.ts`, `temporal-harness-interrupt.test.ts`, `temporal-interrupt-classify.test.ts` |
+| A restart lands on a waiting approval | the ask is a row in the shared store, not an in-memory `Deferred` | same, and the ask can be listed and answered from a different process than the one blocked on it | `permission-durable.test.ts` |
+| A host publishes the project tree while it is behind | not reachable: one process, one directory | refused. The packs form a chain and the chain orders them, so a host with a slow clock cannot make its older tree the newest | `snapshot-chain.test.ts`, `worktree-materialize.test.ts` |
+| A worker has never seen the project | not reachable | the tree is rebuilt from the packs before the drain runs, at the path it was captured at | `worktree-materialize.test.ts`, `scripts/cross-host-check.sh` |
+| The session's history outgrows its run | not reachable | continue-as-new, counting every drain rather than only the wake-driven ones | `session-supervisor-rollover.test.ts` |
+| The worker a step was pinned to is gone | not reachable | the pin times out on schedule-to-start, which says the activity never started, so what is left of the step runs on the shared queue with nothing run twice | `l2-pinned-retry.test.ts`, `l2-step.test.ts` |
+
+What none of this recovers: a non-idempotent tool that was inside its own execution when the process
+died. Nothing in the store says whether the `git push` landed, so it is marked interrupted and the
+model decides. Declaring a tool idempotent is the only thing that changes that answer, and it is the
+harness author's call, not the wrapper's.
+
 ## A session that outlives its client
 
 Everything above makes a session survive a worker. Together the same pieces make it survive the
