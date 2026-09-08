@@ -12,7 +12,7 @@ import { Cause, Effect, Exit } from "effect"
 import { ApplicationFailure } from "@temporalio/activity"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
-import { encodeRunError } from "@opencode-ai/core/session/execution/run-error-codec"
+import { encodeRunError } from "./run-error-codec"
 import { HALTED_FAILURE_TYPE } from "./protocol"
 
 export interface BoundaryOptions {

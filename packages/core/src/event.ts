@@ -188,9 +188,7 @@ export interface LayerOptions {
 /** Chosen to be well under what a person notices in a transcript while staying one cheap indexed
  * read per subscribed session. In-process commits still wake instantly; this only catches what the
  * wake cannot see, so it is worth its cost only where another process writes: see `pollingNode`. */
-// Whether the token already on the row is a later attempt of the same activity execution than the
-// one claiming. Tokens are `run:activityId:attempt`, so only the attempt is comparable: two
-// different activity ids are two different units of work and neither supersedes the other.
+// Same-run tokens order retries and generated activity IDs. Cross-run age needs a separate epoch.
 const supersededBy = (held: string, claimer: string): boolean => {
   const split = (token: string) => {
     const cut = token.lastIndexOf(":")

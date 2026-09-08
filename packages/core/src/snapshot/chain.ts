@@ -1,14 +1,5 @@
-// The order snapshot packs go in, decided by the packs themselves rather than by a clock.
-//
-// Each push chains onto the one before it, so `base` already records the order. `time_created` is
-// whichever host wrote the row, and hosts do not agree on the time: a worker five minutes behind
-// makes its older tree look like the newest one, and every other host then checks that out over
-// the work they were shipped to carry. The chain has no such failure, because a host cannot invent
-// a parent it has not seen.
-//
-// Forks should not happen: only a host standing on the newest state may add to it. They are still
-// handled rather than assumed away, because a store written before that rule existed can hold one.
-// Depth decides, and the write clock is only the tiebreak between two rows at the same depth.
+// Parent depth avoids ordering an intact chain by clocks from different hosts.
+// Forks still use the timestamp tiebreaker. Ordering does not reject a competing publication.
 
 export interface ChainRow {
   readonly id: string

@@ -12,7 +12,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionInputTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { testEffect } from "@opencode-ai/core/testing/effect"
+import { testEffect } from "../../core/test/lib/effect"
 import { makeScheduleDrains } from "../src/l2-drain"
 
 const it = testEffect(

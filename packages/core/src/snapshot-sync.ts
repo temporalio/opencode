@@ -1,9 +1,6 @@
 export * as SnapshotSync from "./snapshot-sync"
 
-// Ships captured snapshot trees to the shared store as git packs, so a worker on another host can
-// rebuild the project worktree before it drains a session (see session/execution/worktree.ts).
-// Each push wraps the tree in a sync commit chained onto the previous push and packs only the
-// delta. Best-effort by design: a failed push degrades portability, never the turn.
+// Packs let a worker rebuild tracked files without sharing the live directory.
 
 import { readFile, rm } from "node:fs/promises"
 import os from "node:os"
@@ -26,7 +23,7 @@ import { readWorktreeTip, writeWorktreeTip } from "./snapshot/tip"
 import { Hash } from "./util/hash"
 
 export interface Interface {
-  /** Ship a captured tree to the shared store as an incremental pack. Never fails the caller. */
+  /** A stale tip fails the caller; packing and insertion errors are logged. */
   readonly push: (tree: Snapshot.ID) => Effect.Effect<void>
 }
 
@@ -74,14 +71,8 @@ const layer = Layer.effect(
         .pipe(Effect.orDie, Effect.map(chainHead))
 
     const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID) {
-      // Only a host standing on the store's newest state may add to it. One that never caught up
-      // packs its older files, becomes the newest by time, and every other host then checks that
-      // out over the work they were shipped to carry.
-      //
-      // Ahead of the note and outside the packing below, both deliberately. The note must not be
-      // moved for a ship that is not allowed, and the packing swallows its failures on purpose: a
-      // pack that does not reach the store costs the next host a rebuild from further back, where
-      // this is a host saying something untrue about the project.
+      // A host that has not caught up must not publish its older files as the next tree.
+      // This reading is not an atomic head claim and does not fence concurrent publishers.
       if (source) {
         const stoodOn = yield* readWorktreeTip(global.data, worktree)
         const ahead = yield* newest()
@@ -138,11 +129,7 @@ const layer = Layer.effect(
           .onConflictDoNothing()
           .run()
           .pipe(Effect.orDie)
-        // After the insert, never before it. The packing below swallows its failures, so a note
-        // written first and an insert that then failed named a tree the store never saw: `isBehind`
-        // finds no row for it and leaves the host where it is, while the ship guard compares that
-        // note with a head it can never match, so every later push from this host dies. Left at the
-        // last state the store agreed on, both keep working and the next push chains from there.
+        // A note must not name a state whose insertion failed.
         yield* writeWorktreeTip(global.data, worktree, tree)
       }).pipe(
         Effect.catchCauseIf(

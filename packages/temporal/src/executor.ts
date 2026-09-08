@@ -4,9 +4,8 @@ import { fileURLToPath } from "node:url"
 import { hostname } from "node:os"
 import { Effect, Layer, Option } from "effect"
 import { Client, Connection, WithStartWorkflowOperation } from "@temporalio/client"
-// Imported lazily inside the worker branch: the worker package drags webpack and swc (it bundles
-// the workflow from source at startup), which a compiled binary can neither bundle nor run. A
-// packaged serve runs OPENCODE_TEMPORAL_ROLE=client next to standalone workers instead.
+// This build leaves worker bundling dependencies outside the compiled client binary.
+// Standalone workers use the source-based workflow entry point below.
 
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import { EventV2 } from "@opencode-ai/core/event"
@@ -22,7 +21,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { eq } from "drizzle-orm"
 import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktree"
-import { toRunError } from "@opencode-ai/core/session/execution/run-error-codec"
+import { toRunError } from "./run-error-codec"
 import * as WF from "./workflow"
 import { TemporalConfig } from "./config"
 import { WORKFLOW_TYPE, WORKFLOW_ID_PREFIX, workflowId } from "./protocol"

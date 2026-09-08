@@ -42,7 +42,7 @@ import { describe, expect } from "bun:test"
 import { realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { Cause, Context, DateTime, Effect, Exit, Layer, Schema, Stream } from "effect"
-import { testEffect } from "../../testing/effect"
+import { testEffect } from "./effect"
 
 // The per-location service build resolves the session directory on disk, so it must exist.
 const WORKSPACE = AbsolutePath.make(realpathSync(tmpdir()))

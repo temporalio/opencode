@@ -31,13 +31,7 @@ import { SIGNALS, RESUME_UPDATE, WORKFLOW_ID_PREFIX } from "./protocol"
 import { makeSupervisor, type SupervisorRuntime } from "./supervisor"
 
 const activityOptions = {
-  // The heartbeat is the liveness bound (it stops within seconds of a worker death and Temporal
-  // re-drives). startToClose is only the backstop for a drain that hangs while its process stays
-  // alive, so it must comfortably exceed any legitimate turn: long tool runs, many steps, or a
-  // human taking their time over a permission ask. 30 minutes proved far too tight -- it
-  // hard-killed
-  // legitimate turns and each kill opened a short two-writer window until the zombie attempt
-  // noticed its heartbeat rejection.
+  // Human approvals can outlast a normal turn. Heartbeat expiry does not terminate the body.
   startToCloseTimeout: "12 hours",
   heartbeatTimeout: "10 seconds",
   retry: { maximumAttempts: 100 },
@@ -54,10 +48,7 @@ const { runToolCall } = proxyActivities<SteppedTurnActivities>(activityOptions)
 const sealOptions = { ...activityOptions, startToCloseTimeout: "10 minutes" } as const
 const { sealStep } = proxyActivities<SteppedTurnActivities>(sealOptions)
 
-// How long a pinned activity waits for the worker that ran the model call to take it. It is polling
-// its own queue, so this is the time to notice it is gone rather than a queueing delay: nobody else
-// can take the work while it stands. Long enough to ride out a restart, short enough that a dead
-// worker does not hold the step for a noticeable part of a turn.
+// A private queue can stop polling or run out of slots. Bound the wait before unstarted work moves.
 const PINNED_SCHEDULE_TO_START = "30 seconds"
 
 /** The same two activities, addressed to one worker's own queue. Built per queue rather than once,

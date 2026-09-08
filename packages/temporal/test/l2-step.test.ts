@@ -383,9 +383,92 @@ describe("stepped turn, pinned to a worker", () => {
     expect(shared.seals).toHaveLength(1)
   })
 
-  it("moves the rest of the step when the pinned worker stops heartbeating", async () => {
-    // The case the level exists to survive: the host holding the step dies with a tool in flight.
-    // It arrives as a failure of a started attempt, so refusing every one of those ends the turn.
+  it("keeps a pinned permission refusal out of the shared queue", async () => {
+    const shared = fakes({ ...withQueue, calls: [call("call_a")] })
+    const declined = new FakeHalt("declined")
+    const seals: SealDrainInput[] = []
+    const run = makeSteppedTurn({
+      activities: shared.activities,
+      isCancellation,
+      isHalt,
+      pinnedTo: () => ({
+        runToolCall: async () => { throw declined },
+        sealStep: async (input) => { seals.push(input); return SEALED },
+      }),
+    })(INPUT)
+
+    await expect(run).rejects.toBe(declined)
+    expect(shared.tools).toHaveLength(0)
+    expect(seals).toHaveLength(1)
+    expect(seals[0]?.needsContinuation).toBe(false)
+  })
+
+  it("stops an unclaimed sibling after a pinned permission refusal", async () => {
+    const release = Promise.withResolvers<ToolCallDrainResult>()
+    const refused = Promise.withResolvers<void>()
+    const shared = fakes(withQueue)
+    const declined = new FakeHalt("declined")
+    const run = makeSteppedTurn({
+      activities: shared.activities, isCancellation, isHalt,
+      pinnedTo: () => ({
+        runToolCall: async (input) => {
+          if (input.call.id === "call_a") return release.promise
+          refused.resolve()
+          throw unclaimed()
+        },
+        sealStep: async () => SEALED,
+      }),
+    })(INPUT)
+    await refused.promise
+    release.reject(declined)
+    await expect(run).rejects.toBe(declined)
+    expect(shared.tools).toHaveLength(0)
+    expect(shared.seals).toHaveLength(1)
+    expect(shared.seals[0]?.needsContinuation).toBe(false)
+  })
+
+  it("stops later serial calls after a pinned permission refusal", async () => {
+    const shared = fakes(withQueue)
+    const declined = new FakeHalt("declined")
+    const pinned: string[] = []
+    const seals: SealDrainInput[] = []
+    const run = makeSteppedTurn({
+      activities: shared.activities, isCancellation, isHalt, serial: true,
+      pinnedTo: () => ({
+        runToolCall: async (input) => {
+          pinned.push(input.call.id)
+          throw declined
+        },
+        sealStep: async (input) => { seals.push(input); return SEALED },
+      }),
+    })(INPUT)
+    await expect(run).rejects.toBe(declined)
+    expect(pinned).toEqual(["call_a"])
+    expect(shared.tools).toHaveLength(0)
+    expect(seals).toHaveLength(1)
+    expect(seals[0]?.needsContinuation).toBe(false)
+  })
+
+  it("stops later serial calls when the shared queue returns a refusal", async () => {
+    for (const queue of [undefined, "worker-queue"]) {
+      const declined = new FakeHalt("declined")
+      const shared = fakes({ ...withQueue, queue }, async () => { throw declined })
+      const run = makeSteppedTurn({
+        activities: shared.activities, isCancellation, isHalt, serial: true,
+        pinnedTo: () => ({
+          runToolCall: async () => { throw unclaimed() },
+          sealStep: async () => SEALED,
+        }),
+      })(INPUT)
+      await expect(run).rejects.toBe(declined)
+      expect(shared.tools.map((input) => input.call.id)).toEqual(["call_a"])
+      expect(shared.seals).toHaveLength(1)
+      expect(shared.seals[0]?.needsContinuation).toBe(false)
+    }
+  })
+
+  it("refuses migration when a started pinned attempt times out", async () => {
+    // Heartbeat expiry also covers a process that can still write its directory.
     const hostGone = () =>
       new ActivityFailure(
         "activity Heartbeat timeout",
@@ -396,27 +479,26 @@ describe("stepped turn, pinned to a worker", () => {
         new TimeoutFailure("heartbeat timed out", undefined, "HEARTBEAT" as never),
       )
     const shared = fakes(withQueue)
-    await makeSteppedTurn({
+    const failed = hostGone()
+    const run = makeSteppedTurn({
       activities: shared.activities,
       isCancellation,
       isHalt,
       isUnclaimed: isUnclaimedFailure,
       pinnedTo: () => ({
         runToolCall: async () => {
-          throw hostGone()
+          throw failed
         },
         sealStep: async () => SEALED,
       }),
     })(INPUT)
 
-    expect(shared.tools.map((input) => input.call.id)).toEqual(["call_a", "call_b"])
-    expect(shared.seals).toHaveLength(1)
+    await expect(run).rejects.toBe(failed)
+    expect(shared.tools).toHaveLength(0)
+    expect(shared.seals).toHaveLength(0)
   })
 
-  it("migrates the rest of the step only once an uncertain pinned sibling is over", async () => {
-    // The sibling's own work may be stranded on that host, which the snapshot chain refuses and
-    // salvages. What must not happen is the rest of the step going with it: a step that never
-    // seals leaves a call no result answers, and the next model call cannot be made from that.
+  it("refuses shared dispatch after an uncertain pinned sibling settles", async () => {
     const release = Promise.withResolvers<ToolCallDrainResult>()
     const refused = Promise.withResolvers<void>()
     let sharedBeforeTheSiblingEnded = 0
@@ -438,15 +520,13 @@ describe("stepped turn, pinned to a worker", () => {
     await refused.promise
     await new Promise((resolve) => setTimeout(resolve, 0))
     sharedBeforeTheSiblingEnded = shared.tools.length
-    release.reject(new Error("the started activity timed out"))
-    await run
+    const failed = new Error("the started activity timed out")
+    release.reject(failed)
+    await expect(run).rejects.toBe(failed)
 
     expect(sharedBeforeTheSiblingEnded).toBe(0)
-    // Both of them, including the one whose pinned attempt failed: it is dispatched again on the
-    // shared queue, where the recorded call and its dispatch identity are what stop a
-    // non-idempotent tool from running a second time.
-    expect(shared.tools.map((input) => input.call.id).sort()).toEqual(["call_a", "call_b"])
-    expect(shared.seals).toHaveLength(1)
+    expect(shared.tools).toHaveLength(0)
+    expect(shared.seals).toHaveLength(0)
   })
 
   it("uses the shared queue when the model call reported no queue of its own", async () => {

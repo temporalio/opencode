@@ -1,16 +1,14 @@
 // One step as three units of work instead of one: the provider attempt, each tool call it asks for,
-// and the seal that closes it. This is the whole point of the split, and it is workflow code, so
-// the
+// and the seal that closes it. That is the whole point of the split, and it is workflow code, so the
 // model-to-tools loop lives where retries, timers, approvals and budgets can sit between the two.
 //
-// MUST stay pure, like supervisor.ts: this is bundled into the workflow sandbox, so no `effect`, no
-// `@opencode-ai/core` runtime imports, no Node builtins. Type-only imports are erased and safe.
+// MUST stay pure, like `supervisor.ts`: this is bundled into the workflow sandbox, so no `effect`,
+// no `@opencode-ai/core` runtime imports, no Node builtins. Type-only imports are erased and safe.
 //
 // What this costs, stated plainly: a whole-step activity starts each tool the moment the model asks
 // for it, while the stream is still going. Here the attempt has to return before any tool starts,
 // because a workflow cannot consume a stream. The tools of one step still run concurrently with
-// each
-// other; what is lost is the overlap between the model and its own tools.
+// each other; what is lost is the overlap between the model and its own tools.
 
 import { ActivityFailure, type ApplicationFailure, TimeoutFailure } from "@temporalio/workflow"
 import { HALTED_FAILURE_TYPE } from "./protocol"
@@ -72,7 +70,7 @@ export interface SteppedTurnDeps {
   /** The same activities, addressed to one worker's own queue. A step's tools write the tree the
    * model call's worker is standing in, so keeping them there is what lets them run at once: they
    * see each other's writes through the filesystem rather than through the store. Only offered a
-   * queue the model call reported, and only used while that worker is still polling. */
+   * queue the model call reported. Only a dispatch that queue never started may move off it. */
   readonly pinnedTo?: (queue: string) => Pick<SteppedActivities, "runToolCall" | "sealStep">
   /** Whether a failure means nobody took the work, which is the one kind a pinned dispatch answers
    * by trying the shared queue instead. */
@@ -109,15 +107,22 @@ export const makeSteppedTurn =
     // step goes to it first, because it is the host holding the tree the tools are about to write.
     const pinned = model.queue && pinnedTo ? pinnedTo(model.queue) : undefined
     let unclaimed = false
+    let uncertain: { error: unknown } | undefined
+    let stopped: { error: unknown } | undefined
+    const observeStop = (error: unknown): never => {
+      if (isCancellation(error) || isHalt(error)) stopped = { error }
+      throw error
+    }
     // Shared dispatches must wait for the pinned batch because the hosts do not share a worktree.
     let shared: Promise<unknown> = Promise.resolve()
     const pendingPins = new Set<Promise<unknown>>()
-    const onShared = <A>(run: (on: SteppedActivities) => Promise<A>): Promise<A> => {
+    const onShared = <A>(run: (on: SteppedActivities) => Promise<A>, allowStopped = false): Promise<A> => {
       const next = shared.then(async () => {
-        // Queue saturation can leave a sibling running on the pinned host, so nothing starts here
-        // until every pinned attempt of this step is over, one way or the other.
+        // Queue saturation can leave a sibling running on the pinned host.
         await Promise.allSettled(pendingPins)
-        return run(activities)
+        if (uncertain) throw uncertain.error
+        if (stopped && !allowStopped) throw stopped.error
+        return run(activities).catch(observeStop)
       })
       shared = next.then(
         () => undefined,
@@ -125,31 +130,37 @@ export const makeSteppedTurn =
       )
       return next
     }
-    // Everything except the turn being stopped moves. What makes that safe is not a judgement about
-    // the pinned host, which cannot be observed from here: it is the barrier above, which starts
-    // nothing shared until every pinned attempt has settled, and then the guards on the durable
-    // things. A stranded host that pushes a snapshot late is refused by the chain, because a pack
-    // names the one it was built on and only a host standing on the head may add to it. A stale
-    // step is fenced out of the event log by the owner token's compare and set. Refusing to move
-    // instead ended the turn, and that strands exactly the same work while losing the rest of the
-    // step as well.
+    // A timeout settles the workflow promise; it does not stop the tool process behind it. So a
+    // pinned attempt that started is not evidence that its directory is free, and the rest of the
+    // step stays off that host until the process is known to have stopped or its workspace is its
+    // own. Only a dispatch nobody started moves, and only after every pinned sibling has settled.
     const viaPinned = async <A>(
       run: (on: Pick<SteppedActivities, "runToolCall" | "sealStep">) => Promise<A>,
+      allowStopped = false,
     ): Promise<A> => {
-      if (!pinned) return run(activities)
-      if (unclaimed) return onShared(run)
+      if (stopped && !allowStopped) throw stopped.error
+      if (uncertain) throw uncertain.error
+      if (!pinned) return run(activities).catch(observeStop)
+      if (unclaimed) return onShared(run, allowStopped)
       const attempt = run(pinned)
       pendingPins.add(attempt)
       try {
         return await attempt
       } catch (error) {
-        if (isCancellation(error)) throw error
+        if (isCancellation(error) || isHalt(error)) {
+          stopped = { error }
+          throw error
+        }
+        if (!(isUnclaimed ?? isUnclaimedFailure)(error)) {
+          uncertain = { error }
+          throw error
+        }
         unclaimed = true
-        log?.("the pinned attempt did not come back; remaining calls move to the shared queue", {
+        log?.("the pinned activity did not start; remaining calls move to the shared queue", {
           sessionID: input.sessionID,
           step: model.step,
         })
-        return onShared(run)
+        return onShared(run, allowStopped)
       } finally {
         pendingPins.delete(attempt)
       }
@@ -191,6 +202,7 @@ export const makeSteppedTurn =
           needsContinuation: stopped ? false : model.needsContinuation,
           owner: model.owner,
         }),
+        stopped,
       )
 
     for (const outcome of dispatched) {
