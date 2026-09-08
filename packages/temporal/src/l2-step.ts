@@ -43,6 +43,17 @@ export const isUnclaimedFailure = (error: unknown) =>
   error.cause instanceof TimeoutFailure &&
   error.cause.timeoutType === "SCHEDULE_TO_START"
 
+// The worker that took the work stopped reporting. A dispatch heartbeats for as long as it is
+// alive, so the server declaring the heartbeat dead says the host is gone rather than that a tool
+// is still running on it. Moving on is safe for a different reason than an unclaimed dispatch: not
+// because nothing ran, but because a declared-idempotent tool is the only one a retry re-runs and
+// the snapshot chain refuses a publish from a host that is behind. Start-to-close is deliberately
+// absent, since that expires while the worker is still heartbeating.
+export const isHostLostFailure = (error: unknown) =>
+  error instanceof ActivityFailure &&
+  error.cause instanceof TimeoutFailure &&
+  error.cause.timeoutType === "HEARTBEAT"
+
 /** The three activities a stepped turn drives. */
 export interface SteppedActivities {
   readonly runModelCall: (input: ModelCallDrainInput) => Promise<ModelCallDrainResult>
@@ -76,6 +87,8 @@ export interface SteppedTurnDeps {
   /** Whether a failure means nobody took the work, which is the one kind a pinned dispatch answers
    * by trying the shared queue instead. */
   readonly isUnclaimed?: (error: unknown) => boolean
+  /** Whether the worker that took the work is gone. See `isHostLostFailure`. */
+  readonly isHostLost?: (error: unknown) => boolean
   /** Run something where the driver's cancellation cannot reach it. An interrupt landing during the
    * tool phase otherwise leaves the step with no ending published at all, so a follower waiting on
    * the turn never hears it stop. */
@@ -97,6 +110,7 @@ export const makeSteppedTurn =
     nonCancellable,
     pinnedTo,
     isUnclaimed,
+    isHostLost,
   }: SteppedTurnDeps) =>
   async (input: StepDrainInput): Promise<StepDrainResult> => {
     const model = await activities.runModelCall(input)
@@ -117,7 +131,7 @@ export const makeSteppedTurn =
         // Queue saturation can leave a sibling running on the pinned host.
         const outcomes = await Promise.allSettled(pendingPins)
         for (const outcome of outcomes) {
-          if (outcome.status === "rejected" && !isUnclaimed?.(outcome.reason))
+          if (outcome.status === "rejected" && !movable(outcome.reason))
             pinFailure ??= { reason: outcome.reason }
         }
         if (pinFailure) throw pinFailure.reason
@@ -129,6 +143,8 @@ export const makeSteppedTurn =
       )
       return next
     }
+    // Either nobody took the work, or whoever did is not there any more.
+    const movable = (error: unknown) => isUnclaimed?.(error) === true || isHostLost?.(error) === true
     const viaPinned = async <A>(
       run: (on: Pick<SteppedActivities, "runToolCall" | "sealStep">) => Promise<A>,
     ): Promise<A> => {
@@ -140,13 +156,13 @@ export const makeSteppedTurn =
       try {
         return await attempt
       } catch (error) {
-        if (!isUnclaimed(error)) {
+        if (!movable(error)) {
           // A failed activity may still be writing, so neither a tool nor a seal may migrate.
           pinFailure ??= { reason: error }
           throw error
         }
         unclaimed = true
-        log?.("the pinned queue did not start the activity; remaining calls move to the shared queue", {
+        log?.("the pinned worker is not answering; remaining calls move to the shared queue", {
           sessionID: input.sessionID,
           step: model.step,
         })

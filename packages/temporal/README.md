@@ -655,7 +655,10 @@ The rules that bound it, because checking a stored tree out over the wrong one d
   the tree to each other, which is what lets them run at once again. What keeps this from being a
   worse kind of stuck than the shared queue: the pinned dispatch carries a 30 second
   `scheduleToStartTimeout`, and that failure means the activity never started, so the work moves to
-  the shared queue with nothing run twice. Whatever is left of that step then goes one at a time,
+  the shared queue with nothing run twice. A worker that stops heartbeating moves it too, for a
+  different reason: a dispatch heartbeats while it is alive, so the server calling the heartbeat
+  dead says the host is gone rather than that a tool is still writing there. Refusing that one as
+  well made a worker dying mid-tool end the turn instead of continuing it elsewhere. Whatever is left of that step then goes one at a time,
   because on the shared queue it can land on two hosts again.
 - **A step's tools otherwise run one at a time wherever the store is shared**
   (`OPENCODE_TEMPORAL_SERIAL_TOOLS=1`, and the default only when step affinity is off). Two on two
@@ -694,7 +697,7 @@ Temporal mode is `OPENCODE_SESSION_EXECUTION=temporal`.
 | A host publishes the project tree while it is behind | not reachable: one process, one directory | refused. The packs form a chain and the chain orders them, so a host with a slow clock cannot make its older tree the newest | `snapshot-chain.test.ts`, `worktree-materialize.test.ts` |
 | A worker has never seen the project | not reachable | the tree is rebuilt from the packs before the drain runs, at the path it was captured at | `worktree-materialize.test.ts`, `scripts/cross-host-check.sh` |
 | The session's history outgrows its run | not reachable | continue-as-new, counting every drain rather than only the wake-driven ones | `session-supervisor-rollover.test.ts` |
-| The worker a step was pinned to is gone | not reachable | the pin times out on schedule-to-start, which says the activity never started, so what is left of the step runs on the shared queue with nothing run twice | `l2-pinned-retry.test.ts`, `l2-step.test.ts` |
+| The worker a step was pinned to is gone | not reachable | two ways, and both move the work to the shared queue with nothing run twice: the pin times out on schedule-to-start, which says nothing started, or the worker stops heartbeating, which says the host is gone | `l2-pinned-retry.test.ts`, `l2-step.test.ts` |
 
 What none of this recovers: a non-idempotent tool that was inside its own execution when the process
 died. Nothing in the store says whether the `git push` landed, so it is marked interrupted and the

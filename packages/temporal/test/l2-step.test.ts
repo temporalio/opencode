@@ -3,7 +3,13 @@
 // pinned here is the orchestration: the owner token reaches every writer, a settled step dispatches
 // nothing, a failed tool still lets the step close, and an interrupt is not swallowed.
 import { describe, it, expect } from "bun:test"
-import { isHaltFailure, isUnclaimedFailure, makeSteppedTurn, type SteppedActivities } from "../src/l2-step"
+import {
+  isHaltFailure,
+  isHostLostFailure,
+  isUnclaimedFailure,
+  makeSteppedTurn,
+  type SteppedActivities,
+} from "../src/l2-step"
 import { runAtBoundary } from "../src/boundary"
 import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
@@ -380,6 +386,37 @@ describe("stepped turn, pinned to a worker", () => {
     expect(sharedBeforeRelease).toBe(0)
     expect(overlap).toBe(false)
     expect(shared.tools.map((input) => input.call.id)).toEqual(["call_b"])
+    expect(shared.seals).toHaveLength(1)
+  })
+
+  it("moves the rest of the step when the pinned worker stops heartbeating", async () => {
+    // The case the level exists to survive: the host holding the step dies with a tool in flight.
+    // It arrives as a failure of a started attempt, so refusing every one of those ends the turn.
+    const hostGone = () =>
+      new ActivityFailure(
+        "activity Heartbeat timeout",
+        "runToolCall",
+        "1",
+        undefined,
+        undefined,
+        new TimeoutFailure("heartbeat timed out", undefined, "HEARTBEAT" as never),
+      )
+    const shared = fakes(withQueue)
+    await makeSteppedTurn({
+      activities: shared.activities,
+      isCancellation,
+      isHalt,
+      isUnclaimed: isUnclaimedFailure,
+      isHostLost: isHostLostFailure,
+      pinnedTo: () => ({
+        runToolCall: async () => {
+          throw hostGone()
+        },
+        sealStep: async () => SEALED,
+      }),
+    })(INPUT)
+
+    expect(shared.tools.map((input) => input.call.id)).toEqual(["call_a", "call_b"])
     expect(shared.seals).toHaveLength(1)
   })
 
