@@ -53,6 +53,8 @@ export interface ToolCallDrainInput {
   readonly sessionID: string
   readonly call: DeferredToolCall
   readonly owner: string
+  /** Which step this call belongs to, so a host can tell it from a call an earlier step left. */
+  readonly step: number
 }
 
 export interface ToolCallDrainResult {
@@ -112,6 +114,13 @@ export const makeScheduleDrains = ({
     ),
 })
 
+// A call, as the host records it: enough to tell this step's writers from an earlier step's.
+const writer = (input: ToolCallDrainInput) => ({
+  sessionID: input.sessionID,
+  step: input.step,
+  callID: input.call.id,
+})
+
 export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQueue }: L2DrainDeps) => {
   // One session, one owner, a present project tree. `claim` is true only for the model call: it is
   // the writer that supersedes a previous attempt, and the rest of the step rides its token.
@@ -123,6 +132,7 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQue
       runner: SessionRunner.Interface,
       session: SessionSchema.Info,
     ) => Effect.Effect<A, SessionRunner.RunError>,
+    current?: { readonly sessionID: string; readonly step: number; readonly callID: string },
   ) =>
     Effect.gen(function* () {
       const session = yield* store.get(SessionSchema.ID.make(sessionID))
@@ -131,8 +141,8 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQue
       if (!session) return undefined
       if (claim) yield* events.claim(session.id, owner)
       // A worker taking this step on a host without the project tree rebuilds it from snapshot
-      // packs.
-      yield* worktrees.ensure(session.location.directory)
+      // packs, unless a call of an earlier step never came back on this host.
+      yield* worktrees.ensure(session.location.directory, current ? { current } : undefined)
       return yield* SessionRunner.Service.use((runner) => use(runner, session)).pipe(
         Effect.provide(locations.get(session.location)),
       )
@@ -196,19 +206,32 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQue
     runAtBoundary(
       input.sessionID,
       signal,
-      inSession(input.sessionID, input.owner, false, (runner, session) =>
-        runner.runToolCall({ sessionID: session.id, call: input.call }).pipe(
-          // A stop landing mid-tool leaves the call recorded as running, where a whole step closes
-          // the tools it opened before it returns. Nothing else closes it until the next turn's
-          // entry check, so a transcript would show the call still going long after the stop.
-          Effect.onInterrupt(() =>
-            turnEnded()
-              ? runner
-                  .failToolCall({ sessionID: session.id, call: input.call })
-                  .pipe(Effect.ignore)
-              : Effect.void,
+      inSession(
+        input.sessionID,
+        input.owner,
+        false,
+        (runner, session) =>
+          Effect.acquireUseRelease(
+            // Said before the tool can touch anything, and taken back when its body returns. It is
+            // the only record on this host of a call still inside its own execution, and what a
+            // later step reads before it uses this directory: a timeout settles the workflow's
+            // promise without stopping the process behind it.
+            worktrees.beginWrite(session.location.directory, writer(input)),
+            () =>
+              runner.runToolCall({ sessionID: session.id, call: input.call }).pipe(
+                // A stop landing mid-tool leaves the call recorded as running, where a whole step
+                // closes the tools it opened before it returns. Nothing else closes it until the
+                // next turn's entry check, so a transcript would show the call still going long
+                // after the stop.
+                Effect.onInterrupt(() =>
+                  turnEnded()
+                    ? runner.failToolCall({ sessionID: session.id, call: input.call }).pipe(Effect.ignore)
+                    : Effect.void,
+                ),
+              ),
+            () => worktrees.endWrite(session.location.directory, input.call.id),
           ),
-        ),
+        writer(input),
       ).pipe(Effect.map((result) => result ?? { outcome: "already-settled" as const })),
     )
 

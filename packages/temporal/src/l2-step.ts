@@ -170,7 +170,11 @@ export const makeSteppedTurn =
     // the seal closes its call as an error and the model gets to react, which is better than losing
     // the step. A cancel and a user halt are different, and both have to propagate.
     const dispatch = (call: (typeof model.calls)[number]) =>
-      viaPinned((on) => on.runToolCall({ sessionID: input.sessionID, call, owner: model.owner }))
+      viaPinned((on) =>
+        // The step travels with the call, because the host tells this step's writers from an
+        // earlier step's by it.
+        on.runToolCall({ sessionID: input.sessionID, call, owner: model.owner, step: model.step }),
+      )
     const dispatched: PromiseSettledResult<ToolCallDrainResult>[] = []
     if (serial) {
       // One at a time, and still settled rather than thrown, so a tool that fails does not take the

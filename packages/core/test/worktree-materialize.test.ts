@@ -451,3 +451,57 @@ describe("WorktreeMaterializer", () => {
     }),
   )
 })
+
+describe("WorktreeMaterializer quarantine", () => {
+  // Refusing to move a step off a host protects that step and nothing after it: the turn ends, the
+  // next prompt lands wherever there is room, and the tool from before can still be writing. A
+  // marker says which calls are inside their own execution, and the directory belongs to that
+  // call's step until it returns.
+  it.live("refuses a directory to another step while an earlier call has not returned", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const root = realpathSync(tmp.path)
+      const worktree = path.join(root, "project")
+      const file = path.join(root, "shared.db")
+      const data = path.join(root, "host-data")
+      yield* Effect.promise(async () => {
+        await mkdir(worktree, { recursive: true })
+        await $`git init -q ${worktree}`.quiet()
+        await $`git -C ${worktree} config user.email t@t`.quiet()
+        await $`git -C ${worktree} config user.name t`.quiet()
+        await writeFile(path.join(worktree, "tracked.txt"), "v1\n")
+        await $`git -C ${worktree} add .`.quiet()
+        await $`git -C ${worktree} commit -qm seed`.quiet()
+      })
+
+      const A = yield* Layer.build(captureStack(file, worktree, data))
+      const captured = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
+      if (!captured) throw new Error("expected a capture")
+      yield* SnapshotSync.Service.use((s) => s.push(captured)).pipe(Effect.provide(A))
+
+      const B = yield* Layer.build(materializeStack(file, data))
+      const worktrees = yield* WorktreeMaterializer.Service.pipe(Effect.provide(B))
+
+      // A call of an earlier step that never came back.
+      const stranded = { sessionID: "ses_one", step: 1, callID: "call_stranded" }
+      yield* worktrees.beginWrite(worktree, stranded)
+
+      // Another step wants the directory. It is not this call's step, so it is refused, and the
+      // refusal is a defect the activity boundary turns into a failure Temporal schedules again.
+      const later = { sessionID: "ses_one", step: 2, callID: "call_later" }
+      const refused = yield* Effect.exit(worktrees.ensure(worktree, { current: later }))
+      expect(refused._tag).toBe("Failure")
+
+      // A sibling of the same step is not stranded: two tools of one step share this directory by
+      // design, and refusing them would be refusing the feature.
+      const sibling = { sessionID: "ses_one", step: 1, callID: "call_sibling" }
+      const allowed = yield* Effect.exit(worktrees.ensure(worktree, { current: sibling }))
+      expect(allowed._tag).toBe("Success")
+
+      // When the call comes back, whatever it did to the directory, it is not still doing it.
+      yield* worktrees.endWrite(worktree, stranded.callID)
+      const afterReturn = yield* Effect.exit(worktrees.ensure(worktree, { current: later }))
+      expect(afterReturn._tag).toBe("Success")
+    }),
+  )
+})

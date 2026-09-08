@@ -28,6 +28,7 @@ import { AbsolutePath } from "../../schema"
 import { SnapshotPackTable } from "../../snapshot/sql"
 import { chainHead, isBehind, orderChain } from "../../snapshot/chain"
 import { readWorktreeTip, writeWorktreeTip } from "../../snapshot/tip"
+import * as Writers from "../../snapshot/writers"
 
 export interface Interface {
   /**
@@ -47,8 +48,20 @@ export interface Interface {
    */
   readonly ensure: (
     directory: string,
-    options?: { readonly pauseBeforeLock?: number },
+    options?: {
+      readonly pauseBeforeLock?: number
+      /**
+       * The step asking for the directory. A call of another step that never came back keeps it,
+       * because a settled workflow promise does not stop the process behind it. Omitted by callers
+       * that are not a step, and then any stranded call refuses them.
+       */
+      readonly current?: Writers.Writer
+    },
   ) => Effect.Effect<void>
+
+  /** Say a call is about to write the directory, and that its body came back. */
+  readonly beginWrite: (directory: string, writer: Writers.Writer) => Effect.Effect<void>
+  readonly endWrite: (directory: string, callID: string) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()(
@@ -58,6 +71,16 @@ export class Service extends Context.Service<Service, Interface>()(
 // HEAD of a rebuilt tree, so the rebuilt repo reads as a clean checkout rather than an unborn
 // branch over a full untracked tree.
 const RESTORED = "refs/heads/opencode-restore"
+
+/**
+ * The directory holds a call from another step that never came back, so this step may not have it.
+ * Tagged separately from a rebuild failure because it is not a transient one: it stands until that
+ * call returns or an operator clears it.
+ */
+export class WorktreeQuarantinedError extends Schema.TaggedErrorClass<WorktreeQuarantinedError>()(
+  "WorktreeMaterializer.QuarantinedError",
+  { message: Schema.String },
+) {}
 
 /** A rebuild that did not finish. Tagged so the boundary can tell it from a refusal and retry it. */
 export class WorktreeMaterializeError extends Schema.TaggedErrorClass<WorktreeMaterializeError>()(
@@ -160,9 +183,28 @@ const layer = Layer.effect(
       return isBehind(rows, held)
     })
 
+    const refuseWhenStranded = Effect.fn("WorktreeMaterializer.refuseWhenStranded")(function* (
+      worktree: string,
+      current?: Writers.Writer,
+    ) {
+      const stranded = yield* Writers.strandedWriters(global.data, worktree, current)
+      if (stranded.length === 0) return
+      const one = stranded[0]
+      // Dies, like a rebuild that could not finish: the activity boundary turns it into a failure
+      // Temporal schedules again, and the next attempt can be taken by a host that is not refused.
+      return yield* Effect.die(
+        new WorktreeQuarantinedError({
+            message:
+            `not using ${worktree}: ${stranded.length} tool call(s) from an earlier step never ` +
+            `returned (${one.callID} of session ${one.sessionID} step ${one.step}, pid ${one.pid}, ` +
+            `started ${one.started}). Stop them before this directory is used again.`,
+        }),
+      )
+    })
+
     const ensure = Effect.fn("WorktreeMaterializer.ensure")(function* (
       directory: string,
-      options?: { readonly pauseBeforeLock?: number },
+      options?: { readonly pauseBeforeLock?: number; readonly current?: Writers.Writer },
     ) {
       // The newest capture whose session ran in this directory decides which worktree to rebuild,
       // and which state a tree that is already here has to be brought to.
@@ -175,6 +217,9 @@ const layer = Layer.effect(
           .pipe(Effect.orDie),
       )
       if (!tip) return
+      // Before anything is rebuilt. A restore is what brings this host to the newest tree, and
+      // doing that under a call nobody can account for is what makes its later capture look current.
+      yield* refuseWhenStranded(tip.worktree, options?.current)
       // An empty directory is not somebody's working copy, so the rule that protects one does not
       // apply to it. Treating it as present is what stops a fresh host from ever building the tree:
       // it has no tip note, so `behind` says no, and the tools then run against nothing. A mounted
@@ -232,7 +277,11 @@ const layer = Layer.effect(
       )
     })
 
-    return Service.of({ ensure })
+    return Service.of({
+      ensure,
+      beginWrite: (directory, writer) => Writers.beginWrite(global.data, directory, writer),
+      endWrite: (directory, callID) => Writers.endWrite(global.data, directory, callID),
+    })
   }),
 )
 
