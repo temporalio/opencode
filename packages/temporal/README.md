@@ -696,6 +696,7 @@ Local mode uses the in-process coordinator. Temporal mode is
 | Fresh worker receives a project | Requires access to the directory | Packs rebuild tracked files at the recorded absolute path | `worktree-materialize.test.ts`; ignored files and external tool effects do not travel |
 | Workflow history grows | No workflow history | Drain count or `continueAsNewSuggested` requests rollover. The supervisor waits for a drain boundary and finished handlers | `session-supervisor-rollover.test.ts`; a long active turn does not roll over mid-step |
 | Pinned queue is unavailable | No queue | Conclusively unstarted work migrates after the pinned batch settles; uncertain started work fails | `l2-step.test.ts`, `l2-pinned-retry.test.ts`; manual recovery must account for the old process and directory |
+| A later turn reuses a directory an abandoned tool may still write | Not reachable: one coordinator holds the directory | The host records each call inside its own execution and refuses the directory to any other step until that call returns. The refusal is a defect, so the work is scheduled again and another host can take it. Nothing clears a marker whose writer died except an operator | `worktree-materialize.test.ts` covers the refusal and its step scope; removing either fails it. The drain writing the marker is covered by typecheck only |
 
 An unknown tool outcome is a loss of evidence, not proof that execution stopped or failed. The
 model can request a new call after reading that result. A non-idempotent external effect needs a
