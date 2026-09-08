@@ -43,16 +43,6 @@ export const isUnclaimedFailure = (error: unknown) =>
   error.cause instanceof TimeoutFailure &&
   error.cause.timeoutType === "SCHEDULE_TO_START"
 
-// The worker that took the work stopped reporting. A dispatch heartbeats for as long as it is
-// alive, so the server declaring the heartbeat dead says the host is gone rather than that a tool
-// is still running on it. Moving on is safe for a different reason than an unclaimed dispatch: not
-// because nothing ran, but because a declared-idempotent tool is the only one a retry re-runs and
-// the snapshot chain refuses a publish from a host that is behind. Start-to-close is deliberately
-// absent, since that expires while the worker is still heartbeating.
-export const isHostLostFailure = (error: unknown) =>
-  error instanceof ActivityFailure &&
-  error.cause instanceof TimeoutFailure &&
-  error.cause.timeoutType === "HEARTBEAT"
 
 /** The three activities a stepped turn drives. */
 export interface SteppedActivities {
@@ -87,8 +77,6 @@ export interface SteppedTurnDeps {
   /** Whether a failure means nobody took the work, which is the one kind a pinned dispatch answers
    * by trying the shared queue instead. */
   readonly isUnclaimed?: (error: unknown) => boolean
-  /** Whether the worker that took the work is gone. See `isHostLostFailure`. */
-  readonly isHostLost?: (error: unknown) => boolean
   /** Run something where the driver's cancellation cannot reach it. An interrupt landing during the
    * tool phase otherwise leaves the step with no ending published at all, so a follower waiting on
    * the turn never hears it stop. */
@@ -110,7 +98,6 @@ export const makeSteppedTurn =
     nonCancellable,
     pinnedTo,
     isUnclaimed,
-    isHostLost,
   }: SteppedTurnDeps) =>
   async (input: StepDrainInput): Promise<StepDrainResult> => {
     const model = await activities.runModelCall(input)
@@ -122,19 +109,14 @@ export const makeSteppedTurn =
     // step goes to it first, because it is the host holding the tree the tools are about to write.
     const pinned = model.queue && pinnedTo ? pinnedTo(model.queue) : undefined
     let unclaimed = false
-    let pinFailure: { reason: unknown } | undefined
     // Shared dispatches must wait for the pinned batch because the hosts do not share a worktree.
     let shared: Promise<unknown> = Promise.resolve()
     const pendingPins = new Set<Promise<unknown>>()
     const onShared = <A>(run: (on: SteppedActivities) => Promise<A>): Promise<A> => {
       const next = shared.then(async () => {
-        // Queue saturation can leave a sibling running on the pinned host.
-        const outcomes = await Promise.allSettled(pendingPins)
-        for (const outcome of outcomes) {
-          if (outcome.status === "rejected" && !movable(outcome.reason))
-            pinFailure ??= { reason: outcome.reason }
-        }
-        if (pinFailure) throw pinFailure.reason
+        // Queue saturation can leave a sibling running on the pinned host, so nothing starts here
+        // until every pinned attempt of this step is over, one way or the other.
+        await Promise.allSettled(pendingPins)
         return run(activities)
       })
       shared = next.then(
@@ -143,26 +125,27 @@ export const makeSteppedTurn =
       )
       return next
     }
-    // Either nobody took the work, or whoever did is not there any more.
-    const movable = (error: unknown) => isUnclaimed?.(error) === true || isHostLost?.(error) === true
+    // Everything except the turn being stopped moves. What makes that safe is not a judgement about
+    // the pinned host, which cannot be observed from here: it is the barrier above, which starts
+    // nothing shared until every pinned attempt has settled, and then the guards on the durable
+    // things. A stranded host that pushes a snapshot late is refused by the chain, because a pack
+    // names the one it was built on and only a host standing on the head may add to it. A stale
+    // step is fenced out of the event log by the owner token's compare and set. Refusing to move
+    // instead ended the turn, and that strands exactly the same work while losing the rest of the
+    // step as well.
     const viaPinned = async <A>(
       run: (on: Pick<SteppedActivities, "runToolCall" | "sealStep">) => Promise<A>,
     ): Promise<A> => {
-      if (pinFailure) throw pinFailure.reason
-      if (!pinned || !isUnclaimed) return run(activities)
+      if (!pinned) return run(activities)
       if (unclaimed) return onShared(run)
       const attempt = run(pinned)
       pendingPins.add(attempt)
       try {
         return await attempt
       } catch (error) {
-        if (!movable(error)) {
-          // A failed activity may still be writing, so neither a tool nor a seal may migrate.
-          pinFailure ??= { reason: error }
-          throw error
-        }
+        if (isCancellation(error)) throw error
         unclaimed = true
-        log?.("the pinned worker is not answering; remaining calls move to the shared queue", {
+        log?.("the pinned attempt did not come back; remaining calls move to the shared queue", {
           sessionID: input.sessionID,
           step: model.step,
         })

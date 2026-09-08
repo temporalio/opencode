@@ -3,13 +3,7 @@
 // pinned here is the orchestration: the owner token reaches every writer, a settled step dispatches
 // nothing, a failed tool still lets the step close, and an interrupt is not swallowed.
 import { describe, it, expect } from "bun:test"
-import {
-  isHaltFailure,
-  isHostLostFailure,
-  isUnclaimedFailure,
-  makeSteppedTurn,
-  type SteppedActivities,
-} from "../src/l2-step"
+import { isHaltFailure, isUnclaimedFailure, makeSteppedTurn, type SteppedActivities } from "../src/l2-step"
 import { runAtBoundary } from "../src/boundary"
 import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
@@ -407,7 +401,6 @@ describe("stepped turn, pinned to a worker", () => {
       isCancellation,
       isHalt,
       isUnclaimed: isUnclaimedFailure,
-      isHostLost: isHostLostFailure,
       pinnedTo: () => ({
         runToolCall: async () => {
           throw hostGone()
@@ -420,9 +413,13 @@ describe("stepped turn, pinned to a worker", () => {
     expect(shared.seals).toHaveLength(1)
   })
 
-  it("does not migrate the tools or seal after a pinned sibling has an uncertain outcome", async () => {
+  it("migrates the rest of the step only once an uncertain pinned sibling is over", async () => {
+    // The sibling's own work may be stranded on that host, which the snapshot chain refuses and
+    // salvages. What must not happen is the rest of the step going with it: a step that never
+    // seals leaves a call no result answers, and the next model call cannot be made from that.
     const release = Promise.withResolvers<ToolCallDrainResult>()
     const refused = Promise.withResolvers<void>()
+    let sharedBeforeTheSiblingEnded = 0
     const shared = fakes(withQueue)
     const run = makeSteppedTurn({
       activities: shared.activities,
@@ -439,10 +436,17 @@ describe("stepped turn, pinned to a worker", () => {
       }),
     })(INPUT)
     await refused.promise
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    sharedBeforeTheSiblingEnded = shared.tools.length
     release.reject(new Error("the started activity timed out"))
-    await expect(run).rejects.toThrow("the started activity timed out")
-    expect(shared.tools).toHaveLength(0)
-    expect(shared.seals).toHaveLength(0)
+    await run
+
+    expect(sharedBeforeTheSiblingEnded).toBe(0)
+    // Both of them, including the one whose pinned attempt failed: it is dispatched again on the
+    // shared queue, where the recorded call and its dispatch identity are what stop a
+    // non-idempotent tool from running a second time.
+    expect(shared.tools.map((input) => input.call.id).sort()).toEqual(["call_a", "call_b"])
+    expect(shared.seals).toHaveLength(1)
   })
 
   it("uses the shared queue when the model call reported no queue of its own", async () => {

@@ -27,6 +27,21 @@ trap cleanup EXIT
 
 [ -n "${OPENAI_API_KEY:-}" ] || { echo "set OPENAI_API_KEY"; exit 1; }
 
+# A workspace link pointing at a package the store no longer holds. `bun install` leaves these
+# behind when node_modules was pruned by hand, and what a broken one produces is an ENOENT from
+# whichever command first needs that package, which reads like a bug in the command. Cheap to ask
+# here, and the answer is always the same: install again from a clean tree.
+dangling=""
+for link in packages/*/node_modules/* packages/*/node_modules/@*/* \
+            packages/*/*/node_modules/* packages/*/*/node_modules/@*/*; do
+  [ -L "$link" ] && [ ! -e "$link" ] && dangling="$dangling  $link"$'\n'
+done
+if [ -n "$dangling" ]; then
+  printf 'the install is stale; these workspace links point at nothing:\n%s' "$dangling"
+  echo "run: find . -name node_modules -type d -prune -exec rm -rf {} + && bun install"
+  exit 1
+fi
+
 $COMPOSE down -v >/dev/null 2>&1
 # Only when the image is missing. The compose file mounts the engine's source over the image, so a
 # code change does not need a new one, and the dependency install is most of the build.

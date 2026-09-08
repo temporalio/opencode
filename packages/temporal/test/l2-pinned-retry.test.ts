@@ -4,7 +4,10 @@ import { ApplicationFailure } from "@temporalio/common"
 import { TestWorkflowEnvironment } from "@temporalio/testing"
 import { Worker } from "@temporalio/worker"
 
-it("limits pinned tools and seals to one attempt before reporting an uncertain outcome", async () => {
+// A pinned dispatch gets one attempt, and what happens after it fails is the contract that matters:
+// the rest of the step carries on somewhere else rather than taking the turn down with it. The host
+// it left behind cannot revert anything, because a snapshot pack names the one it was built on.
+it("gives a pinned dispatch one attempt and then moves the step to the shared queue", async () => {
   const env = await TestWorkflowEnvironment.createLocal()
   let phase: "tool" | "seal" = "tool"
   const attempts = { tool: 0, seal: 0 }
@@ -52,6 +55,7 @@ it("limits pinned tools and seals to one attempt before reporting an uncertain o
       pinned.runUntil(async () => {
         for (const kind of ["tool", "seal"] as const) {
           phase = kind
+          shared = 0
           const handle = await env.client.workflow.start("sessionTurn", {
             workflowId: `pin-retry-session-${kind}`,
             taskQueue: "pin-retry-main",
@@ -69,9 +73,9 @@ it("limits pinned tools and seals to one attempt before reporting an uncertain o
                 timer = setTimeout(() => resolve("waiting for retries"), 2_000)
               }),
             ])
-            expect(outcome).toBe("failed")
+            expect(outcome).toBe("completed")
             expect(attempts[kind]).toBe(1)
-            expect(shared).toBe(0)
+            expect(shared).toBeGreaterThan(0)
           } finally {
             clearTimeout(timer)
             await handle.terminate()

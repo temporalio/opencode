@@ -39,6 +39,21 @@ trap cleanup EXIT
 
 [ -n "${OPENAI_API_KEY:-}" ] || { echo "set OPENAI_API_KEY"; exit 1; }
 
+# A workspace link pointing at a package the store no longer holds. `bun install` leaves these
+# behind when node_modules was pruned by hand, and what a broken one produces is an ENOENT from
+# whichever command first needs that package, which reads like a bug in the command. Cheap to ask
+# here, and the answer is always the same: install again from a clean tree.
+dangling=""
+for link in "$ROOT"/packages/*/node_modules/* "$ROOT"/packages/*/node_modules/@*/* \
+            "$ROOT"/packages/*/*/node_modules/* "$ROOT"/packages/*/*/node_modules/@*/*; do
+  [ -L "$link" ] && [ ! -e "$link" ] && dangling="$dangling  $link"$'\n'
+done
+if [ -n "$dangling" ]; then
+  printf 'the install is stale; these workspace links point at nothing:\n%s' "$dangling"
+  echo "run: find . -name node_modules -type d -prune -exec rm -rf {} + && bun install"
+  exit 1
+fi
+
 rm -rf "$RUN"; mkdir -p "$RUN/proj" "$RUN/logs"
 git -C "$RUN/proj" init -q
 echo hello > "$RUN/proj/README.md"

@@ -26,7 +26,7 @@ import {
 } from "@temporalio/workflow"
 import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common"
 import type { StepActivities, SteppedTurnActivities } from "./activities"
-import { isHaltFailure, isHostLostFailure, isUnclaimedFailure, makeSteppedTurn } from "./l2-step"
+import { isHaltFailure, isUnclaimedFailure, makeSteppedTurn } from "./l2-step"
 import { SIGNALS, RESUME_UPDATE, WORKFLOW_ID_PREFIX } from "./protocol"
 import { makeSupervisor, type SupervisorRuntime } from "./supervisor"
 
@@ -161,7 +161,6 @@ const steppedRuntime = (serial: boolean): SupervisorRuntime => ({
     isCancellation,
     isHalt: isHaltFailure,
     isUnclaimed: isUnclaimedFailure,
-    isHostLost: isHostLostFailure,
     pinnedTo,
     serial,
     nonCancellable: (fn) => CancellationScope.nonCancellable(fn),
