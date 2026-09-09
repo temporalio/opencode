@@ -287,7 +287,7 @@ const layer = Layer.effect(
         return yield* Effect.die(continueAfterCompaction(currentStep))
       const startSnapshot = yield* snapshots.capture()
       // Ship the pre-step tree so another host can rebuild the worktree; best-effort inside push.
-      if (startSnapshot) yield* snapshotSync.push(startSnapshot)
+      if (startSnapshot) yield* snapshotSync.push(startSnapshot, session.id)
       const publisher = createLLMEventPublisher(events, {
         sessionID: session.id,
         agent: agent.id,
@@ -402,7 +402,7 @@ const layer = Layer.effect(
           if (stepSettlement && !publisher.hasProviderError() && !deferTools) {
             const endSnapshot = yield* snapshots.capture()
             // Ship the post-step tree: this is the state a resumed step on another host needs.
-            if (endSnapshot) yield* snapshotSync.push(endSnapshot)
+            if (endSnapshot) yield* snapshotSync.push(endSnapshot, session.id)
             const files =
               startSnapshot && endSnapshot
                 ? yield* snapshots
@@ -605,7 +605,7 @@ const layer = Layer.effect(
       yield* failInterruptedTools(input.sessionID)
       const startSnapshot = inFlight.snapshot?.start
       const endSnapshot = yield* snapshots.capture()
-      if (endSnapshot) yield* snapshotSync.push(endSnapshot)
+      if (endSnapshot) yield* snapshotSync.push(endSnapshot, input.sessionID)
       const files =
         startSnapshot && endSnapshot
           ? yield* snapshots
@@ -744,7 +744,7 @@ const layer = Layer.effect(
       const startSnapshot = target.snapshot?.start
       const endSnapshot = yield* snapshots.capture()
       // Ship the post-step tree: this is the state a later step on another host needs.
-      if (endSnapshot) yield* snapshotSync.push(endSnapshot)
+      if (endSnapshot) yield* snapshotSync.push(endSnapshot, input.sessionID)
       const files =
         startSnapshot && endSnapshot
           ? yield* snapshots
@@ -928,7 +928,7 @@ const layer = Layer.effect(
       yield* shipping.withLock(location.directory)(
         Effect.gen(function* () {
           const afterTool = yield* snapshots.capture().pipe(Effect.catch(() => Effect.succeed(undefined)))
-          if (afterTool) yield* snapshotSync.push(afterTool)
+          if (afterTool) yield* snapshotSync.push(afterTool, input.sessionID)
         }),
       )
       return { outcome: "settled" } as ToolCallResult

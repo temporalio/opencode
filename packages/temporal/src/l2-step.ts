@@ -75,6 +75,11 @@ export interface SteppedTurnDeps {
   /** Whether a failure means nobody took the work, which is the one kind a pinned dispatch answers
    * by trying the shared queue instead. */
   readonly isUnclaimed?: (error: unknown) => boolean
+  /** Whether this run was started after a lost host stopped ending the turn. Which activities a
+   * step schedules is what a workflow writes down, so changing that rule changes histories that
+   * already exist: a run recorded under the old one failed the turn where this code seals and goes
+   * on. A run that predates the change answers false here and keeps what it recorded. */
+  readonly resumesAfterLostHost?: () => boolean
   /** Run something where the driver's cancellation cannot reach it. An interrupt landing during the
    * tool phase otherwise leaves the step with no ending published at all, so a follower waiting on
    * the turn never hears it stop. */
@@ -96,6 +101,7 @@ export const makeSteppedTurn =
     nonCancellable,
     pinnedTo,
     isUnclaimed,
+    resumesAfterLostHost,
   }: SteppedTurnDeps) =>
   async (input: StepDrainInput): Promise<StepDrainResult> => {
     const model = await activities.runModelCall(input)
@@ -191,23 +197,20 @@ export const makeSteppedTurn =
     } else {
       dispatched.push(...(await Promise.allSettled(model.calls.map(dispatch))))
     }
-    const seal = (stopped: boolean) =>
-      viaPinned((on) =>
-        on.sealStep({
-          sessionID: input.sessionID,
-          step: model.step,
-          // A stopped step is not one that continues. The settlement carries the model's own finish
-          // reason, and for a step that asked for tools that is `tool-calls`, which every follower
-          // reads as "another step follows". Passing it through on the way out recorded a turn the
-          // user stopped as a turn still going.
-          settlement:
-            stopped && model.settlement ? { ...model.settlement, finish: "stop" } : model.settlement,
-          assistantMessageID: model.assistantMessageID,
-          needsContinuation: stopped ? false : model.needsContinuation,
-          owner: model.owner,
-        }),
-        stopped,
-      )
+    const sealing = (stopped: boolean): SealDrainInput => ({
+      sessionID: input.sessionID,
+      step: model.step,
+      // A stopped step is not one that continues. The settlement carries the model's own finish
+      // reason, and for a step that asked for tools that is `tool-calls`, which every follower
+      // reads as "another step follows". Passing it through on the way out recorded a turn the
+      // user stopped as a turn still going.
+      settlement:
+        stopped && model.settlement ? { ...model.settlement, finish: "stop" } : model.settlement,
+      assistantMessageID: model.assistantMessageID,
+      needsContinuation: stopped ? false : model.needsContinuation,
+      owner: model.owner,
+    })
+    const seal = (stopped: boolean) => viaPinned((on) => on.sealStep(sealing(stopped)), stopped)
 
     for (const outcome of dispatched) {
       if (outcome.status !== "rejected") continue
@@ -244,5 +247,30 @@ export const makeSteppedTurn =
     if (unsettled.length > 0)
       log?.("step did not settle every call it dispatched", { step: model.step, calls: unsettled })
 
-    return seal(false)
+    // A pinned attempt that started and failed used to take the turn with it, because nothing could
+    // say the tool over there had stopped. Nothing can say that now either, and it no longer has to:
+    // the log fences a superseded attempt out of the transcript, and the pack store refuses its
+    // files under the same token, so what that host is still doing cannot reach the session. The
+    // step is closed on the shared queue, where a worker that is answering can take it, and the
+    // turn goes on with whatever the seal says follows. What still does not move is the rest of
+    // this step: its calls stay where their host has them.
+    const closeElsewhere = () => {
+      log?.("the step lost its host; closing it elsewhere and carrying the turn on", {
+        sessionID: input.sessionID,
+        step: model.step,
+      })
+      return activities.sealStep(sealing(false))
+    }
+    const resumes = () => (uncertain !== undefined && (resumesAfterLostHost?.() ?? false))
+    if (resumes()) return closeElsewhere()
+    try {
+      return await seal(false)
+    } catch (error) {
+      // The seal is the other way a step loses its host, and it is the half that has to be written
+      // down: a step with no ending recorded is one no follower ever hears about. Re-sealing where
+      // a worker is answering is what an ordinary retry of this activity does; the pinned rule is
+      // the only reason it did not already happen.
+      if (stopped || !resumes()) throw error
+      return await closeElsewhere()
+    }
   }

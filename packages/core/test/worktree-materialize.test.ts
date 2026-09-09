@@ -4,6 +4,7 @@
 // simulate a fresh host, "host B" materializes it back from the store alone.
 import { describe, expect } from "bun:test"
 import { $ } from "bun"
+import { spawn } from "node:child_process"
 import { realpathSync } from "node:fs"
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import path from "path"
@@ -12,6 +13,8 @@ import { Effect, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventSequenceTable } from "@opencode-ai/core/event/sql"
 import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -102,9 +105,7 @@ describe("WorktreeMaterializer", () => {
 
       // A second ensure on an existing tree is a no-op, not a rebuild.
       yield* WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(Effect.provide(B))
-      expect(yield* Effect.promise(() => readFile(path.join(worktree, "tracked.txt"), "utf8"))).toBe(
-        "v3\n",
-      )
+      expect(yield* Effect.promise(() => readFile(path.join(worktree, "tracked.txt"), "utf8"))).toBe("v3\n")
 
       yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
     }),
@@ -136,9 +137,11 @@ describe("WorktreeMaterializer", () => {
       const first = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
       if (!first) throw new Error("expected a capture")
       yield* SnapshotSync.Service.use((s) => s.push(first)).pipe(Effect.provide(A))
-      const stored = yield* Database.Service.use(({ db }) =>
-        db.select().from(SnapshotPackTable).all(),
-      ).pipe(Effect.orDie, Effect.provide(Database.layerFromPath(file)), Effect.scoped)
+      const stored = yield* Database.Service.use(({ db }) => db.select().from(SnapshotPackTable).all()).pipe(
+        Effect.orDie,
+        Effect.provide(Database.layerFromPath(file)),
+        Effect.scoped,
+      )
 
       // The newest state in the store, and a pack that is not a pack: indexing it is how a rebuild
       // fails for reasons the store cannot rule out.
@@ -225,9 +228,7 @@ describe("WorktreeMaterializer", () => {
       const B = yield* Layer.build(materializeStack(file, path.join(root, "host-b-data")))
       yield* WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(Effect.provide(B))
 
-      expect(yield* Effect.promise(() => readFile(path.join(worktree, "note.txt"), "utf8"))).toBe(
-        "travelled\n",
-      )
+      expect(yield* Effect.promise(() => readFile(path.join(worktree, "note.txt"), "utf8"))).toBe("travelled\n")
 
       yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
     }),
@@ -270,9 +271,7 @@ describe("WorktreeMaterializer", () => {
       // Host B builds the tree from the store, which is what makes it B's to move.
       yield* Effect.promise(() => rm(worktree, { recursive: true, force: true }))
       const B = yield* Layer.build(materializeStack(file, path.join(root, "host-b-data")))
-      const ensureB = WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(
-        Effect.provide(B),
-      )
+      const ensureB = WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(Effect.provide(B))
       yield* ensureB
       expect(yield* content()).toBe("v1\n")
 
@@ -347,10 +346,7 @@ describe("WorktreeMaterializer", () => {
       // says the project is. Shipping it would revert the other host.
       yield* Effect.promise(() => writeFile(path.join(worktree, "f.txt"), "stale\n"))
       const stale = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
-      const exit = yield* SnapshotSync.Service.use((s) => s.push(stale!)).pipe(
-        Effect.provide(A),
-        Effect.exit,
-      )
+      const exit = yield* SnapshotSync.Service.use((s) => s.push(stale!)).pipe(Effect.provide(A), Effect.exit)
       expect(exit._tag).toBe("Failure")
 
       // Nothing was added, and the note was not moved either: a refused ship must leave this host
@@ -391,9 +387,11 @@ describe("WorktreeMaterializer", () => {
       const A = yield* Layer.build(captureStack(file, worktree, data))
       const first = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
       yield* SnapshotSync.Service.use((s) => s.push(first!)).pipe(Effect.provide(A))
-      const packs = yield* Database.Service.use(({ db }) =>
-        db.select().from(SnapshotPackTable).all(),
-      ).pipe(Effect.orDie, Effect.provide(Database.layerFromPath(file)), Effect.scoped)
+      const packs = yield* Database.Service.use(({ db }) => db.select().from(SnapshotPackTable).all()).pipe(
+        Effect.orDie,
+        Effect.provide(Database.layerFromPath(file)),
+        Effect.scoped,
+      )
 
       // Another host ships on top, so this one is behind.
       yield* Effect.sleep(10)
@@ -443,14 +441,43 @@ describe("WorktreeMaterializer", () => {
           .values([{ id: "c".repeat(40), directory: "/w", worktree: "/w", tree: "t".repeat(40), pack: bytes }])
           .run(),
       ).pipe(Effect.orDie, Effect.provide(layer), Effect.scoped)
-      const row = yield* Database.Service.use(({ db }) =>
-        db.select().from(SnapshotPackTable).get(),
-      ).pipe(Effect.orDie, Effect.provide(layer), Effect.scoped)
+      const row = yield* Database.Service.use(({ db }) => db.select().from(SnapshotPackTable).get()).pipe(
+        Effect.orDie,
+        Effect.provide(layer),
+        Effect.scoped,
+      )
       expect(Buffer.from(row!.pack).equals(bytes)).toBeTrue()
       yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
     }),
   )
 })
+
+// A process in a group of its own, which is what a worker somebody's supervisor started has. The
+// group is the part that matters: it is where the children of a dead writer stay.
+const spawned = () => {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: "ignore",
+  })
+  return { child, pid: child.pid! }
+}
+
+const ended = async (started: ReturnType<typeof spawned>) => {
+  const exited = new Promise((resolve) => started.child.once("exit", resolve))
+  started.child.kill("SIGKILL")
+  await exited
+  return { pid: started.pid, pgid: started.pid }
+}
+
+/** Say the one marker on this host was written by another process, or before a restart. */
+const editMarker = async (data: string, worktree: string, patch: Record<string, unknown>) => {
+  const root = path.join(data, "worktree-writers")
+  const [dir] = await readdir(root)
+  const [name] = await readdir(path.join(root, dir))
+  const file = path.join(root, dir, name)
+  const note = JSON.parse(await readFile(file, "utf8"))
+  await writeFile(file, JSON.stringify({ ...note, ...patch }))
+}
 
 describe("WorktreeMaterializer quarantine", () => {
   // Refusing to move a step off a host protects that step and nothing after it: the turn ends, the
@@ -502,6 +529,90 @@ describe("WorktreeMaterializer quarantine", () => {
       yield* worktrees.endWrite(worktree, stranded.callID)
       const afterReturn = yield* Effect.exit(worktrees.ensure(worktree, { current: later }))
       expect(afterReturn._tag).toBe("Success")
+
+      // A worker that died mid-tool leaves its marker behind, and that used to need a person. Most
+      // of it is answerable without one: the writer's process is gone, nothing it started is left
+      // in its group, and the machine has not restarted underneath the pids that say so.
+      const usable = () =>
+        Effect.exit(worktrees.ensure(worktree, { current: later })).pipe(Effect.map((exit) => exit._tag === "Success"))
+
+      // Written by this process, which is running. Nothing to conclude, so the refusal stands.
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      expect(yield* usable()).toBe(false)
+
+      // The worker died and left nothing behind. A group of its own is what a worker somebody's
+      // supervisor started has, and an empty one is the rest of the proof that its tools are over.
+      const gone = yield* Effect.promise(() => ended(spawned()))
+      yield* Effect.promise(() => editMarker(data, worktree, { pid: gone.pid, pgid: gone.pgid }))
+      expect(yield* usable()).toBe(true)
+
+      // The worker died and something it started did not. That is what the refusal is for.
+      const orphan = spawned()
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() => editMarker(data, worktree, { pid: gone.pid, pgid: orphan.pid }))
+      expect(yield* usable()).toBe(false)
+      yield* Effect.promise(() => ended(orphan))
+      expect(yield* usable()).toBe(true)
+
+      // A pid means nothing across a restart, so a marker from before one is not read as live.
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() => editMarker(data, worktree, { bootAt: 0 }))
+      expect(yield* usable()).toBe(true)
+    }),
+  )
+})
+
+// A dispatch the session stopped waiting for keeps running, and the files it ships afterwards would
+// be the newest state the store holds: the tip check cannot refuse them, because the host is still
+// standing exactly where it was told to stand. The event log already fences a superseded attempt
+// out of the transcript, and the packs travel under the same token.
+describe("SnapshotSync owner fence", () => {
+  it.live("refuses a pack from an attempt the session has moved past", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const root = realpathSync(tmp.path)
+      const worktree = path.join(root, "project")
+      const file = path.join(root, "shared.db")
+      yield* Effect.promise(async () => {
+        await mkdir(worktree, { recursive: true })
+        await $`git init -q ${worktree}`.quiet()
+        await $`git -C ${worktree} config user.email t@t`.quiet()
+        await $`git -C ${worktree} config user.name t`.quiet()
+        await writeFile(path.join(worktree, "tracked.txt"), "v1\n")
+        await $`git -C ${worktree} add .`.quiet()
+        await $`git -C ${worktree} commit -qm seed`.quiet()
+      })
+
+      const A = yield* Layer.build(captureStack(file, worktree, path.join(root, "host-a-data")))
+      const onDatabase = <A2, E2>(use: (db: Database.Interface["db"]) => Effect.Effect<A2, E2>) =>
+        Database.Service.use(({ db }) => use(db)).pipe(
+          Effect.orDie,
+          Effect.provide(Database.layerFromPath(file)),
+          Effect.scoped,
+        )
+      // The session is on a later attempt than the one that is about to publish.
+      yield* onDatabase((db) =>
+        db.insert(EventSequenceTable).values({ aggregate_id: "ses_fenced", seq: 1, owner_id: "run:1:2" }).run(),
+      )
+
+      const captured = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
+      if (!captured) throw new Error("expected a capture")
+      const shipped = (owner: string) =>
+        Effect.exit(
+          SnapshotSync.Service.use((s) => s.push(captured, "ses_fenced")).pipe(
+            Effect.provideService(EventV2.EventOwner, owner),
+            Effect.provide(A),
+          ),
+        )
+
+      const stale = yield* shipped("run:1:1")
+      expect(stale._tag).toBe("Failure")
+      expect(yield* onDatabase((db) => db.select().from(SnapshotPackTable).all())).toHaveLength(0)
+
+      // The attempt the session is actually on ships as usual.
+      const current = yield* shipped("run:1:2")
+      expect(current._tag).toBe("Success")
+      expect(yield* onDatabase((db) => db.select().from(SnapshotPackTable).all())).toHaveLength(1)
     }),
   )
 })

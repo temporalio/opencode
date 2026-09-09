@@ -8,6 +8,7 @@
 // `@opencode-ai/core` runtime imports, no Node builtins.
 
 import {
+  patched,
   proxyActivities,
   defineSignal,
   defineUpdate,
@@ -135,8 +136,7 @@ const runtime: SupervisorRuntime = {
   // root's consideredCancelled).
   isRootCancelled: () => rootScope?.consideredCancelled ?? false,
   allHandlersFinished,
-  continueAsNew: (sessionID, startWithWake) =>
-    continueAsNew<typeof sessionTurn>(sessionID, { startWithWake }),
+  continueAsNew: (sessionID, startWithWake) => continueAsNew<typeof sessionTurn>(sessionID, { startWithWake }),
   // The server's own read of whether this run has grown enough to roll over. The drain count alone
   // misses it: a stepped turn is thousands of events, so a handful of drains can cross the limit.
   historyWantsRollover: () => workflowInfo().continueAsNewSuggested,
@@ -152,6 +152,8 @@ const steppedRuntime = (serial: boolean): SupervisorRuntime => ({
     isCancellation,
     isHalt: isHaltFailure,
     isUnclaimed: isUnclaimedFailure,
+    // False only while replaying a history written before this rule existed. See the dep.
+    resumesAfterLostHost: () => patched("lost-host-does-not-end-the-turn"),
     pinnedTo,
     serial,
     nonCancellable: (fn) => CancellationScope.nonCancellable(fn),

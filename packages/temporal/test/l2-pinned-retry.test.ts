@@ -4,12 +4,14 @@ import { ApplicationFailure } from "@temporalio/common"
 import { TestWorkflowEnvironment } from "@temporalio/testing"
 import { Worker } from "@temporalio/worker"
 
-// The server must not retry a pinned body or move it while its physical state is unknown.
-it("gives a pinned dispatch one attempt and refuses uncertain migration", async () => {
+// The server must not retry a pinned body or move it while its physical state is unknown. What the
+// step does instead is close itself where a worker is answering: the call stays with the host that
+// has it, and the turn goes on rather than ending with that host.
+it("gives a pinned dispatch one attempt, keeps its call, and closes the step elsewhere", async () => {
   const env = await TestWorkflowEnvironment.createLocal()
   let phase: "tool" | "seal" = "tool"
   const attempts = { tool: 0, seal: 0 }
-  let shared = 0
+  const shared = { tool: 0, seal: 0 }
   try {
     const worker = await Worker.create({
       connection: env.nativeConnection,
@@ -25,11 +27,11 @@ it("gives a pinned dispatch one attempt and refuses uncertain migration", async 
           queue: "pin-retry-tools",
         }),
         runToolCall: async () => {
-          shared++
+          shared.tool++
           return { outcome: "settled" }
         },
         sealStep: async () => {
-          shared++
+          shared.seal++
           return { ran: true, continue: false, step: 1, promotion: null }
         },
       },
@@ -53,7 +55,8 @@ it("gives a pinned dispatch one attempt and refuses uncertain migration", async 
       pinned.runUntil(async () => {
         for (const kind of ["tool", "seal"] as const) {
           phase = kind
-          shared = 0
+          shared.tool = 0
+          shared.seal = 0
           const handle = await env.client.workflow.start("sessionTurn", {
             workflowId: `pin-retry-session-${kind}`,
             taskQueue: "pin-retry-main",
@@ -71,9 +74,16 @@ it("gives a pinned dispatch one attempt and refuses uncertain migration", async 
                 timer = setTimeout(() => resolve("waiting for retries"), 2_000)
               }),
             ])
-            expect(outcome).toBe("failed")
+            // The turn is handed back, not ended: the step was closed on the shared queue and the
+            // supervisor gets a result to carry on from.
+            expect(outcome).toBe("completed")
+            // One attempt on the pinned queue, and never a second one anywhere: a retry's queue
+            // timeout cannot rule out the first attempt still running.
             expect(attempts[kind]).toBe(1)
-            expect(shared).toBe(0)
+            // The call itself does not move. Only the seal does, and that is the step saying what
+            // it had rather than the tool being run somewhere else.
+            expect(shared.tool).toBe(0)
+            expect(shared.seal).toBe(1)
           } finally {
             clearTimeout(timer)
             await handle.terminate()
