@@ -511,6 +511,14 @@ It prints this process's resolved settings, configuration errors, and warnings. 
 certificate pair or unsupported fleet store setting fails preflight. A remote plaintext connection
 produces a warning. None of these checks verifies another process's actual storage access.
 
+Sessions that are already running do not have to be drained first. What a stepped turn does after a
+pinned dispatch fails is a workflow decision, so it is written into every history that reached it,
+and a run recorded before that rule changed would replay into a nondeterminism error. Those rules
+sit behind `patched()`, so an old run keeps the behaviour it recorded and a new one gets the current
+rule. `packages/temporal/test/l2-replay.test.ts` replays both directions: a history this code writes,
+and the kept ones under `test/fixture/histories`, each recorded by the code that predates a rule.
+Removing a patch fails it.
+
 ### Running workers separately
 
 By default the serve process hosts both the Temporal activity worker and the workflow client
@@ -655,10 +663,11 @@ The rules that bound it, because checking a stored tree out over the wrong one d
   directory. Pinned activities have one attempt and a 30-second `scheduleToStartTimeout`.
   Fallback waits for all pinned promises and runs shared dispatches sequentially. Only a
   schedule-to-start failure permits this move. A started attempt that fails can still write its
-  directory, so that outcome fails the turn without dispatching or sealing on another host.
-  A confirmed dead host is also refused because the workflow cannot establish that fact.
-  Automatic recovery from this case needs process termination evidence or isolated workspaces
-  whose publication is fenced. A declined permission and cancellation retain their stop semantics.
+  directory, so its call stays where it is and is never dispatched again. The step is closed on
+  the shared queue instead, and the turn continues with the next one. What makes that safe is the
+  publication fence: the files a superseded attempt ships are refused under the same owner token
+  that already fences its event appends, so a tool still running over there cannot move the
+  project. A declined permission and cancellation retain their stop semantics.
 - **Without affinity, shared-store tools run sequentially.**
   `OPENCODE_TEMPORAL_SERIAL_TOOLS=1` is the default when affinity is off. This prevents ordinary
   same-step dispatches from concurrently editing separate copies. It does not stop an attempt
@@ -686,7 +695,7 @@ Local mode uses the in-process coordinator. Temporal mode is
 | Failure | Local mode | Temporal mode | Evidence and limit |
 |---|---|---|---|
 | Prompt committed before its wake | A later `wake` or `resume` can consume the recorded prompt | A wake already accepted by Temporal is durable. The application write and wake are separate operations | Schedule tests cover retried firing admission, not a crash between an ordinary HTTP admission and wake |
-| Process dies mid-turn | No automatic restart reconciler; explicit execution can read the record | Whole-step activities retry. Split model calls can retry; an uncertain started pin fails the turn | `session-runner-resume.test.ts`; `l2-pinned-retry.test.ts`. A workflow promise ending does not prove process death |
+| Process dies mid-turn | No automatic restart reconciler; explicit execution can read the record | Whole-step activities retry. Split model calls can retry; an uncertain started pin closes its step elsewhere and the turn goes on | `session-runner-resume.test.ts`; `l2-pinned-retry.test.ts`. A workflow promise ending does not prove process death, which is why the call itself never moves |
 | Tool outcome is absent | Recovery retains completed results, re-executes declared idempotent tools, and reports other started calls as unknown | Same runner rule after execution resumes | `session-runner-resume.test.ts`; external effects are not reconciled |
 | Two dispatches read one pending call | One coordinator serializes its own turn | Non-idempotent L2 dispatches compete for one deterministic admission event; declared idempotent tools can execute again | `session-runner-model-call.test.ts` forces both reads before either admission |
 | Attempts overlap | The local coordinator governs one process | Same-run ordered owner tokens fence later event appends. Tools and seals share their model attempt's owner | `event-claim.test.ts`; cross-run age is not encoded, and event fencing cannot stop filesystem effects |
@@ -695,8 +704,9 @@ Local mode uses the in-process coordinator. Temporal mode is
 | Behind host publishes files | Shared-file concurrency is outside the one-coordinator deployment | Initial tip check rejects sequential stale publication | `worktree-materialize.test.ts`, `snapshot-chain.test.ts`; neither proves atomic concurrent head admission |
 | Fresh worker receives a project | Requires access to the directory | Packs rebuild tracked files at the recorded absolute path | `worktree-materialize.test.ts`; ignored files and external tool effects do not travel |
 | Workflow history grows | No workflow history | Drain count or `continueAsNewSuggested` requests rollover. The supervisor waits for a drain boundary and finished handlers | `session-supervisor-rollover.test.ts`; a long active turn does not roll over mid-step |
-| Pinned queue is unavailable | No queue | Conclusively unstarted work migrates after the pinned batch settles; uncertain started work fails | `l2-step.test.ts`, `l2-pinned-retry.test.ts`; manual recovery must account for the old process and directory |
-| A later turn reuses a directory an abandoned tool may still write | Not reachable: one coordinator holds the directory | The host records each call inside its own execution and refuses the directory to any other step until that call returns. The refusal is a defect, so the work is scheduled again and another host can take it. Nothing clears a marker whose writer died except an operator | `worktree-materialize.test.ts` covers the refusal and its step scope; removing either fails it. The drain writing the marker is covered by typecheck only |
+| Pinned queue is unavailable | No queue | Conclusively unstarted work migrates after the pinned batch settles; uncertain started work stays with its host and its step is closed on the shared queue | `l2-step.test.ts`, `l2-pinned-retry.test.ts`; the old process is fenced out of the store rather than accounted for, and its directory stays refused until it is provably free |
+| A later turn reuses a directory an abandoned tool may still write | Not reachable: one coordinator holds the directory | The host records each call inside its own execution and refuses the directory to any other step until that call returns. The refusal is a defect, so the work is scheduled again and another host can take it. A marker retires itself when this host can show the call is over: the writer's process is gone, its process group is empty, and the machine has not restarted underneath those pids. A tool that put itself in another group still needs an operator | `worktree-materialize.test.ts` covers the refusal, its step scope, and each way a marker retires; removing any of them fails it. `l2-drain-writers.test.ts` drives the real drain, so the marker being written at all is covered |
+| A superseded attempt ships files afterwards | Not reachable | Its pack is refused under the owner token the session has moved past, the same one that fences its event appends. Before anything supersedes it, its publication is ordinary and the next host builds on it | `worktree-materialize.test.ts` covers the refusal and the attempt the session is on shipping as usual; the window before the next claim is not fenced by anything |
 
 An unknown tool outcome is a loss of evidence, not proof that execution stopped or failed. The
 model can request a new call after reading that result. A non-idempotent external effect needs a
