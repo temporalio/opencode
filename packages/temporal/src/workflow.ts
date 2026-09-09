@@ -140,6 +140,9 @@ const runtime: SupervisorRuntime = {
   // The server's own read of whether this run has grown enough to roll over. The drain count alone
   // misses it: a stepped turn is thousands of events, so a handful of drains can cross the limit.
   historyWantsRollover: () => workflowInfo().continueAsNewSuggested,
+  // False only while replaying a history written before the ceiling existed. See the runtime field.
+  boundsStepsPerTurn: () => patched("a-turn-has-a-step-ceiling"),
+  warn: (message, attributes) => log.warn(message, attributes),
 }
 
 // Same supervisor, different step body: wake, interrupt, idle timeout and continue-as-new are

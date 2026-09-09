@@ -56,6 +56,10 @@ export interface SealStepInput {
    * provider error, so a seal that re-derives this from the log would keep calling a provider that
    * just failed. Absent on a re-drive, where the log is all there is. */
   readonly needsContinuation?: boolean
+  /** This step is being closed away from the host that ran it, so the files are not this seal's to
+   * touch: it is standing in a directory that never saw the tools, and the host that did may still
+   * be inside one of them. Writing the step down is the whole job here. */
+  readonly withoutTheTree?: boolean
 }
 
 /** One recorded tool call, to run on its own. */

@@ -68,6 +68,10 @@ export interface SealDrainInput {
   readonly assistantMessageID?: string
   readonly needsContinuation?: boolean
   readonly owner: string
+  /** This step is being closed away from the host that was running it. The tree is not this seal's
+   * to rebuild or to ship: the host that ran the tools is the only one holding what they did, and
+   * it may still be inside one of them. Writing the step down is the whole job. */
+  readonly withoutTheTree?: boolean
 }
 
 export interface L2DrainDeps {
@@ -133,6 +137,10 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQue
       session: SessionSchema.Info,
     ) => Effect.Effect<A, SessionRunner.RunError>,
     current?: { readonly sessionID: string; readonly step: number; readonly callID: string },
+    /** Leave the project tree alone. For a seal closing a step away from its host: rebuilding here
+     * would put this host on the newest state while the one that ran the tools may still be
+     * writing, and nothing this seal does needs the files. */
+    withoutTheTree = false,
   ) =>
     Effect.gen(function* () {
       const session = yield* store.get(SessionSchema.ID.make(sessionID))
@@ -142,7 +150,8 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQue
       if (claim) yield* events.claim(session.id, owner)
       // A worker taking this step on a host without the project tree rebuilds it from snapshot
       // packs, unless a call of an earlier step never came back on this host.
-      yield* worktrees.ensure(session.location.directory, current ? { current } : undefined)
+      if (!withoutTheTree)
+        yield* worktrees.ensure(session.location.directory, current ? { current } : undefined)
       return yield* SessionRunner.Service.use((runner) => use(runner, session)).pipe(
         Effect.provide(locations.get(session.location)),
       )
@@ -239,14 +248,21 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQue
     runAtBoundary(
       input.sessionID,
       signal,
-      inSession(input.sessionID, input.owner, false, (runner, session) =>
-        runner.sealStep({
-          sessionID: session.id,
-          step: input.step,
-          settlement: input.settlement,
-          assistantMessageID: input.assistantMessageID,
-          needsContinuation: input.needsContinuation,
-        }),
+      inSession(
+        input.sessionID,
+        input.owner,
+        false,
+        (runner, session) =>
+          runner.sealStep({
+            sessionID: session.id,
+            step: input.step,
+            settlement: input.settlement,
+            assistantMessageID: input.assistantMessageID,
+            needsContinuation: input.needsContinuation,
+            withoutTheTree: input.withoutTheTree,
+          }),
+        undefined,
+        input.withoutTheTree,
       ).pipe(
         Effect.map((result) =>
           result === undefined

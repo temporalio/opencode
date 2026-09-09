@@ -12,6 +12,7 @@ it("gives a pinned dispatch one attempt, keeps its call, and closes the step els
   let phase: "tool" | "seal" = "tool"
   const attempts = { tool: 0, seal: 0 }
   const shared = { tool: 0, seal: 0 }
+  const sealed: Array<boolean | undefined> = []
   try {
     const worker = await Worker.create({
       connection: env.nativeConnection,
@@ -30,8 +31,9 @@ it("gives a pinned dispatch one attempt, keeps its call, and closes the step els
           shared.tool++
           return { outcome: "settled" }
         },
-        sealStep: async () => {
+        sealStep: async (input: { withoutTheTree?: boolean }) => {
           shared.seal++
+          sealed.push(input.withoutTheTree === true)
           return { ran: true, continue: false, step: 1, promotion: null }
         },
       },
@@ -57,6 +59,7 @@ it("gives a pinned dispatch one attempt, keeps its call, and closes the step els
           phase = kind
           shared.tool = 0
           shared.seal = 0
+          sealed.length = 0
           const handle = await env.client.workflow.start("sessionTurn", {
             workflowId: `pin-retry-session-${kind}`,
             taskQueue: "pin-retry-main",
@@ -84,6 +87,10 @@ it("gives a pinned dispatch one attempt, keeps its call, and closes the step els
             // it had rather than the tool being run somewhere else.
             expect(shared.tool).toBe(0)
             expect(shared.seal).toBe(1)
+            // And it seals without the tree: this worker never ran the step, and the one that did
+            // may still be inside a tool, so rebuilding here would put it on the newest state and
+            // shipping from here would publish the state before the step.
+            expect(sealed).toEqual([true])
           } finally {
             clearTimeout(timer)
             await handle.terminate()

@@ -32,7 +32,7 @@ const materializerStack = (data: string) =>
 const drainsOver = (
   worktrees: WorktreeMaterializer.Interface,
   directory: string,
-  runToolCall: SessionRunner.Interface["runToolCall"],
+  runner: Partial<SessionRunner.Interface>,
 ) =>
   makeL2Drains({
     store: {
@@ -41,7 +41,7 @@ const drainsOver = (
     // The location resolves to a runner and nothing else: what is under test is the bracket around
     // the call, not what the tool does inside it.
     locations: {
-      get: () => Layer.succeed(SessionRunner.Service, { runToolCall } as unknown as SessionRunner.Interface),
+      get: () => Layer.succeed(SessionRunner.Service, runner as SessionRunner.Interface),
     } as unknown as L2DrainDeps["locations"],
     ctx: Context.empty() as L2DrainDeps["ctx"],
     events: { claim: () => Effect.void } as unknown as L2DrainDeps["events"],
@@ -58,13 +58,13 @@ it.live("marks the directory while a tool call runs and takes the mark back afte
     )
 
     const seen: Writers.Writer[][] = []
-    const { toolCallDrain } = drainsOver(worktrees, directory, ((input: { call: { id: string } }) =>
+    const { toolCallDrain } = drainsOver(worktrees, directory, { runToolCall: ((input: { call: { id: string } }) =>
       Effect.gen(function* () {
         // Inside the body, which is the window the refusal exists for. Asked with no step of its
         // own, so what comes back is every marker the host is holding.
         seen.push(yield* Writers.strandedWriters(data, directory))
         return { outcome: "settled" as const, call: input.call.id }
-      })) as unknown as SessionRunner.Interface["runToolCall"])
+      })) as unknown as SessionRunner.Interface["runToolCall"] })
 
     yield* Effect.promise(() =>
       toolCallDrain(
@@ -97,8 +97,10 @@ it.live("takes the mark back when the tool fails rather than returns", () =>
       Effect.provide(yield* Layer.build(materializerStack(data))),
     )
 
-    const { toolCallDrain } = drainsOver(worktrees, directory, (() =>
-      Effect.die(new Error("the tool blew up"))) as unknown as SessionRunner.Interface["runToolCall"])
+    const { toolCallDrain } = drainsOver(worktrees, directory, {
+      runToolCall: (() =>
+        Effect.die(new Error("the tool blew up"))) as unknown as SessionRunner.Interface["runToolCall"],
+    })
 
     const failed = yield* Effect.promise(() =>
       toolCallDrain(
@@ -118,5 +120,53 @@ it.live("takes the mark back when the tool fails rather than returns", () =>
     // A call that failed is not a call still inside its own execution. Leaving the mark would refuse
     // the directory to everything after it for a tool that is over.
     expect(yield* Writers.strandedWriters(data, directory)).toEqual([])
+  }),
+)
+
+it.live("seals a step away from its host without touching the tree", () =>
+  Effect.gen(function* () {
+    const root = yield* Effect.promise(() => mkdtemp(path.join(tmpdir(), "opencode-l2-writers-")))
+    const data = path.join(root, "host-data")
+    const directory = path.join(root, "project")
+    const real = yield* WorktreeMaterializer.Service.pipe(
+      Effect.provide(yield* Layer.build(materializerStack(data))),
+    )
+    // The rebuild is the part that must not happen, and with no packs stored it would return
+    // without doing anything, so what is counted is the call rather than its effect.
+    let rebuilds = 0
+    const worktrees: WorktreeMaterializer.Interface = {
+      ...real,
+      ensure: (dir, options) => {
+        rebuilds++
+        return real.ensure(dir, options)
+      },
+    }
+
+    const sealed: unknown[] = []
+    const { sealDrain } = drainsOver(worktrees, directory, {
+      sealStep: ((input: unknown) => {
+        sealed.push(input)
+        return Effect.succeed({ ran: true, continue: true, step: 2, promotion: undefined })
+      }) as unknown as SessionRunner.Interface["sealStep"],
+    })
+    const seal = (withoutTheTree?: boolean) =>
+      Effect.promise(() =>
+        sealDrain(
+          { sessionID: "ses_writers", step: 1, owner: "run:1:1", withoutTheTree },
+          new AbortController().signal,
+        ),
+      )
+
+    // An ordinary seal is on the host that ran the step, and it ships what the step produced.
+    yield* seal()
+    expect(rebuilds).toBe(1)
+    expect((sealed[0] as { withoutTheTree?: boolean }).withoutTheTree).toBeUndefined()
+
+    // One closing a step away from that host is not. Rebuilding here would put this host on the
+    // newest state while the one that ran the tools may still be writing, and what it captured
+    // would be the state before them.
+    yield* seal(true)
+    expect(rebuilds).toBe(1)
+    expect((sealed[1] as { withoutTheTree?: boolean }).withoutTheTree).toBe(true)
   }),
 )

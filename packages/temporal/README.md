@@ -515,8 +515,9 @@ Sessions that are already running do not have to be drained first. What a steppe
 pinned dispatch fails is a workflow decision, so it is written into every history that reached it,
 and a run recorded before that rule changed would replay into a nondeterminism error. Those rules
 sit behind `patched()`, so an old run keeps the behaviour it recorded and a new one gets the current
-rule. `packages/temporal/test/l2-replay.test.ts` replays both directions: a history this code writes,
-and the kept ones under `test/fixture/histories`, each recorded by the code that predates a rule.
+rule. The same holds for the step ceiling, which is also something the supervisor schedules.
+`packages/temporal/test/l2-replay.test.ts` replays both directions: a history this code writes, and
+the kept ones under `test/fixture/histories`, each recorded by the code that predates a rule.
 Removing a patch fails it.
 
 ### Running workers separately
@@ -664,10 +665,14 @@ The rules that bound it, because checking a stored tree out over the wrong one d
   Fallback waits for all pinned promises and runs shared dispatches sequentially. Only a
   schedule-to-start failure permits this move. A started attempt that fails can still write its
   directory, so its call stays where it is and is never dispatched again. The step is closed on
-  the shared queue instead, and the turn continues with the next one. What makes that safe is the
-  publication fence: the files a superseded attempt ships are refused under the same owner token
-  that already fences its event appends, so a tool still running over there cannot move the
-  project. A declined permission and cancellation retain their stop semantics.
+  the shared queue instead, and the turn continues with the next one. That seal does not touch the
+  tree: it is standing in a directory that never ran the tools, so rebuilding there would put it on
+  the newest state while the host that did run them may still be writing, and what it captured
+  would be the state before the step. What makes carrying on safe is the publication fence: the
+  files a superseded attempt ships are refused under the same owner token that already fences its
+  event appends. Between the dispatch failing and the next step claiming the log, nothing fences
+  that host, and what makes the window harmless is that nobody else publishes during it. A declined
+  permission and cancellation retain their stop semantics.
 - **Without affinity, shared-store tools run sequentially.**
   `OPENCODE_TEMPORAL_SERIAL_TOOLS=1` is the default when affinity is off. This prevents ordinary
   same-step dispatches from concurrently editing separate copies. It does not stop an attempt
@@ -705,8 +710,9 @@ Local mode uses the in-process coordinator. Temporal mode is
 | Fresh worker receives a project | Requires access to the directory | Packs rebuild tracked files at the recorded absolute path | `worktree-materialize.test.ts`; ignored files and external tool effects do not travel |
 | Workflow history grows | No workflow history | Drain count or `continueAsNewSuggested` requests rollover. The supervisor waits for a drain boundary and finished handlers | `session-supervisor-rollover.test.ts`; a long active turn does not roll over mid-step |
 | Pinned queue is unavailable | No queue | Conclusively unstarted work migrates after the pinned batch settles; uncertain started work stays with its host and its step is closed on the shared queue | `l2-step.test.ts`, `l2-pinned-retry.test.ts`; the old process is fenced out of the store rather than accounted for, and its directory stays refused until it is provably free |
-| A later turn reuses a directory an abandoned tool may still write | Not reachable: one coordinator holds the directory | The host records each call inside its own execution and refuses the directory to any other step until that call returns. The refusal is a defect, so the work is scheduled again and another host can take it. A marker retires itself when this host can show the call is over: the writer's process is gone, its process group is empty, and the machine has not restarted underneath those pids. A tool that put itself in another group still needs an operator | `worktree-materialize.test.ts` covers the refusal, its step scope, and each way a marker retires; removing any of them fails it. `l2-drain-writers.test.ts` drives the real drain, so the marker being written at all is covered |
-| A superseded attempt ships files afterwards | Not reachable | Its pack is refused under the owner token the session has moved past, the same one that fences its event appends. Before anything supersedes it, its publication is ordinary and the next host builds on it | `worktree-materialize.test.ts` covers the refusal and the attempt the session is on shipping as usual; the window before the next claim is not fenced by anything |
+| A later turn reuses a directory an abandoned tool may still write | Not reachable: one coordinator holds the directory | The host records each call inside its own execution and refuses the directory to any other step until that call returns. The refusal is a defect, so the work is scheduled again and another host can take it. A marker retires itself when this host can show the call is over: the writer's process is gone, nothing carrying the name that worker put in its environment is still running, its process group is empty, and the machine has not restarted underneath those pids. Everything a tool starts inherits that name, including through `setsid`, so what still needs an operator is a tool that both left the group and was handed an environment of somebody else's choosing. The refusal is retryable and carries its own short delay, so it does not climb the backoff a failing activity earns | `worktree-materialize.test.ts` covers the refusal, its step scope, and each way a marker retires; removing any of them fails it. `l2-drain-writers.test.ts` drives the real drain, so the marker being written at all is covered, and `boundary-refusal.test.ts` pins how a refusal crosses the activity boundary |
+| A superseded attempt ships files afterwards | Not reachable | Its pack is refused under the owner token the session has moved past, the same one that fences its event appends. Before anything supersedes it, its publication is ordinary and the next host builds on it | `worktree-materialize.test.ts` covers the refusal and the attempt the session is on shipping as usual; the window before the next claim holds only because the seal that closes the step does not publish, which `l2-drain-writers.test.ts` and `l2-pinned-retry.test.ts` pin |
+| A turn never stops stepping | The coordinator's own loop | The supervisor stops driving it after 200 steps and says so. Each step is its own activity and each one succeeds, so nothing below the supervisor can see it | `session-supervisor-ceiling.test.ts` drives a runtime whose steps always ask for another; the ceiling is behind a patch, so a run recorded before it keeps what it recorded |
 
 An unknown tool outcome is a loss of evidence, not proof that execution stopped or failed. The
 model can request a new call after reading that result. A non-idempotent external effect needs a

@@ -4,7 +4,9 @@
 // simulate a fresh host, "host B" materializes it back from the store alone.
 import { describe, expect } from "bun:test"
 import { $ } from "bun"
-import { spawn } from "node:child_process"
+import { execFile, spawn } from "node:child_process"
+import { randomBytes } from "node:crypto"
+import { promisify } from "node:util"
 import { realpathSync } from "node:fs"
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises"
 import path from "path"
@@ -452,12 +454,23 @@ describe("WorktreeMaterializer", () => {
   )
 })
 
-// A process in a group of its own, which is what a worker somebody's supervisor started has. The
-// group is the part that matters: it is where the children of a dead writer stay.
-const spawned = () => {
+// A process in a group of its own, which is what a worker somebody's supervisor started has, and
+// what a tool that daemonizes gives itself. It carries a worker name of this test's choosing, so
+// what each case turns on is the one thing that case is about. Without one it gets this process's
+// environment, which is the case that says the name is exported rather than only written down.
+const run = promisify(execFile)
+
+// Per run, because a name is what the host looks for and an assertion that fails before its child
+// is killed leaves that child running. A fixed name would then answer for every later run.
+const runToken = randomBytes(4).toString("hex")
+const named = (worker: string) => `${worker}-${runToken}`
+
+const spawned = (worker?: string) => {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     detached: true,
     stdio: "ignore",
+    env:
+      worker === undefined ? process.env : { ...process.env, OPENCODE_WORKTREE_WRITER: named(worker) },
   })
   return { child, pid: child.pid! }
 }
@@ -540,18 +553,52 @@ describe("WorktreeMaterializer quarantine", () => {
       yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
       expect(yield* usable()).toBe(false)
 
-      // The worker died and left nothing behind. A group of its own is what a worker somebody's
-      // supervisor started has, and an empty one is the rest of the proof that its tools are over.
-      const gone = yield* Effect.promise(() => ended(spawned()))
-      yield* Effect.promise(() => editMarker(data, worktree, { pid: gone.pid, pgid: gone.pgid }))
+      // The worker died and left nothing behind: no process of its own, nothing carrying its name,
+      // and an empty group. That is the whole of the proof that its tools are over.
+      const gone = yield* Effect.promise(() => ended(spawned("gone")))
+      const stale = { pid: gone.pid, pgid: gone.pgid, worker: named("gone") }
+      yield* Effect.promise(() => editMarker(data, worktree, stale))
       expect(yield* usable()).toBe(true)
 
       // The worker died and something it started did not. That is what the refusal is for.
-      const orphan = spawned()
+      const orphan = spawned("orphaned")
       yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
-      yield* Effect.promise(() => editMarker(data, worktree, { pid: gone.pid, pgid: orphan.pid }))
+      yield* Effect.promise(() =>
+        editMarker(data, worktree, { ...stale, pgid: orphan.pid, worker: named("orphaned") }),
+      )
       expect(yield* usable()).toBe(false)
       yield* Effect.promise(() => ended(orphan))
+      expect(yield* usable()).toBe(true)
+
+      // A tool that asks for a group of its own is out of the group check's reach. What it cannot
+      // put down is the name its worker left in the environment it inherited.
+      const escaped = spawned("escaped")
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() => editMarker(data, worktree, { ...stale, worker: named("escaped") }))
+      expect(yield* usable()).toBe(false)
+      yield* Effect.promise(() => ended(escaped))
+      expect(yield* usable()).toBe(true)
+
+      // And the name has to reach the tool, not only the marker. This child is given no environment
+      // of its own, so the only way it carries the name is that the worker exported it.
+      const inheriting = spawned()
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() =>
+        editMarker(data, worktree, { ...stale, worker: process.env.OPENCODE_WORKTREE_WRITER }),
+      )
+      expect(yield* usable()).toBe(false)
+      yield* Effect.promise(() => ended(inheriting))
+      expect(yield* usable()).toBe(true)
+
+      // A worker restarted from the same shell is in the group its predecessor was in, so the group
+      // answers for this process rather than for the marker. What the dead worker started is what
+      // decides, and it started nothing.
+      const ourGroup = yield* Effect.promise(async () => {
+        const { stdout } = await run("ps", ["-o", "pgid=", "-p", String(process.pid)])
+        return Number.parseInt(stdout.trim(), 10)
+      })
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() => editMarker(data, worktree, { ...stale, pgid: ourGroup }))
       expect(yield* usable()).toBe(true)
 
       // A pid means nothing across a restart, so a marker from before one is not read as live.

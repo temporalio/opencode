@@ -259,7 +259,12 @@ export const makeSteppedTurn =
         sessionID: input.sessionID,
         step: model.step,
       })
-      return activities.sealStep(sealing(false))
+      // Without the tree. This seal is standing in a directory that never ran the step's tools, so
+      // what it would ship is the state before them, and the host that did run them may still be
+      // inside one. Between the dispatch failing and the next step claiming the log there is a
+      // window where nothing fences that host, and the only thing that makes the window harmless
+      // is that nobody else publishes during it.
+      return activities.sealStep({ ...sealing(false), withoutTheTree: true })
     }
     const resumes = () => (uncertain !== undefined && (resumesAfterLostHost?.() ?? false))
     if (resumes()) return closeElsewhere()

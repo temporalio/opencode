@@ -742,7 +742,9 @@ const layer = Layer.effect(
       // sends a request carrying a tool_use with no tool_result and the provider rejects it.
       yield* failInterruptedTools(input.sessionID, context)
       const startSnapshot = target.snapshot?.start
-      const endSnapshot = yield* snapshots.capture()
+      // A seal closing a step away from its host captures a directory that never ran the tools, so
+      // what it would ship is the state before them. The host that has them is the one that ships.
+      const endSnapshot = input.withoutTheTree ? undefined : yield* snapshots.capture()
       // Ship the post-step tree: this is the state a later step on another host needs.
       if (endSnapshot) yield* snapshotSync.push(endSnapshot, input.sessionID)
       const files =
