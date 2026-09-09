@@ -45,6 +45,18 @@ export interface SupervisorRuntime {
   /** Restart the run with fresh history, carrying whether work is still pending. History-keeping
    * drivers only (Temporal). */
   readonly continueAsNew?: (sessionID: string, startWithWake: boolean) => Promise<never>
+  /** Whether the driver says this run's history is large enough to roll over. A drain count cannot
+   * answer this: one drain is a whole turn, and a stepped turn of 200 steps is thousands of events,
+   * so a handful of drains can cross the server's limit long before the count does. Optional:
+   * drivers without a history return false. */
+  readonly historyWantsRollover?: () => boolean
+  /** Whether this run was started after a turn got a step ceiling. A turn that keeps stepping is
+   * what the ceiling is for, and a run recorded before it exists would replay into a step this
+   * code refuses to schedule, so only a run that recorded the change may take it. Optional:
+   * drivers with no history to replay always have it. */
+  readonly boundsStepsPerTurn?: () => boolean
+  /** Where a turn says it stopped because it ran out of steps rather than because it finished. */
+  readonly warn?: (message: string, attributes: Record<string, unknown>) => void
 }
 
 export interface WorkflowOptions {
@@ -52,6 +64,8 @@ export interface WorkflowOptions {
   readonly idleTimeout?: string
   /** Drains per run before continue-as-new, when the driver supports it. */
   readonly maxDrainsPerRun?: number
+  /** Steps one turn may take before the supervisor stops driving it. */
+  readonly maxStepsPerTurn?: number
 }
 
 export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions) => {
@@ -60,6 +74,11 @@ export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions)
   // until Temporal terminates the workflow. continue-as-new carries the pending-wake state, so no
   // queued work is lost across the boundary.
   const MAX_DRAINS_PER_RUN = options?.maxDrainsPerRun ?? 30
+  // A turn that never stops stepping is a bug in the loop above this one: a model asking for the
+  // same tool forever, or a step that keeps handing itself back because its host keeps dying. Only
+  // the supervisor can see it, because each step is its own activity and each one succeeds. High
+  // enough that real work never reaches it.
+  const MAX_STEPS_PER_TURN = options?.maxStepsPerTurn ?? 200
 
   // Each step (one provider attempt + its tools) is its own activity; the step loop is supervisor
   // control flow (step / promotion / first mirror SessionRunner.run's loop). `startWithWake` is the
@@ -81,12 +100,31 @@ export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions)
         .runInDrainScope(async () => {
           drains++
           if (drains >= MAX_DRAINS_PER_RUN) rolloverPending = true
+          if (rt.historyWantsRollover?.()) rolloverPending = true
           let step = 1
           let promotion: string | null = null
           let first = true
-          for (;;) {
+          for (let taken = 0; ; taken++) {
+            if (taken >= MAX_STEPS_PER_TURN && (rt.boundsStepsPerTurn?.() ?? true)) {
+              rt.warn?.("turn hit the step ceiling and was left where it stopped", {
+                sessionID,
+                steps: taken,
+              })
+              break
+            }
             const r: StepDrainResult = await rt.runTurnStep({ sessionID, step, promotion, first, force })
+            // Inside the loop as well, because one drain is a whole turn: a long one outgrows the
+            // history without ever reaching the next drain's check.
+            if (rt.historyWantsRollover?.()) rolloverPending = true
             if (!r.continue) break
+            // A queued prompt continues this same drain as a fresh turn, so a session fed without a
+            // gap never goes quiet and the rollover it is waiting for never happens. Stop at that
+            // boundary instead and let the new run pick the queue up: the work is not lost, it is
+            // one turn later. A steer is not a boundary, so it still rides this drain through.
+            if (rolloverPending && r.promotion === "queue") {
+              pendingWake = true
+              break
+            }
             step = r.step
             promotion = r.promotion
             first = false

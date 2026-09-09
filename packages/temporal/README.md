@@ -1,16 +1,22 @@
 # @opencode-ai/temporal
 
-The Temporal executor for opencode's `SessionExecution` seam, packaged as a plugin: core carries
-the seam, the built-in local executor, and the executor-agnostic toolkit; this package is one
-dependency that makes an opencode **session** a durable Temporal workflow. A coding session
-survives worker loss, can run detached or in the background, and can be driven from anywhere by
-signal. opencode's loop, tools, model, storage, and HTTP API are untouched, and nothing Temporal
-exists in core.
+This package implements `SessionExecution` with Temporal workflows and activities. The default
+executor remains local. Both drive the fork's `SessionRunner` and read its application event log.
+
+The integration changes runner APIs, tool admission, event fencing, approvals, questions, and
+storage. The TUI bridge and deployment wiring are additional changes. There are no Temporal SDK
+imports in core, but this is not an unchanged harness with a package added. Recovery depends on the
+failure point and mode; the contract below names the cases that fail rather than migrate.
 
 A lighter increment exists as its own change: the `2026/08/opencode-temporal-http` branch wraps
 the **shipping** `opencode serve` over its HTTP API, for the agent-as-black-box case. It makes the
-orchestration durable but cannot recover a partial turn. This change is the deeper one: durability
-inside the engine, so a crashed turn resumes mid-step instead of being re-attached to.
+orchestration durable. That prototype did not add host-side partial-turn recovery. A coarse
+activity can recover partial progress when the host exposes a recorded continuation, as this
+fork does.
+
+Reported live measurements and historical verification below are the author's supplied evidence.
+They were not rerun during this review. Current offline and Temporal test results are recorded in
+`work/opencode-review.md` in the review package.
 
 ## How it fits together
 
@@ -25,7 +31,7 @@ in-process on the proven `SessionRunCoordinator` (core's `execution/local.ts`), 
 the v1 server uses, with no server and no ports (see [Two modes, one
 runner](#two-modes-one-runner)).
 What an executor must do is defined executably: core's conformance suite
-(`session/execution/conformance.ts`) runs the same wake/resume/interrupt scenarios against the local
+(`packages/core/test/lib/execution-conformance.ts`) runs the same wake/resume/interrupt scenarios against the local
 executor in core's tests and against this package through real workflows.
 
 That forces six things:
@@ -38,8 +44,8 @@ That forces six things:
    (`loop-guard.ts`: a step ceiling plus a repeated-identical-call detector), because a runaway
    turn would otherwise be a durable runaway turn
    ([Two modes, one runner](#two-modes-one-runner)).
-3. **Two writers must be fenced.** A superseded attempt cannot keep appending to the log; each
-   drain claims the log with an attempt token ([Notes](#notes)).
+3. **Event appends check the owner.** Each drain claims an attempt token. Same-run ordering
+   rejects older claims; cross-run age is not encoded ([Notes](#notes)).
 4. **The worktree must travel.** Snapshot trees ship as incremental git packs, and a worker
    without the project tree rebuilds it before the run
    ([What resumes cross-host](#what-resumes-cross-host-and-what-does-not)).
@@ -58,7 +64,7 @@ visibility, so it survives restarts.
 opencode's v2 engine (`packages/core` + `packages/server`) is already event-sourced per session and
 exposes a substitutable `SessionExecution` service (`active` / `resume` / `wake` / `interrupt`)
 whose local impl comments "Future remote placement belongs here." This change provides a
-Temporal-backed `SessionExecution` in `packages/core/src/session/execution/`:
+Temporal-backed `SessionExecution` in `packages/temporal/src/`:
 
 - `packages/temporal/src/workflow.ts`: the pure per-session workflow (the Temporal equivalent of
   `SessionRunCoordinator`: `wake`/`force` drive one drain, wakes coalesce, quiescent runs end).
@@ -66,8 +72,8 @@ Temporal-backed `SessionExecution` in `packages/core/src/session/execution/`:
   cancellation;
   injects the attempt's event-log owner token).
 - `packages/temporal/src/executor.ts`: the `SessionExecution` layer + node: `wake` →
-  `signalWithStart`, `resume` →
-  forced `signalWithStart`, `interrupt` → cancel signal; each drain runs one step of the local
+  `signalWithStart`, `resume` → `executeUpdateWithStart`, `interrupt` → a signal cancelling
+  the current drain scope; each drain runs one step of the local
   coordinator's loop (`SessionRunner.runStep`) in an activity against the durable event log. The
   Temporal client and an embedded worker are co-hosted in the server process (both run under bun).
 
@@ -99,28 +105,27 @@ session runs as a Temporal workflow `session-exec-<sessionID>`.
 ### A step as three activities (`OPENCODE_TEMPORAL_STEPPED=1`)
 
 By default one step (a provider attempt plus every tool it asks for) is a single activity. That is
-the smallest unit the runner used to expose, and it means nothing can sit between the model asking
-for a tool and the tool running. `OPENCODE_TEMPORAL_STEPPED=1` splits a step into three kinds of
+the smallest activity boundary in whole-step mode. Workflow code has no boundary between the
+model and tools there; application callbacks can still gate dispatch. `OPENCODE_TEMPORAL_STEPPED=1` splits a step into three kinds of
 activity instead:
 
 ```
 runModelCall  ->  runToolCall (one per call, concurrent)  ->  sealStep
 ```
 
-`SessionRunner.runModelCall` performs the attempt, records each call as `Tool.Called`, and hands the
-calls back rather than running them. `runToolCall` settles one call. `sealStep` takes the end
-snapshot, diffs it against the start, and publishes `Step.Ended`. The loop between them is workflow
-code, so a retry policy, a timeout, an approval or a budget can live where the model-to-tools
-handoff
-used to be. Each activity also carries its own bounds: sealing does not inherit a turn-sized
-backstop, and one tool waiting on a human no longer holds the attempt and its sibling tools under a
-single timeout.
+`SessionRunner.runModelCall` records pending tool inputs and returns call identities. At dispatch,
+`runToolCall` commits `Tool.Called` before execution, then publishes the result. `sealStep` captures
+the final tree and publishes `Step.Ended`. Workflow code connects those activities.
+
+Each activity has its own bounds. The seal's `startToCloseTimeout` is `10 minutes`, compared with
+`12 hours` for the model and tool activities. Pinned activities have one attempt; shared activities
+permit up to `100`. These proxies do not set a total `scheduleToCloseTimeout`.
 
 The supervisor is unchanged. Wake, interrupt, idle self-termination and continue-as-new only ever
 called one `runTurnStep`, so the stepped mode supplies a different one. The mode rides the workflow
 input, so a session that rolls over keeps it.
 
-Two things are load-bearing and easy to get wrong:
+Two conditions govern dispatch:
 
 - **One owner token per step, not per activity.** The event log fences a publish behind the current
   owner, so a step's writers have to share one. Only `runModelCall` claims; the tool and seal
@@ -138,12 +143,11 @@ Two things are load-bearing and easy to get wrong:
   fence in front of the side effect: under a superseded owner the publish fails and the tool never
   runs, where before it ran and then lost its result.
 
-  It is also what closes the zombie window, which the settled-result check on its own does not: that
-  check is a read then a write, so an attempt that lost its heartbeat but kept running could race a
-  retry past it. For the case that matters, a non-idempotent side effect running twice, it cannot
-  happen anyway, because the second dispatch refuses to run the tool at all. What can still race is
-  which truthful outcome reaches the model, the zombie's real result or the "unknown", and both
-  describe something that did happen. Reporting success for a tool that never ran is not reachable.
+  A non-idempotent dispatch uses an event ID derived from the session, assistant message, and
+  call ID. The unique event insert commits before execution. Concurrent attempts that both read
+  `pending` therefore compete for one admission. This prevents a second dispatch from starting the
+  same call. It does not stop an admitted process after a timeout, undo an external effect, or stop
+  the model requesting a new call with a new ID.
 - **A stop closes the calls it cut short.** A whole step closes the tools it opened on its way out.
   A call that is its own activity has nobody to do that, so an interrupted turn used to leave it
   recorded as running until the next prompt: a transcript showing a tool still going, and an entry
@@ -164,7 +168,7 @@ Two separate costs, and only one of them is usually real.
 
 **The lost overlap.** A whole-step activity starts each tool the moment the model asks for it, while
 the stream is still going. Here the attempt has to return before any tool starts, because a workflow
-cannot consume a stream. `packages/core/test/step-overlap-bench.test.ts` dials a mock model's stream
+receives the completed model activity result, not streamed tool-call events. `packages/core/test/step-overlap-bench.test.ts` dials a mock model's stream
 tail and a sleeping tool, so the number is the overlap and nothing else:
 
 | stream tail after 1st call | tool | whole step | split step | loss | `min(tail, tool)` |
@@ -191,15 +195,13 @@ around the call:
 | `gpt-5-mini` (responses) | 33 ms | 36 ms | none, in any probe |
 | `gpt-5` (responses) | 34 ms | 77 ms | none, in any probe |
 
-A single tool call *is* the end of the stream, so there is nothing to overlap. A tail appears only
-when the model asks for several tools at once, and is then just the time to stream calls 2..N: tens
-of milliseconds, one to three percent of the stream. No model emitted a single character of text
-after asking for its first tool.
+In these probes, the remaining stream carried later tool calls. None contained text after the
+first call. This sample does not establish the tail for other providers, prompts, or model versions.
 
-Taken with the hand-offs below, the whole cost of the split is roughly 40-110 ms per step against
-model calls of two to eight seconds. The overlap is not a reason to avoid it.
+The reported runs added roughly 40-110 ms per step against model calls of two to eight seconds.
+That result describes those runs, not a deployment-independent cost.
 
-**The extra round trips.** Three activities per step instead of one means two more hand-offs.
+**The extra round trips.** A one-tool step has three activities instead of one.
 Measured from workflow history on a loopback dev server (mean of four, one turn):
 
 ```
@@ -212,7 +214,12 @@ done runModelCall -> sched sealStep       3 ms
 About 5 ms per hand-off, so ~10 ms per step, against model calls of 1.2 s and 3.2 s in the same run.
 Per-step Temporal overhead tracks worker-to-namespace distance, so this is the floor: it grows with
 placement, and a laptop driving a remote namespace pays it many times over. Put workers next to the
-namespace and the split is close to free.
+namespace to reduce this term.
+
+With `N` tools, the split schedules `N+2` activities. That is an activity count, not the latency
+of a parallel batch. With available slots, the critical path includes the model, slowest tool, and
+seal. Serial fallback instead adds each tool's dispatch and execution time. Activity cost, history
+bytes, queue delay, transcript reads, and tree transfers need separate measurements.
 
 Wall-clock totals are deliberately not quoted here. Model latency dominates and varies more between
 two runs of the same cell than the effect being measured.
@@ -329,10 +336,8 @@ OPENCODE_TEMPORAL_WORKTREE_AFFINITY=1 OPENCODE_TEMPORAL_WORKTREE=/srv/trees/acme
 
 The queue is keyed on the session's `location.directory`, not the project root, because that is the
 tree `worktrees.ensure` has to produce and two sessions in one project can sit in different
-directories. Paths are resolved through `realpath` first: on macOS `/tmp/x` and `/private/tmp/x` are
-one tree, and a client and a worker that disagreed would sit on two queues and the session would
-hang
-with nothing to show for it.
+directories. Queue derivation normalizes paths without depending on whether the directory exists
+locally. Every participant must still use the same logical directory.
 
 **This trades availability for latency, which is why it is opt-in.** With affinity on, a session
 whose tree has no worker polling does not fall back to another worker. It waits. Reconstruction is
@@ -340,10 +345,15 @@ what makes any worker able to serve any session, and turning affinity on is choo
 
 Two consequences to plan for, both silent:
 
+- **The key is the directory, not the host.** In a container fleet where every worker's project is
+  the same path, this affinity is a no-op: they all poll the same queue and a step's tools still
+  land wherever. It is a real routing decision only where hosts serve different paths.
+  What keeps a step's writes together in a container fleet is step affinity below, which is keyed by
+  host as well as by path.
+
 - **A worker serves one tree.** In the default `role=both` deployment the embedded worker polls the
   queue for the process directory, so a session in another project has no poller. Point
-  `OPENCODE_TEMPORAL_WORKTREE` at the project root, not at a subfolder, since the key is the project
-  worktree.
+  `OPENCODE_TEMPORAL_WORKTREE` at the session directory used to derive that queue.
 - **Flipping the flag strands workflows already running.** A workflow keeps the task queue it
   started on for life, and its activities inherit it. Restarting workers with the flag changed
   leaves in-flight sessions with nobody polling their queue. They do not fail; they stay `RUNNING`
@@ -418,9 +428,8 @@ the crash is handled by declared idempotency: a side-effect-free tool (`read`/`g
 `idempotent: true`) is re-run for a real result, while a side-effecting tool is marked interrupted
 and left for the model to redo. The harness cannot know whether the side-effecting one already ran
 and must not re-run `git push`, so the default is non-idempotent; the blanket case (idempotency keys
-against an external system) is per-integration and out of scope. Finer granularity (the model call
-and each tool as separate Temporal activities) would un-fuse the eager tool dispatch and is left for
-later. Verified by `packages/core/test/session-runner-resume.test.ts`.
+against an external system) is per-integration and out of scope. The optional split mode also reuses recorded calls, with the model, tools, and seal in separate
+activities. Verified by `packages/core/test/session-runner-resume.test.ts`.
 
 ### Notes
 
@@ -450,6 +459,66 @@ later. Verified by `packages/core/test/session-runner-resume.test.ts`.
 
 Resume is verified end to end: it resolves on a healthy session and rejects on a failing
 one with the original tagged error (`LLM.Error`) reconstructed across the boundary.
+
+### A turn nobody starts
+
+`session start` still needs something running to hand the prompt to. A schedule does not: it is a
+Temporal object, and what it fires is a workflow that admits the prompt itself and then starts the
+session's own supervisor. At firing time there is no client and no serve process, only workers.
+
+The session is created once, when the schedule is made, because a session is a row in the store
+before it is anything else. After that the firing reaches only Temporal. The prompt is admitted as
+queued rather than delivered, so a firing that lands while the last turn is still working is not
+lost: it is drained when that turn ends, and overlapping firings are skipped rather than stacked.
+
+### Picking a deployment rather than assembling one
+
+The settings below are not independent, and getting them wrong fails as something else later: a
+store only one process can see reads as a worker that never picks anything up. `OPENCODE_TEMPORAL_PROFILE`
+picks one deployment and the rest follow.
+
+| | `local` (default) | `fleet` |
+|---|---|---|
+| what it is | one serve, worker inside it | serve processes and workers, separate |
+| store | this process only | **you set** `OPENCODE_DB_URL` |
+| role | `both` | `client` for serve, `worker` for workers |
+| unit of work | a whole step | the model call, each tool call, the seal |
+
+Individual settings override profile defaults. Preflight checks this process's configuration and
+rejects combinations it declares unsupported. It does not compare processes, probe another host's
+storage, or prove fleet availability.
+
+Reaching a server that is not the dev server:
+
+```bash
+TEMPORAL_ADDRESS=your-ns.a1b2c.tmprl.cloud:7233 TEMPORAL_NAMESPACE=your-ns.a1b2c \
+  OPENCODE_TEMPORAL_API_KEY_FILE=/run/secrets/temporal-key     # Temporal Cloud
+TEMPORAL_ADDRESS=temporal.internal:7233 \
+  OPENCODE_TEMPORAL_TLS_CERT=/run/secrets/tls.crt \
+  OPENCODE_TEMPORAL_TLS_KEY=/run/secrets/tls.key               # a cluster with mTLS
+```
+
+Both roles read credentials through the same connection helper. Their environment and credential
+files can still differ. Operators must align the address, namespace, queues, and storage settings.
+
+Ask before deploying rather than after:
+
+```bash
+opencode session doctor
+```
+
+It prints this process's resolved settings, configuration errors, and warnings. An incomplete
+certificate pair or unsupported fleet store setting fails preflight. A remote plaintext connection
+produces a warning. None of these checks verifies another process's actual storage access.
+
+Sessions that are already running do not have to be drained first. What a stepped turn does after a
+pinned dispatch fails is a workflow decision, so it is written into every history that reached it,
+and a run recorded before that rule changed would replay into a nondeterminism error. Those rules
+sit behind `patched()`, so an old run keeps the behaviour it recorded and a new one gets the current
+rule. The same holds for the step ceiling, which is also something the supervisor schedules.
+`packages/temporal/test/l2-replay.test.ts` replays both directions: a history this code writes, and
+the kept ones under `test/fixture/histories`, each recorded by the code that predates a rule.
+Removing a patch fails it.
 
 ### Running workers separately
 
@@ -492,7 +561,8 @@ re-drives without a saved rule). Graceful shutdown retires the process's pending
 and a revived attempt flips them back to pending; after a hard crash the pending row feeds the
 retry. A pending ask whose session is abandoned lingers in the list until a reply retires it.
 Verified by `packages/core/test/permission-durable.test.ts` (two independent stacks over one store).
-The `question` tool still uses an in-process deferred and needs the same treatment.
+`question_request` also persists pending questions and their answers. Its local deferred races a
+store poll. `question-durable.test.ts` covers separate service stacks over one database.
 
 ## Shared, durable event store (any-worker resume)
 
@@ -569,13 +639,47 @@ and dependencies are not captured, so a rebuilt tree may need an install step be
 identically. Worker affinity (below) or a shared volume skips the materialization latency on warm
 paths; the packs are the portable baseline that works with neither.
 
-Two rules bound what that refresh may touch, because checking a stored tree out over the wrong one
-destroys work. A tree is moved only when a host-local note (`snapshot/tip.ts`) says this host is
-behind the store, so a host holding a capture that never shipped is left as it is. And it is moved
-only when this host built the tree from packs, so a checkout the host already had, a developer's own
-working copy, is never rewritten: that case is logged and left alone. What stays open is the tools
-of ONE step running on two hosts, since nothing captures their writes until the step is sealed.
-Affinity is what keeps a step's tools on one tree.
+The rules that bound it, because checking a stored tree out over the wrong one destroys work:
+
+- **Chain depth orders packs.** Parent links determine depth. Equal-depth branches still use
+  `time_created` as a tiebreaker. This is ordering, not publication admission.
+- **A stale host fails the initial push check.** `SnapshotSync.push` compares the host's tip note
+  with one head reading. Packing and insertion follow outside a shared head transaction. The check
+  does not exclude two concurrent publishers, or a late process using a note another activity
+  refreshed. The existing tests cover sequential stale publication and clock ordering.
+- **A tree is moved only when this host has a note for it**, which means this host agreed to that
+  state: it either built the tree from packs or captured the tree from there. A developer's own
+  checkout has no note, so it is never rewritten. Gating this on whether the tree carried the marker
+  a rebuild writes was wrong in the other direction: a host that seeded the session from its own
+  checkout never has that marker, so once anyone else shipped, every activity that host drew failed
+  for good.
+- **The tip note is written after the insert, never before.** The packing swallows its own failures,
+  so a note written first and an insert that then failed named a tree the store never saw: the host
+  was behind nothing it could see, and every later ship from it was refused.
+- **A tool ships from the host that ran it.** The seal can land anywhere, and it used to be the only
+  thing that captured, so a tool's writes reached the store only when the seal happened to be on
+  the same host.
+- **Step affinity keeps parallel tools on one worker's directory.**
+  `OPENCODE_TEMPORAL_STEP_AFFINITY` defaults on. Each worker polls a queue keyed by host and
+  directory. Pinned activities have one attempt and a 30-second `scheduleToStartTimeout`.
+  Fallback waits for all pinned promises and runs shared dispatches sequentially. Only a
+  schedule-to-start failure permits this move. A started attempt that fails can still write its
+  directory, so its call stays where it is and is never dispatched again. The step is closed on
+  the shared queue instead, and the turn continues with the next one. That seal does not touch the
+  tree: it is standing in a directory that never ran the tools, so rebuilding there would put it on
+  the newest state while the host that did run them may still be writing, and what it captured
+  would be the state before the step. What makes carrying on safe is the publication fence: the
+  files a superseded attempt ships are refused under the same owner token that already fences its
+  event appends. Between the dispatch failing and the next step claiming the log, nothing fences
+  that host, and what makes the window harmless is that nobody else publishes during it. A declined
+  permission and cancellation retain their stop semantics.
+- **Without affinity, shared-store tools run sequentially.**
+  `OPENCODE_TEMPORAL_SERIAL_TOOLS=1` is the default when affinity is off. This prevents ordinary
+  same-step dispatches from concurrently editing separate copies. It does not stop an attempt
+  that outlives its timeout.
+- **Capturing and shipping the tree is one at a time per directory.** Two tools of one step now run
+  at once on one host, and both end by capturing and pushing: a capture writes the git index and a
+  push compares against the store's head, so two of them in one directory race on both.
 
 Host-local state that does NOT ride the DB, so it is not reconstructed on a different host:
 
@@ -588,13 +692,122 @@ Host-local state that does NOT ride the DB, so it is not reconstructed on a diff
   `${data}`
   (the XDG data dir) at shared storage to make them portable.
 
+### What recovers, and what a person has to answer for
+
+Local mode uses the in-process coordinator. Temporal mode is
+`OPENCODE_SESSION_EXECUTION=temporal`. Each row states the boundary of the cited check.
+
+| Failure | Local mode | Temporal mode | Evidence and limit |
+|---|---|---|---|
+| Prompt committed before its wake | A later `wake` or `resume` can consume the recorded prompt | A wake already accepted by Temporal is durable. The application write and wake are separate operations | Schedule tests cover retried firing admission, not a crash between an ordinary HTTP admission and wake |
+| Process dies mid-turn | No automatic restart reconciler; explicit execution can read the record | Whole-step activities retry. Split model calls can retry; an uncertain started pin closes its step elsewhere and the turn goes on | `session-runner-resume.test.ts`; `l2-pinned-retry.test.ts`. A workflow promise ending does not prove process death, which is why the call itself never moves |
+| Tool outcome is absent | Recovery retains completed results, re-executes declared idempotent tools, and reports other started calls as unknown | Same runner rule after execution resumes | `session-runner-resume.test.ts`; external effects are not reconciled |
+| Two dispatches read one pending call | One coordinator serializes its own turn | Non-idempotent L2 dispatches compete for one deterministic admission event; declared idempotent tools can execute again | `session-runner-model-call.test.ts` forces both reads before either admission |
+| Attempts overlap | The local coordinator governs one process | Same-run ordered owner tokens fence later event appends. Tools and seals share their model attempt's owner | `event-claim.test.ts`; cross-run age is not encoded, and event fencing cannot stop filesystem effects |
+| User stops the turn | The coordinator cancels its run | The drain is cancelled; the supervisor remains available. Declined permission must not trigger queue fallback | Interrupt tests and `l2-step.test.ts`; cancellation does not prove the child process has stopped |
+| Restart during approval or question | Pending state is stored; execution still needs restarting | Retried asks adopt stored state and can receive a reply from another process | `permission-durable.test.ts`, `question-durable.test.ts`; answers are stored in tables, not workflow signals |
+| Behind host publishes files | Shared-file concurrency is outside the one-coordinator deployment | Initial tip check rejects sequential stale publication | `worktree-materialize.test.ts`, `snapshot-chain.test.ts`; neither proves atomic concurrent head admission |
+| Fresh worker receives a project | Requires access to the directory | Packs rebuild tracked files at the recorded absolute path | `worktree-materialize.test.ts`; ignored files and external tool effects do not travel |
+| Workflow history grows | No workflow history | Drain count or `continueAsNewSuggested` requests rollover. The supervisor waits for a drain boundary and finished handlers | `session-supervisor-rollover.test.ts`; a long active turn does not roll over mid-step |
+| Pinned queue is unavailable | No queue | Conclusively unstarted work migrates after the pinned batch settles; uncertain started work stays with its host and its step is closed on the shared queue | `l2-step.test.ts`, `l2-pinned-retry.test.ts`; the old process is fenced out of the store rather than accounted for, and its directory stays refused until it is provably free |
+| A later turn reuses a directory an abandoned tool may still write | Not reachable: one coordinator holds the directory | The host records each call inside its own execution and refuses the directory to any other step until that call returns. The refusal is a defect, so the work is scheduled again and another host can take it. A marker retires itself when this host can show the call is over: the writer's process is gone, nothing carrying the name that worker put in its environment is still running, its process group is empty, and the machine has not restarted underneath those pids. Everything a tool starts inherits that name, including through `setsid`, so what still needs an operator is a tool that both left the group and was handed an environment of somebody else's choosing. The refusal is retryable and carries its own short delay, so it does not climb the backoff a failing activity earns | `worktree-materialize.test.ts` covers the refusal, its step scope, and each way a marker retires; removing any of them fails it. `l2-drain-writers.test.ts` drives the real drain, so the marker being written at all is covered, and `boundary-refusal.test.ts` pins how a refusal crosses the activity boundary |
+| A superseded attempt ships files afterwards | Not reachable | Its pack is refused under the owner token the session has moved past, the same one that fences its event appends. Before anything supersedes it, its publication is ordinary and the next host builds on it | `worktree-materialize.test.ts` covers the refusal and the attempt the session is on shipping as usual; the window before the next claim holds only because the seal that closes the step does not publish, which `l2-drain-writers.test.ts` and `l2-pinned-retry.test.ts` pin |
+| A turn never stops stepping | The coordinator's own loop | The supervisor stops driving it after 200 steps and says so. Each step is its own activity and each one succeeds, so nothing below the supervisor can see it | `session-supervisor-ceiling.test.ts` drives a runtime whose steps always ask for another; the ceiling is behind a patch, so a run recorded before it keeps what it recorded |
+
+An unknown tool outcome is a loss of evidence, not proof that execution stopped or failed. The
+model can request a new call after reading that result. A non-idempotent external effect needs a
+remote idempotency key, outcome query, or human reconciliation to decide what happened.
+
+## A session that outlives its client
+
+Everything above makes a session survive a worker. Together the same pieces make it survive the
+*client*, which is the part a user can feel: start something, close the laptop, and pick it up from
+a machine that has never seen it.
+
+Nothing new is needed underneath. A session is already a workflow rather than a process, the
+running set already comes from Temporal visibility, the store is already shared, and a live tail
+already re-reads so a subscriber sees work another process is doing. What was missing was a way to
+say so from a command line, which is these three:
+
+```bash
+# hand over a prompt and walk away; prints the session id and exits
+opencode session start "port the auth module to the new API" --attach http://gateway:4096
+
+# what is this deployment running right now, across every client that ever connected
+opencode session running --attach http://gateway:4096
+
+# follow one from anywhere, and stop when the turn stops
+opencode session watch ses_abc123 --attach http://gateway:4096
+
+# a turn nobody starts: the firing needs no client and no serve process
+opencode session schedule "review yesterday.s merges" --cron "0 9 * * *" --attach http://gateway:4096
+```
+
+`--attach` takes any serve in the deployment, because they are interchangeable: each one reads the
+same store and signals the same workflows. There is no "the server that owns this session". That is
+the property, and it is why these commands are plain HTTP clients with no Temporal dependency.
+`$OPENCODE_SERVER` sets the endpoint once. For an interactive terminal instead of a follower,
+`opencode attach <url> --session <id>` already puts the TUI on a remote session.
+
+To run it as a deployment rather than a laptop:
+
+```bash
+export OPENCODE_SESSION_EXECUTION=temporal
+export OPENCODE_DB_URL=libsql://...     # one store, so any worker resumes any session
+export TEMPORAL_ADDRESS=...
+
+OPENCODE_TEMPORAL_ROLE=worker bun run packages/server/src/worker.ts   # as many as you want
+OPENCODE_TEMPORAL_ROLE=client opencode serve --port 4096             # as many as you want
+```
+
+### Verified
+
+`packages/temporal/scripts/detached-session-check.sh` runs the whole claim against real processes:
+serve A starts a turn and is killed with a tool still running, the turn finishes on a standalone
+worker, and serve B (which never saw the session) reports it running and replays the transcript.
+Then `session start` returns without waiting, `session running` lists it, and `session watch`
+follows it live from a cold client and exits when the turn ends. `session schedule` then creates a
+schedule and the check waits for a firing to run a turn with no client involved at all.
+
+The runner publishes `session.next.turn.ended` for an ordinary ending. It is live-only, so a
+separate HTTP process polling durable events does not receive it. `watch` also uses terminal steps,
+quiet time retained across reconnects, and periodic absence from the running set. Its stream does
+not replay a missed ending. These backstops do not create a durable per-turn outcome.
+
+The shared-store check includes a mutation: give serve B its
+own `OPENCODE_DB` and the three cross-process assertions fail (`active` returns `{}`, the replay is
+empty, the follower hangs) while the serve-A-and-worker ones still pass.
+
+### Across two machines
+
+`packages/temporal/scripts/cross-host-check.sh` runs the claim against containers, where each worker
+has its own filesystem and hostname and the store is a real libSQL server. A session writes a file
+on worker A, worker A's host is killed, and worker B, whose project volume is empty, continues the
+same session and reads that file back.
+
+That check found a bug a single host cannot show. `WorktreeMaterializer.ensure` treated any existing
+directory as somebody's working copy, and a fresh host has no tip note, so `behind` said no and the
+tree was never built. The tools then ran against an empty directory and the model was told a wrong
+answer, which is worse than a failure. On one host the case never appears: worker B either has the
+project already or has no directory at all, and an absent directory materializes fine. A mounted
+empty directory is the shape of a machine that has never seen the session, and it now materializes
+too (`packages/core/test/worktree-materialize.test.ts` covers it).
+
+The compose file mounts the engine's source over the image, so a code change does not need a new
+image. One libSQL server, so this shows a shared store over a network rather than one that survives
+losing a node.
+
+Schedules have an entry point, and deployment profiles validate local settings. Storage
+availability, fleet-wide configuration agreement, and uncertain process recovery remain operator
+responsibilities. A profile check does not test another host's filesystem or repair its state.
+
 ## Porting this pattern
 
 The shape transfers to any agent engine; Temporal is one executor behind a seam the engine owns.
 
 1. Find the engine's coordination seam and name it: here, four verbs (`active`, `wake`, `resume`,
    `interrupt`) behind one substitutable service, with the in-process coordinator as the default.
-2. Make the turn body an idempotent, fenced step function: claim the log with an owner token,
+2. Give the step an explicit recovery contract: claim the log with an owner token,
    reuse recorded results on re-drive, encode errors so they survive a process boundary.
 3. Write the executor as a thin workflow that loops the step as activities; keep the loop free of
    engine imports so it stays deterministic and sandbox-safe.

@@ -12,7 +12,7 @@ import { Cause, Effect, Exit } from "effect"
 import { ApplicationFailure } from "@temporalio/activity"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
-import { encodeRunError } from "@opencode-ai/core/session/execution/run-error-codec"
+import { encodeRunError } from "./run-error-codec"
 import { HALTED_FAILURE_TYPE } from "./protocol"
 
 export interface BoundaryOptions {
@@ -35,6 +35,30 @@ const halted = (sessionID: string, declined?: SessionRunDeclinedError) => {
     details: encoded === undefined ? undefined : [encoded],
   })
 }
+
+// Failures that say something about the moment rather than about the work: storage that was not
+// reachable, a defect from a database call that `orDie` turned into one. Everything else stays
+// non-retryable, because re-running a step whose input the model already answered is worse than
+// failing it. Without this a libsql blip during a seal failed the step for good rather than moving
+// it to another worker.
+const QUARANTINED = "WorktreeMaterializer.QuarantinedError"
+// A refusal must not climb the backoff a failing activity earns: the interval doubles per attempt,
+// and the host that answers first and refuses fastest is exactly the one that would push the next
+// attempt minutes out while a free host sits idle. Long enough not to spin, short enough that the
+// work reaches another host in about the time one dispatch takes.
+const REFUSAL_RETRY = "2 seconds"
+
+const TRANSIENT = new Set([
+  "ToolOutputStore.StorageError",
+  "SqlError",
+  "SqliteError",
+  // A rebuild that did not finish. git and the filesystem fail for reasons that pass, and the
+  // alternative is a turn failing for good because one worker had a bad minute.
+  "WorktreeMaterializer.MaterializeError",
+  // And a directory this host is refused. It is this host saying no, not the work failing: the
+  // same dispatch runs fine on a host that is not holding somebody's abandoned tool.
+  QUARANTINED,
+])
 
 export const runAtBoundary = async <A>(
   sessionID: string,
@@ -63,7 +87,8 @@ export const runAtBoundary = async <A>(
   throw ApplicationFailure.create({
     message: squashed?.message ?? Cause.pretty(cause),
     type: squashed?._tag ?? "SessionRunError",
-    nonRetryable: true,
+    nonRetryable: !(squashed?._tag !== undefined && TRANSIENT.has(squashed._tag)),
     details: encoded === undefined ? undefined : [encoded],
+    ...(squashed?._tag === QUARANTINED ? { nextRetryDelay: REFUSAL_RETRY } : {}),
   })
 }

@@ -36,13 +36,10 @@ export interface StepResult {
   readonly promotion: SessionInput.Delivery | undefined
 }
 
-/** A tool call the provider asked for, recorded but not run, handed to the caller to dispatch.
- * Every id comes from the provider or the publisher and is carried, never regenerated: a second run
- * of the same step would mint different ones and the results would not match the log. */
+/** Carry recorded identities so dispatch reads the matching arguments without duplicating payloads. */
 export interface DeferredToolCall {
   readonly id: string
   readonly name: string
-  readonly input: unknown
   readonly assistantMessageID: string
 }
 
@@ -59,6 +56,10 @@ export interface SealStepInput {
    * provider error, so a seal that re-derives this from the log would keep calling a provider that
    * just failed. Absent on a re-drive, where the log is all there is. */
   readonly needsContinuation?: boolean
+  /** This step is being closed away from the host that ran it, so the files are not this seal's to
+   * touch: it is standing in a directory that never saw the tools, and the host that did may still
+   * be inside one of them. Writing the step down is the whole job here. */
+  readonly withoutTheTree?: boolean
 }
 
 /** One recorded tool call, to run on its own. */
@@ -124,16 +125,13 @@ export interface Interface {
    * puts the
    * model-to-tools loop in a durable executor's hands rather than inside a single activity. */
   readonly runModelCall: (input: StepInput) => Effect.Effect<ModelCallResult, RunError>
-  /** Run one recorded tool call and publish its result. Safe to call twice for the same call: the
-   * second sees the settled result and does nothing. */
+  /** Recorded admission prevents repeating non-idempotent calls after an uncertain result. */
   readonly runToolCall: (input: ToolCallInput) => Effect.Effect<ToolCallResult, RunError>
   /** Close a call a stop cut short, so it does not sit in the log as running until the next turn.
    * A whole step closes the tools it opened on its way out; a dispatch that is its own unit of work
    * has to be told. A call that never started, and one that already settled, are left alone. */
   readonly failToolCall: (input: ToolCallInput) => Effect.Effect<void, RunError>
-  /** Close a step once its calls have been dispatched: snapshot, file diff, Step.Ended, and the
-   * loop decision. Safe to call twice: the second sees the step already closed and returns the same
-   * answer without publishing again. */
+  /** The target message keeps a retried seal from closing a different step. */
   readonly sealStep: (input: SealStepInput) => Effect.Effect<StepResult, RunError>
 }
 

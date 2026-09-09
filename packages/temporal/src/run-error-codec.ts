@@ -1,21 +1,17 @@
-// Faithful round-trip of a SessionRunner.RunError across the Temporal boundary. Every member of the
-// union is a Schema.TaggedErrorClass, so we can encode the error to JSON in the activity and decode
-// it back into the exact tagged instance in the layer, instead of flattening it to a carrier.
-
 import { Schema } from "effect"
 import { LLMError } from "@opencode-ai/llm"
-import { Integration } from "../../integration"
-import { SystemContext } from "../../system-context/index"
-import { ToolOutputStore } from "../../tool-output-store"
-import type { SessionSchema } from "../schema"
-import { ContextSnapshotDecodeError, MessageDecodeError, SessionRunDeclinedError } from "../error"
+import { Integration } from "@opencode-ai/core/integration"
+import { SystemContext } from "@opencode-ai/core/system-context"
+import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
+import type { SessionSchema } from "@opencode-ai/core/session/schema"
+import { ContextSnapshotDecodeError, MessageDecodeError, SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import {
   ModelNotSelectedError,
   ModelUnavailableError,
   UnsupportedApiError,
   VariantUnavailableError,
-} from "../runner/model"
-import type { SessionRunner } from "../runner"
+} from "@opencode-ai/core/session/runner/model"
+import type { SessionRunner } from "@opencode-ai/core/session/runner"
 
 const RunErrorSchema = Schema.Union([
   LLMError,

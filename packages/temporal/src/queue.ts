@@ -43,3 +43,25 @@ export const queueForWorktree = (base: string, directory: string): string => {
   const digest = createHash("sha256").update(canonical).digest("hex").slice(0, DIGEST_LENGTH)
   return `${base}-wt-${digest}`
 }
+
+/**
+ * The queue a worker polls on its own, alongside the shared one.
+ *
+ * This is what a step is pinned to: the tools of one step write the tree the worker that made the
+ * model call is standing in, so they are sent back to it rather than to whoever is free. Keyed by
+ * host as well as directory, unlike the worktree queue above, because two hosts can serve the same
+ * path without sharing a byte of it: a key on the path alone routes a step to a host whose tree is
+ * a different tree.
+ *
+ * Stable across a restart, so a worker that comes back keeps serving what it served. A pin nobody
+ * answers can release unstarted dispatches after their schedule-to-start bound, subject to
+ * the other pinned attempts' outcomes.
+ */
+export const queueForWorker = (base: string, host: string, directory: string): string => {
+  const canonical = resolve(directory).replace(/[/\\]+$/, "")
+  const digest = createHash("sha256")
+    .update(`${host}\0${canonical}`)
+    .digest("hex")
+    .slice(0, DIGEST_LENGTH)
+  return `${base}-w-${digest}`
+}

@@ -1,9 +1,6 @@
 export * as SnapshotSync from "./snapshot-sync"
 
-// Ships captured snapshot trees to the shared store as git packs, so a worker on another host can
-// rebuild the project worktree before it drains a session (see session/execution/worktree.ts).
-// Each push wraps the tree in a sync commit chained onto the previous push and packs only the
-// delta. Best-effort by design: a failed push degrades portability, never the turn.
+// Packs let a worker rebuild tracked files without sharing the live directory.
 
 import { readFile, rm } from "node:fs/promises"
 import os from "node:os"
@@ -13,6 +10,8 @@ import { ChildProcess } from "effect/unstable/process"
 import { desc, eq } from "drizzle-orm"
 import { Database } from "./database/database"
 import { makeLocationNode } from "./effect/app-node"
+import { EventV2 } from "./event"
+import { EventSequenceTable } from "./event/sql"
 import { FSUtil } from "./fs-util"
 import { Git } from "./git"
 import { Global } from "./global"
@@ -21,12 +20,20 @@ import { AppProcess } from "./process"
 import { AbsolutePath } from "./schema"
 import type { Snapshot } from "./snapshot"
 import { SnapshotPackTable } from "./snapshot/sql"
-import { writeWorktreeTip } from "./snapshot/tip"
+import { chainHead } from "./snapshot/chain"
+import { readWorktreeTip, writeWorktreeTip } from "./snapshot/tip"
 import { Hash } from "./util/hash"
 
 export interface Interface {
-  /** Ship a captured tree to the shared store as an incremental pack. Never fails the caller. */
-  readonly push: (tree: Snapshot.ID) => Effect.Effect<void>
+  /**
+   * A stale tip fails the caller; packing and insertion errors are logged.
+   *
+   * `sessionID` is what the files are being shipped for. Given it, a publisher a newer attempt has
+   * superseded is refused, which is the one case the tip check cannot answer: a tool whose dispatch
+   * was abandoned is still standing on the tree it read, so its pack is clean and reverts whatever
+   * ran in its place. Omitted by callers with no session behind them, and then nothing is fenced.
+   */
+  readonly push: (tree: Snapshot.ID, sessionID?: string) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SnapshotSync") {}
@@ -62,23 +69,63 @@ const layer = Layer.effect(
         { stdin },
       )
 
-    const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID) {
-      // Noted before the packing, which is best-effort: what this host holds is true whether or not
-      // the pack reaches the store, and a note left behind would let a later drain check out an
-      // older tree over work only this host has.
-      if (source) yield* writeWorktreeTip(global.data, worktree, tree)
+    // The newest state the store holds for this worktree, read off the chain the packs form rather
+    // than off `time_created`, which is whichever host wrote the row.
+    const newest = () =>
+      db
+        .select()
+        .from(SnapshotPackTable)
+        .where(eq(SnapshotPackTable.worktree, worktree))
+        .all()
+        .pipe(Effect.orDie, Effect.map(chainHead))
+
+    // Whether a newer attempt holds this session's log. The token is the one the drain claimed and
+    // provided, so this asks the same question the log's own fence asks of every append: is what is
+    // writing still the attempt the session is on?
+    const superseded = Effect.fn("SnapshotSync.superseded")(function* (sessionID: string) {
+      const owner = yield* EventV2.EventOwner
+      // Outside a drain nothing claimed anything, so there is nothing to be superseded by.
+      if (owner === undefined) return false
+      const row = yield* db
+        .select({ ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      return row?.ownerID != null && row.ownerID !== owner
+    })
+
+    const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID, sessionID?: string) {
+      // The files travel under the token the transcript does. A dispatch the session stopped
+      // waiting for keeps running, and what it publishes afterwards would otherwise be the newest
+      // state the store holds, because it is standing exactly where it was told to stand.
+      if (source && sessionID && (yield* superseded(sessionID))) {
+        return yield* Effect.die(
+          new Error(`refusing to ship ${worktree}: a newer attempt holds ${sessionID}`),
+        )
+      }
+      // A host that has not caught up must not publish its older files as the next tree.
+      // This reading is not an atomic head claim and does not fence concurrent publishers.
+      if (source) {
+        const stoodOn = yield* readWorktreeTip(global.data, worktree)
+        const ahead = yield* newest()
+        if (ahead && ahead.tree !== tree && stoodOn !== ahead.tree) {
+          yield* Effect.die(
+            new Error(
+              `refusing to ship ${worktree}: this host stood on ${stoodOn ?? "nothing"}, ` +
+                `and the store is at ${ahead.tree}`,
+            ),
+          )
+        }
+      }
       yield* Effect.gen(function* () {
         if (!source) return
-        const latest = yield* db
-          .select()
-          .from(SnapshotPackTable)
-          .where(eq(SnapshotPackTable.worktree, worktree))
-          .orderBy(desc(SnapshotPackTable.time_created))
-          .limit(1)
-          .get()
-          .pipe(Effect.orDie)
-        // The newest shipped state already is this tree: nothing to pack.
-        if (latest?.tree === tree) return
+        const latest = yield* newest()
+        // The newest shipped state already is this tree: nothing to pack, and the note is true.
+        if (latest?.tree === tree) {
+          yield* writeWorktreeTip(global.data, worktree, tree)
+          return
+        }
         // Chain onto the previous sync commit only when this host has it; a base absent locally
         // would produce a delta pack the pack builder cannot compute.
         const base =
@@ -115,6 +162,8 @@ const layer = Layer.effect(
           .onConflictDoNothing()
           .run()
           .pipe(Effect.orDie)
+        // A note must not name a state whose insertion failed.
+        yield* writeWorktreeTip(global.data, worktree, tree)
       }).pipe(
         Effect.catchCauseIf(
           (cause) => !Cause.hasInterrupts(cause),

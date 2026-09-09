@@ -19,7 +19,10 @@ import type { DeferredToolCall, ToolCallOutcome } from "@opencode-ai/core/sessio
 import type { StepSettlement } from "@opencode-ai/core/session/runner/publish-llm-event"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionStore } from "@opencode-ai/core/session/store"
-import type { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionInput } from "@opencode-ai/core/session/input"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { Prompt } from "@opencode-ai/schema/prompt"
+import type { Database } from "@opencode-ai/core/database/database"
 import { runAtBoundary } from "./boundary"
 import type { StepDrainInput, StepDrainResult } from "./drain"
 
@@ -39,12 +42,19 @@ export type ModelCallDrainResult =
       /** The event-log token this attempt claimed. The tool and seal activities of this step must
        * publish under it, so it travels with the calls instead of being minted again. */
       readonly owner: string
+      /** The queue this worker polls on its own, when it has one. The tools of this step write the
+       * tree this worker is standing in, so sending them here keeps them on it. Absent when the
+       * worker was not given a queue of its own, and never required: the step falls back to the
+       * shared queue and the tree is rebuilt there. */
+      readonly queue?: string
     }
 
 export interface ToolCallDrainInput {
   readonly sessionID: string
   readonly call: DeferredToolCall
   readonly owner: string
+  /** Which step this call belongs to, so a host can tell it from a call an earlier step left. */
+  readonly step: number
 }
 
 export interface ToolCallDrainResult {
@@ -58,6 +68,10 @@ export interface SealDrainInput {
   readonly assistantMessageID?: string
   readonly needsContinuation?: boolean
   readonly owner: string
+  /** This step is being closed away from the host that was running it. The tree is not this seal's
+   * to rebuild or to ship: the host that ran the tools is the only one holding what they did, and
+   * it may still be inside one of them. Writing the step down is the whole job. */
+  readonly withoutTheTree?: boolean
 }
 
 export interface L2DrainDeps {
@@ -66,9 +80,52 @@ export interface L2DrainDeps {
   readonly ctx: Context.Context<SessionStore.Service | LocationServiceMap.Service>
   readonly events: EventV2.Interface
   readonly worktrees: WorktreeMaterializer.Interface
+  /** The queue this worker polls on its own, reported by the model call so the rest of the step can
+   * be sent back to it. Absent when the worker has none. */
+  readonly stepQueue?: string
 }
 
-export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2DrainDeps) => {
+/**
+ * Admit a prompt to a session that already exists, without waking anything.
+ *
+ * This is what a start with no client is made of. A prompt is a durable row before it is work, and
+ * writing that row needs the store, which a workflow cannot reach; waking the session is the
+ * workflow's own job (it starts or signals the session's supervisor). Separating the two is what
+ * lets a schedule fire into a deployment where nothing is running but workers.
+ *
+ * Idempotent on the message id, which the workflow derives from the firing, so a re-driven activity
+ * admits nothing twice.
+ */
+export const makeScheduleDrains = ({
+  db,
+  events,
+}: {
+  readonly db: Database.Interface["db"]
+  readonly events: EventV2.Interface
+}) => ({
+  promptDrain: async (input: { readonly sessionID: string; readonly messageID: string; readonly text: string }) =>
+    SessionInput.admit(db, events, {
+      id: SessionMessage.ID.make(input.messageID),
+      sessionID: SessionSchema.ID.make(input.sessionID),
+      prompt: Prompt.make({ text: input.text }),
+      delivery: "queue",
+    }).pipe(
+      Effect.asVoid,
+      // Prompt admission must leave the active drain's ownership unchanged.
+      Effect.provideService(EventV2.EventOwner, undefined),
+      Effect.scoped,
+      Effect.runPromise,
+    ),
+})
+
+// A call, as the host records it: enough to tell this step's writers from an earlier step's.
+const writer = (input: ToolCallDrainInput) => ({
+  sessionID: input.sessionID,
+  step: input.step,
+  callID: input.call.id,
+})
+
+export const makeL2Drains = ({ store, locations, ctx, events, worktrees, stepQueue }: L2DrainDeps) => {
   // One session, one owner, a present project tree. `claim` is true only for the model call: it is
   // the writer that supersedes a previous attempt, and the rest of the step rides its token.
   const inSession = <A>(
@@ -79,6 +136,11 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
       runner: SessionRunner.Interface,
       session: SessionSchema.Info,
     ) => Effect.Effect<A, SessionRunner.RunError>,
+    current?: { readonly sessionID: string; readonly step: number; readonly callID: string },
+    /** Leave the project tree alone. For a seal closing a step away from its host: rebuilding here
+     * would put this host on the newest state while the one that ran the tools may still be
+     * writing, and nothing this seal does needs the files. */
+    withoutTheTree = false,
   ) =>
     Effect.gen(function* () {
       const session = yield* store.get(SessionSchema.ID.make(sessionID))
@@ -87,8 +149,9 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
       if (!session) return undefined
       if (claim) yield* events.claim(session.id, owner)
       // A worker taking this step on a host without the project tree rebuilds it from snapshot
-      // packs.
-      yield* worktrees.ensure(session.location.directory)
+      // packs, unless a call of an earlier step never came back on this host.
+      if (!withoutTheTree)
+        yield* worktrees.ensure(session.location.directory, current ? { current } : undefined)
       return yield* SessionRunner.Service.use((runner) => use(runner, session)).pipe(
         Effect.provide(locations.get(session.location)),
       )
@@ -135,6 +198,7 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
                     assistantMessageID: result.assistantMessageID,
                     needsContinuation: result.needsContinuation,
                     owner: input.owner,
+                    ...(stepQueue === undefined ? {} : { queue: stepQueue }),
                   },
         ),
       ),
@@ -151,19 +215,32 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
     runAtBoundary(
       input.sessionID,
       signal,
-      inSession(input.sessionID, input.owner, false, (runner, session) =>
-        runner.runToolCall({ sessionID: session.id, call: input.call }).pipe(
-          // A stop landing mid-tool leaves the call recorded as running, where a whole step closes
-          // the tools it opened before it returns. Nothing else closes it until the next turn's
-          // entry check, so a transcript would show the call still going long after the stop.
-          Effect.onInterrupt(() =>
-            turnEnded()
-              ? runner
-                  .failToolCall({ sessionID: session.id, call: input.call })
-                  .pipe(Effect.ignore)
-              : Effect.void,
+      inSession(
+        input.sessionID,
+        input.owner,
+        false,
+        (runner, session) =>
+          Effect.acquireUseRelease(
+            // Said before the tool can touch anything, and taken back when its body returns. It is
+            // the only record on this host of a call still inside its own execution, and what a
+            // later step reads before it uses this directory: a timeout settles the workflow's
+            // promise without stopping the process behind it.
+            worktrees.beginWrite(session.location.directory, writer(input)),
+            () =>
+              runner.runToolCall({ sessionID: session.id, call: input.call }).pipe(
+                // A stop landing mid-tool leaves the call recorded as running, where a whole step
+                // closes the tools it opened before it returns. Nothing else closes it until the
+                // next turn's entry check, so a transcript would show the call still going long
+                // after the stop.
+                Effect.onInterrupt(() =>
+                  turnEnded()
+                    ? runner.failToolCall({ sessionID: session.id, call: input.call }).pipe(Effect.ignore)
+                    : Effect.void,
+                ),
+              ),
+            () => worktrees.endWrite(session.location.directory, input.call.id),
           ),
-        ),
+        writer(input),
       ).pipe(Effect.map((result) => result ?? { outcome: "already-settled" as const })),
     )
 
@@ -171,14 +248,21 @@ export const makeL2Drains = ({ store, locations, ctx, events, worktrees }: L2Dra
     runAtBoundary(
       input.sessionID,
       signal,
-      inSession(input.sessionID, input.owner, false, (runner, session) =>
-        runner.sealStep({
-          sessionID: session.id,
-          step: input.step,
-          settlement: input.settlement,
-          assistantMessageID: input.assistantMessageID,
-          needsContinuation: input.needsContinuation,
-        }),
+      inSession(
+        input.sessionID,
+        input.owner,
+        false,
+        (runner, session) =>
+          runner.sealStep({
+            sessionID: session.id,
+            step: input.step,
+            settlement: input.settlement,
+            assistantMessageID: input.assistantMessageID,
+            needsContinuation: input.needsContinuation,
+            withoutTheTree: input.withoutTheTree,
+          }),
+        undefined,
+        input.withoutTheTree,
       ).pipe(
         Effect.map((result) =>
           result === undefined
