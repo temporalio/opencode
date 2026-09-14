@@ -3,54 +3,20 @@
 // (tools disabled, text-only wrap-up) instead of looping forever. Driven end to end through
 // SessionRunner.run with a mock LLM that always answers with the same tool call until tools are
 // disabled. Also unit-covers the trailing-signature detection.
-import { LLMClient, type LLMClientShape } from "@opencode-ai/llm/route"
+import type { LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMEvent } from "@opencode-ai/llm"
-import { Database } from "@opencode-ai/core/database/database"
-import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { PermissionV2 } from "@opencode-ai/core/permission"
-import { AgentV2 } from "@opencode-ai/core/agent"
-import { Config } from "@opencode-ai/core/config"
-import { Project } from "@opencode-ai/core/project"
-import { ProjectTable } from "@opencode-ai/core/project/sql"
-import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
-import { Snapshot } from "@opencode-ai/core/snapshot"
-import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionRunner } from "@opencode-ai/core/session/runner"
-import * as SessionRunnerLLM from "@opencode-ai/core/session/runner/llm"
-import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
 import { REPEAT_LIMIT, trailingIdenticalToolSteps } from "@opencode-ai/core/session/runner/loop-guard"
-import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { Tool } from "@opencode-ai/core/tool/tool"
-import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
-import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { Location } from "@opencode-ai/core/location"
-import { SystemContextRegistry } from "@opencode-ai/core/system-context/registry"
-import { SystemContext } from "@opencode-ai/core/system-context"
-import { SkillGuidance } from "@opencode-ai/core/skill/guidance"
-import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
-import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
-import { Auth } from "@opencode-ai/llm/route"
 import { describe, expect, test } from "bun:test"
-import { DateTime, Effect, Layer, Schema, Stream } from "effect"
-import { testEffect } from "./lib/effect"
-
-const model = OpenAIChat.route
-  .with({ endpoint: { baseURL: "https://api.openai.com/v1" }, auth: Auth.bearer("fixture") })
-  .model({ id: "gpt-4o-mini" })
-const models = SessionRunnerModel.layerWith(() => Effect.succeed(model))
-const systemContext = AppNodeBuilder.build(SystemContextRegistry.node)
-const skillGuidance = Layer.mock(SkillGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
-const referenceGuidance = Layer.mock(ReferenceGuidance.Service, { load: () => Effect.succeed(SystemContext.empty) })
-const config = Layer.succeed(Config.Service, Config.Service.of({ entries: () => Effect.succeed([]) }))
-const permission = Layer.mock(PermissionV2.Service, {})
+import { DateTime, Effect, Schema, Stream } from "effect"
+import { emptyStep, runnerHarness, seedSession } from "./lib/runner-harness"
 
 // Always answers with the same tool call until tools are disabled, then a bare text-less final step.
 // Records each request's toolChoice so the test can assert the guard fired.
@@ -62,8 +28,7 @@ const stuckModel = () => {
     const toolChoice = (request.toolChoice as { type?: string } | undefined)?.type
     requests.push({ tools: request.tools.length, toolChoice })
     attempt++
-    if (toolChoice === "none" || request.tools.length === 0)
-      return Stream.fromIterable([LLMEvent.stepStart({ index: 0 }), LLMEvent.stepFinish({ index: 0, reason: "stop" })])
+    if (toolChoice === "none" || request.tools.length === 0) return emptyStep(request)
     return Stream.fromIterable([
       LLMEvent.stepStart({ index: 0 }),
       LLMEvent.toolCall({ id: `call_${attempt}`, name: "probe_stuck", input: { target: "same" } }),
@@ -73,72 +38,13 @@ const stuckModel = () => {
   return { requests, stream }
 }
 
-const harness = (stream: LLMClientShape["stream"]) =>
-  testEffect(
-    AppNodeBuilder.build(
-      LayerNode.group([
-        Database.node,
-        SessionProjector.node,
-        SessionStore.node,
-        AgentV2.node,
-        ToolRegistry.node,
-        SessionRunnerModel.node,
-        SystemContextRegistry.node,
-        SkillGuidance.node,
-        ReferenceGuidance.node,
-        Config.node,
-        Snapshot.node,
-        SessionRunnerLLM.node,
-        ApplicationTools.node,
-      ]),
-      [
-        [
-          LayerNodePlatform.llmClient,
-          Layer.succeed(
-            LLMClient.Service,
-            LLMClient.Service.of({
-              prepare: () => Effect.die("unused"),
-              generate: () => Effect.die("unused"),
-              stream,
-            }),
-          ),
-        ],
-        [PermissionV2.node, permission],
-        [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
-        [SessionRunnerModel.node, models],
-        [SystemContextRegistry.node, systemContext],
-        [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
-        [SkillGuidance.node, skillGuidance],
-        [ReferenceGuidance.node, referenceGuidance],
-        [Config.node, config],
-        [Snapshot.node, Snapshot.noopLayer],
-      ],
-    ),
-  )
-
 const sessionID = SessionV2.ID.make("ses_loop_guard")
-
-const seedSession = Effect.gen(function* () {
-  const { db } = yield* Database.Service
-  yield* db
-    .insert(ProjectTable)
-    .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
-    .onConflictDoNothing()
-    .run()
-    .pipe(Effect.orDie)
-  yield* db
-    .insert(SessionTable)
-    .values({ id: sessionID, project_id: Project.ID.global, slug: "t", directory: "/project", title: "t", version: "t" })
-    .onConflictDoNothing()
-    .run()
-    .pipe(Effect.orDie)
-})
 
 describe("SessionRunner loop guard", () => {
   const { requests, stream } = stuckModel()
-  harness(stream).effect("ends a run whose model repeats the same tool call every step", () =>
+  runnerHarness(stream).effect("ends a run whose model repeats the same tool call every step", () =>
     Effect.gen(function* () {
-      yield* seedSession
+      yield* seedSession(sessionID)
       yield* (yield* ApplicationTools.Service).register({
         probe_stuck: Tool.make({
           description: "always same result",
