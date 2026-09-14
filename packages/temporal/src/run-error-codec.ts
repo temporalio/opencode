@@ -4,18 +4,18 @@
 
 import { Schema } from "effect"
 import { LLMError } from "@opencode-ai/llm"
-import { Integration } from "../../integration"
-import { SystemContext } from "../../system-context/index"
-import { ToolOutputStore } from "../../tool-output-store"
-import type { SessionSchema } from "../schema"
-import { ContextSnapshotDecodeError, MessageDecodeError, SessionRunDeclinedError } from "../error"
+import { Integration } from "@opencode-ai/core/integration"
+import { SystemContext } from "@opencode-ai/core/system-context"
+import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
+import type { SessionSchema } from "@opencode-ai/core/session/schema"
+import { ContextSnapshotDecodeError, MessageDecodeError, SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import {
   ModelNotSelectedError,
   ModelUnavailableError,
   UnsupportedApiError,
   VariantUnavailableError,
-} from "../runner/model"
-import type { SessionRunner } from "../runner"
+} from "@opencode-ai/core/session/runner/model"
+import type { SessionRunner } from "@opencode-ai/core/session/runner"
 
 const RunErrorSchema = Schema.Union([
   LLMError,
@@ -45,7 +45,7 @@ export function encodeRunError(error: unknown): unknown | undefined {
 }
 
 // Reconstructs the exact tagged RunError from its JSON encoding, or undefined if it does not decode.
-export function decodeRunError(payload: unknown): SessionRunner.RunError | undefined {
+function decodeRunError(payload: unknown): SessionRunner.RunError | undefined {
   try {
     return decode(payload) as SessionRunner.RunError
   } catch {

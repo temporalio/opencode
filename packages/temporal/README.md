@@ -24,7 +24,7 @@ is the loop, `workflow.ts` adapts it to the sandbox, `drain.ts` is the step body
 in-process on the proven `SessionRunCoordinator` (core's `execution/local.ts`), the same lifecycle
 the v1 server uses, with no server and no ports (see [Two modes, one runner](#two-modes-one-runner)).
 What an executor must do is defined executably: core's conformance suite
-(`session/execution/conformance.ts`) runs the same wake/resume/interrupt scenarios against the local
+(`packages/core/test/lib/execution-conformance.ts`) runs the same wake/resume/interrupt scenarios against the local
 executor in core's tests and against this package through real workflows.
 
 That forces six things:

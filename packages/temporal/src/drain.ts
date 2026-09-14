@@ -16,7 +16,7 @@ import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import type { SessionInput } from "@opencode-ai/core/session/input"
-import { encodeRunError } from "@opencode-ai/core/session/execution/run-error-codec"
+import { encodeRunError } from "./run-error-codec"
 // One step of a turn, as any executor drives it. `promotion` is null (not undefined) so it
 // serializes cleanly across an executor's process boundary.
 export interface StepDrainInput {

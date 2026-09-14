@@ -3,6 +3,6 @@
 // against the Temporal executor in packages/temporal; the shared suite is what holds any executor
 // to one behavior.
 import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
-import { makeExecutionFor, runContract } from "@opencode-ai/core/session/execution/conformance"
+import { makeExecutionFor, runContract } from "./lib/execution-conformance"
 
 runContract("local executor", makeExecutionFor(SessionExecutionLocal.node))
