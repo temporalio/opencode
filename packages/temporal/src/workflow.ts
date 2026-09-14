@@ -27,9 +27,8 @@ const activityOptions = {
   // The heartbeat is the liveness bound (it stops within seconds of a worker death and Temporal
   // re-drives). startToClose is only the backstop for a drain that hangs while its process stays
   // alive, so it must comfortably exceed any legitimate turn: long tool runs, many steps, or a
-  // human taking their time over a permission ask. 30 minutes proved far too tight -- it hard-killed
-  // legitimate turns and each kill opened a short two-writer window until the zombie attempt
-  // noticed its heartbeat rejection.
+  // human taking their time over a permission ask. A bound that kills a live turn also opens a
+  // two-writer window until the old attempt notices its heartbeat was rejected.
   startToCloseTimeout: "12 hours",
   heartbeatTimeout: "10 seconds",
   retry: { maximumAttempts: 100 },
@@ -43,18 +42,12 @@ export const resume = defineUpdate<void>(RESUME_UPDATE)
 const signals = { wake, interrupt } as const
 
 const runtime: SupervisorRuntime = {
-  // Short-circuit when the predicate already holds. Besides saving a round trip, this avoids a real
-  // breakage: on @temporalio/workflow 1.21, calling condition(fn, timeout) when fn is already true
-  // leaves the current CancellationScope cancelled, so the NEXT condition() throws CancelledFailure
-  // -- which the supervisor reads as an interrupt and the workflow completes without ever draining a
-  // turn. Checking fn() first keeps the timeout timer (and its scope) out of the already-true path.
-  // A timed wait that does NOT use the SDK's condition(fn, timeout). On @temporalio/workflow 1.21
-  // that variant cancels its internal timer scope on resolve and the cancellation LEAKS into the
-  // parent (root) scope, so the next drain's child scope is born cancelled and the turn never runs
-  // (a session could serve only one turn). Instead: short-circuit an already-true predicate; for a
-  // real wait, race a no-timeout condition against a bare timer and abandon the loser. Nothing here
-  // cancels a scope, so nothing leaks; an unfired timer / unresolved condition is harmless and a
-  // pending timer is cleaned up when the workflow closes.
+  // A timed wait that does not use the SDK's condition(fn, timeout). On @temporalio/workflow 1.21
+  // that variant cancels its internal timer scope on resolve, and the cancellation leaks into the
+  // parent scope, so the next drain's child scope is born cancelled and the turn never runs. An
+  // already-true predicate is answered without a timer for the same reason. For a real wait, a
+  // no-timeout condition races a bare timer and the loser is abandoned: nothing here cancels a
+  // scope, and a pending timer is cleaned up when the workflow closes.
   condition: async (predicate, timeout) => {
     if (predicate()) return true
     if (timeout === undefined) {
@@ -91,8 +84,7 @@ const runtime: SupervisorRuntime = {
   // root's consideredCancelled).
   isRootCancelled: () => rootScope?.consideredCancelled ?? false,
   allHandlersFinished,
-  continueAsNew: (sessionID, startWithWake) =>
-    continueAsNew<typeof sessionTurn>(sessionID, { startWithWake }),
+  continueAsNew: (sessionID, startWithWake) => continueAsNew<typeof sessionTurn>(sessionID, { startWithWake }),
 }
 
 // The scope of the drain currently running, so an interrupt signal can cancel exactly that turn.
