@@ -1,3 +1,6 @@
+// A v1-shaped HTTP shim in front of the v2 daemon API. The TUI still speaks v1, so this file
+// translates until it speaks v2 directly, and then it goes. The loose typing is deliberate for
+// code with that lifespan.
 import { run } from "@opencode-ai/tui"
 import { TuiConfig } from "@opencode-ai/tui/config"
 import { createBuiltinPlugins } from "@opencode-ai/tui/builtins"
