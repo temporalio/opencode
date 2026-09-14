@@ -96,9 +96,7 @@ describe("WorktreeMaterializer", () => {
 
       // A second ensure on an existing tree is a no-op, not a rebuild.
       yield* WorktreeMaterializer.Service.use((w) => w.ensure(worktree)).pipe(Effect.provide(B))
-      expect(yield* Effect.promise(() => readFile(path.join(worktree, "tracked.txt"), "utf8"))).toBe(
-        "v3\n",
-      )
+      expect(yield* Effect.promise(() => readFile(path.join(worktree, "tracked.txt"), "utf8"))).toBe("v3\n")
 
       yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
     }),
@@ -118,9 +116,11 @@ describe("WorktreeMaterializer", () => {
           .values([{ id: "c".repeat(40), directory: "/w", worktree: "/w", tree: "t".repeat(40), pack: bytes }])
           .run(),
       ).pipe(Effect.orDie, Effect.provide(layer), Effect.scoped)
-      const row = yield* Database.Service.use(({ db }) =>
-        db.select().from(SnapshotPackTable).get(),
-      ).pipe(Effect.orDie, Effect.provide(layer), Effect.scoped)
+      const row = yield* Database.Service.use(({ db }) => db.select().from(SnapshotPackTable).get()).pipe(
+        Effect.orDie,
+        Effect.provide(layer),
+        Effect.scoped,
+      )
       expect(Buffer.from(row!.pack).equals(bytes)).toBeTrue()
       yield* Effect.promise(() => tmp[Symbol.asyncDispose]())
     }),

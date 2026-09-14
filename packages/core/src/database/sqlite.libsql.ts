@@ -59,8 +59,7 @@ const make = (options: LibsqlConfig) =>
     // sqld surfaces a cross-process write-lock conflict as a busy error instead of queueing, and
     // the remote path has no `busy_timeout` pragma. Without a bounded retry, a routine collision
     // (serve writing while a worker holds a turn transaction) dies the caller.
-    const isBusy = (cause: unknown) =>
-      /SQLITE_BUSY|database is locked|database table is locked/i.test(String(cause))
+    const isBusy = (cause: unknown) => /SQLITE_BUSY|database is locked|database table is locked/i.test(String(cause))
     const withBusyRetry = async <A>(attempt: () => Promise<A>): Promise<A> => {
       for (let tries = 0; ; tries++) {
         try {
@@ -80,14 +79,12 @@ const make = (options: LibsqlConfig) =>
     // Auto-commit connection: each statement is its own request. Used outside transactions.
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.tryPromise({
-        try: () =>
-          withBusyRetry(() => native.execute({ sql: query, args: params as never[] })).then(toRows),
+        try: () => withBusyRetry(() => native.execute({ sql: query, args: params as never[] })).then(toRows),
         catch: fail,
       })
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.tryPromise({
-        try: () =>
-          withBusyRetry(() => native.execute({ sql: query, args: params as never[] })).then(toValues),
+        try: () => withBusyRetry(() => native.execute({ sql: query, args: params as never[] })).then(toValues),
         catch: fail,
       })
 
@@ -188,8 +185,7 @@ const make = (options: LibsqlConfig) =>
     const guard = <A, E>(query: string, effect: Effect.Effect<A, E>) =>
       isRead(query) ? effect : semaphore.withPermits(1)(effect)
     const guarded = identity<Connection>({
-      execute: (query, params, transformRows) =>
-        guard(query, connection.execute(query, params, transformRows)),
+      execute: (query, params, transformRows) => guard(query, connection.execute(query, params, transformRows)),
       executeRaw: (query, params) => guard(query, connection.executeRaw(query, params)),
       executeValues: (query, params) => guard(query, connection.executeValues(query, params)),
       executeUnprepared: (query, params, transformRows) =>

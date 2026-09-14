@@ -178,26 +178,28 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
     {
       const { requests, stream } = countingModel()
       const sessionID = SessionV2.ID.make(`ses_${slug}_wake`)
-      it.live("wake drives a turn to settlement, then the idle executor retires", () =>
-        withIdleOverride(
-          Effect.gen(function* () {
-            yield* seedSession(sessionID)
-            yield* seedPrompt(sessionID)
-            const exec = Context.get(yield* Layer.build(makeExec(stream)), SessionExecution.Service)
-            yield* exec.wake(sessionID)
-            const store = yield* SessionStore.Service
-            yield* until(store.context(sessionID), (context) => {
-              const assistant = context.findLast((message) => message.type === "assistant")
-              return assistant?.type === "assistant" && Boolean(assistant.time.completed)
-            })
-            expect(requests).toHaveLength(1)
-            // Idle self-termination: the executor retires without an interrupt. How long a settled
-            // session lingers in `active` is the executor's business (the local coordinator retires
-            // on settlement, the Temporal workflow serves until its idle timeout); the contract only
-            // demands it eventually leaves.
-            yield* until(exec.active, (active) => !active.has(sessionID))
-          }),
-        ),
+      it.live(
+        "wake drives a turn to settlement, then the idle executor retires",
+        () =>
+          withIdleOverride(
+            Effect.gen(function* () {
+              yield* seedSession(sessionID)
+              yield* seedPrompt(sessionID)
+              const exec = Context.get(yield* Layer.build(makeExec(stream)), SessionExecution.Service)
+              yield* exec.wake(sessionID)
+              const store = yield* SessionStore.Service
+              yield* until(store.context(sessionID), (context) => {
+                const assistant = context.findLast((message) => message.type === "assistant")
+                return assistant?.type === "assistant" && Boolean(assistant.time.completed)
+              })
+              expect(requests).toHaveLength(1)
+              // Idle self-termination: the executor retires without an interrupt. How long a settled
+              // session lingers in `active` is the executor's business (the local coordinator retires
+              // on settlement, the Temporal workflow serves until its idle timeout); the contract only
+              // demands it eventually leaves.
+              yield* until(exec.active, (active) => !active.has(sessionID))
+            }),
+          ),
         60000,
       )
     }
@@ -205,26 +207,28 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
     {
       const { requests, stream } = countingModel()
       const sessionID = SessionV2.ID.make(`ses_${slug}_resume_ok`)
-      it.live("resume forces a healthy turn to completion and resolves", () =>
-        withIdleOverride(
-          Effect.gen(function* () {
-            yield* seedSession(sessionID)
-            yield* seedPrompt(sessionID)
-            const exec = Context.get(yield* Layer.build(makeExec(stream)), SessionExecution.Service)
-            // resume is request/response: it awaits the forced drain and resolves on success.
-            const exit = yield* exec.resume(sessionID).pipe(Effect.exit)
-            expect(Exit.isSuccess(exit)).toBe(true)
-            expect(requests).toHaveLength(1)
-            const store = yield* SessionStore.Service
-            const context = yield* store.context(sessionID)
-            const assistant = context.findLast((message) => message.type === "assistant")
-            expect(assistant?.type === "assistant" && Boolean(assistant.time.completed)).toBe(true)
-            // Wait out the retirement while this run's worker still exists. A durable executor's
-            // session would otherwise linger forever: the test's task queue dies with the process,
-            // so nothing ever processes the idle timer's task.
-            yield* until(exec.active, (active) => !active.has(sessionID))
-          }),
-        ),
+      it.live(
+        "resume forces a healthy turn to completion and resolves",
+        () =>
+          withIdleOverride(
+            Effect.gen(function* () {
+              yield* seedSession(sessionID)
+              yield* seedPrompt(sessionID)
+              const exec = Context.get(yield* Layer.build(makeExec(stream)), SessionExecution.Service)
+              // resume is request/response: it awaits the forced drain and resolves on success.
+              const exit = yield* exec.resume(sessionID).pipe(Effect.exit)
+              expect(Exit.isSuccess(exit)).toBe(true)
+              expect(requests).toHaveLength(1)
+              const store = yield* SessionStore.Service
+              const context = yield* store.context(sessionID)
+              const assistant = context.findLast((message) => message.type === "assistant")
+              expect(assistant?.type === "assistant" && Boolean(assistant.time.completed)).toBe(true)
+              // Wait out the retirement while this run's worker still exists. A durable executor's
+              // session would otherwise linger forever: the test's task queue dies with the process,
+              // so nothing ever processes the idle timer's task.
+              yield* until(exec.active, (active) => !active.has(sessionID))
+            }),
+          ),
         60000,
       )
     }
@@ -232,44 +236,48 @@ export const runContract = (label: string, makeExec: ReturnType<typeof makeExecu
     {
       const sessionID = SessionV2.ID.make(`ses_${slug}_error`)
       const failingModels = SessionRunnerModel.layerWith(() => Effect.fail(new ModelNotSelectedError({ sessionID })))
-      it.live("resume surfaces the exact tagged RunError through the shared codec", () =>
-        withIdleOverride(
-          Effect.gen(function* () {
-            yield* seedSession(sessionID)
-            const { stream } = countingModel()
-            const exec = Context.get(yield* Layer.build(makeExec(stream, failingModels)), SessionExecution.Service)
-            const exit = yield* exec.resume(sessionID).pipe(Effect.exit)
-            expect(Exit.isFailure(exit)).toBe(true)
-            const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
-            // The same encode -> details -> decode path the Temporal boundary uses, so the caller gets
-            // the identical tagged instance in both modes.
-            expect(error).toBeInstanceOf(ModelNotSelectedError)
-            // Same reason as the healthy resume: retire before this run's task queue dies.
-            yield* until(exec.active, (active) => !active.has(sessionID))
-          }),
-        ),
+      it.live(
+        "resume surfaces the exact tagged RunError through the shared codec",
+        () =>
+          withIdleOverride(
+            Effect.gen(function* () {
+              yield* seedSession(sessionID)
+              const { stream } = countingModel()
+              const exec = Context.get(yield* Layer.build(makeExec(stream, failingModels)), SessionExecution.Service)
+              const exit = yield* exec.resume(sessionID).pipe(Effect.exit)
+              expect(Exit.isFailure(exit)).toBe(true)
+              const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+              // The same encode -> details -> decode path the Temporal boundary uses, so the caller gets
+              // the identical tagged instance in both modes.
+              expect(error).toBeInstanceOf(ModelNotSelectedError)
+              // Same reason as the healthy resume: retire before this run's task queue dies.
+              yield* until(exec.active, (active) => !active.has(sessionID))
+            }),
+          ),
         60000,
       )
     }
 
     {
       const sessionID = SessionV2.ID.make(`ses_${slug}_interrupt`)
-      it.live("interrupt cancels an in-flight turn and the session leaves the active set", () =>
-        withIdleOverride(
-          Effect.gen(function* () {
-            yield* seedSession(sessionID)
-            yield* seedPrompt(sessionID)
-            // A model that never answers: the turn hangs until interrupted.
-            const exec = Context.get(yield* Layer.build(makeExec(() => Stream.never)), SessionExecution.Service)
-            yield* exec.wake(sessionID)
-            yield* Effect.sleep(200)
-            yield* until(exec.active, (active) => active.has(sessionID))
-            yield* exec.interrupt(sessionID)
-            // The Temporal supervisor keeps serving after an interrupt (a racing wake/resume must
-            // not be lost); with nothing else queued it leaves the active set via idle retirement.
-            yield* until(exec.active, (active) => !active.has(sessionID))
-          }),
-        ),
+      it.live(
+        "interrupt cancels an in-flight turn and the session leaves the active set",
+        () =>
+          withIdleOverride(
+            Effect.gen(function* () {
+              yield* seedSession(sessionID)
+              yield* seedPrompt(sessionID)
+              // A model that never answers: the turn hangs until interrupted.
+              const exec = Context.get(yield* Layer.build(makeExec(() => Stream.never)), SessionExecution.Service)
+              yield* exec.wake(sessionID)
+              yield* Effect.sleep(200)
+              yield* until(exec.active, (active) => active.has(sessionID))
+              yield* exec.interrupt(sessionID)
+              // The Temporal supervisor keeps serving after an interrupt (a racing wake/resume must
+              // not be lost); with nothing else queued it leaves the active set via idle retirement.
+              yield* until(exec.active, (active) => !active.has(sessionID))
+            }),
+          ),
         60000,
       )
     }

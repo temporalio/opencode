@@ -53,7 +53,9 @@ export function apply(db: Database) {
           )
           if (completed.size === 0) {
             if (
-              yield* tx.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${"__drizzle_migrations"}`)
+              yield* tx.get(
+                sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${"__drizzle_migrations"}`,
+              )
             ) {
               yield* tx.run(sql`
                 INSERT OR IGNORE INTO ${sql.identifier("migration")} (id, time_completed)
@@ -62,7 +64,9 @@ export function apply(db: Database) {
                 WHERE name IS NOT NULL
               `)
               completed = new Set(
-                (yield* tx.all<{ id: string }>(sql`SELECT id FROM ${sql.identifier("migration")}`)).map((row) => row.id),
+                (yield* tx.all<{ id: string }>(sql`SELECT id FROM ${sql.identifier("migration")}`)).map(
+                  (row) => row.id,
+                ),
               )
             }
           }

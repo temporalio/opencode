@@ -361,9 +361,7 @@ async function v1Providers(origin: string, directory: string | null, headers?: H
         .filter((method: any) => method.type === "env")
         .flatMap((method: any) => method.names ?? []) ?? [],
     options: {},
-    models: Object.fromEntries(
-      models.filter((m) => m.providerID === provider.id).map((m) => [m.id, v1Model(m)]),
-    ),
+    models: Object.fromEntries(models.filter((m) => m.providerID === provider.id).map((m) => [m.id, v1Model(m)])),
   }))
   const connected = new Set(integrations.filter((item) => item.connections?.length).map((item) => item.id))
   return {
@@ -466,7 +464,11 @@ async function globalEventStream(origin: string, directory: string | null, heade
 // locally observable moment is this daemon's own admission, so a followed session keeps re-reading
 // until its latest assistant message settles; without that, a reply would only render when the
 // NEXT local event happened to trigger a re-read.
-function createSessionProjector(origin: string, headers: HeadersInit | undefined, emit: (dir: string, payload: unknown) => void) {
+function createSessionProjector(
+  origin: string,
+  headers: HeadersInit | undefined,
+  emit: (dir: string, payload: unknown) => void,
+) {
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const FOLLOW_INTERVAL = 1200
   // A turn longer than this stops refreshing a cross-process TUI until the next admission.
@@ -517,17 +519,17 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
             }
             for (const stale of seen.get(message.info.id) ?? []) {
               if (!ids.has(stale))
-                emit(
-                  dir,
-                  legacyEvent("message.part.removed", { sessionID, messageID: message.info.id, partID: stale }),
-                )
+                emit(dir, legacyEvent("message.part.removed", { sessionID, messageID: message.info.id, partID: stale }))
             }
             seen.set(message.info.id, ids)
           }
           const latest = messages.at(-1)?.info
           settled = latest?.role === "assistant" && Boolean(latest.time?.completed)
           signature = messages
-            .map((m) => `${m.info.id}:${m.parts.map((part) => `${part.id}=${part.text?.length ?? part.state?.status ?? ""}`).join(",")}`)
+            .map(
+              (m) =>
+                `${m.info.id}:${m.parts.map((part) => `${part.id}=${part.text?.length ?? part.state?.status ?? ""}`).join(",")}`,
+            )
             .join(";")
         } catch {}
         try {
@@ -536,7 +538,15 @@ function createSessionProjector(origin: string, headers: HeadersInit | undefined
           const current = new Set<string>()
           for (const question of pending) {
             current.add(question.id)
-            emit(dir, legacyEvent("question.v2.asked", { id: question.id, sessionID, questions: question.questions, tool: question.tool }))
+            emit(
+              dir,
+              legacyEvent("question.v2.asked", {
+                id: question.id,
+                sessionID,
+                questions: question.questions,
+                tool: question.tool,
+              }),
+            )
           }
           // A question that left the list was answered or rejected elsewhere; clear it from the store.
           for (const stale of seen) {
@@ -688,8 +698,7 @@ async function v2(origin: string, path: string, directory: string | null, header
 const gracefulFetch = Object.assign(
   async (input: RequestInfo | URL, init?: RequestInit) => {
     // The passthrough fetch consumes a Request's body; keep a clone in case a write needs bridging.
-    const preserved =
-      input instanceof Request && input.method !== "GET" && !init?.body ? input.clone() : undefined
+    const preserved = input instanceof Request && input.method !== "GET" && !init?.body ? input.clone() : undefined
     const response = await fetch(input, init)
     const url = new URL(input instanceof Request ? input.url : input)
     if (response.status !== 404) return response

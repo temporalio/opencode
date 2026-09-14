@@ -30,9 +30,7 @@ export interface Interface {
   readonly ensure: (directory: string) => Effect.Effect<void>
 }
 
-export class Service extends Context.Service<Service, Interface>()(
-  "@opencode/v2/WorktreeMaterializer",
-) {}
+export class Service extends Context.Service<Service, Interface>()("@opencode/v2/WorktreeMaterializer") {}
 
 const layer = Layer.effect(
   Service,

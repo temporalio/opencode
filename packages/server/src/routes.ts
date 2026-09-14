@@ -60,9 +60,7 @@ export function createServiceLayer() {
   // event log; the local coordinator owns the wake/resume/interrupt lifecycle and is shared with
   // the v1 server path, so it is the well-exercised default.
   const executionNode =
-    process.env.OPENCODE_SESSION_EXECUTION === "temporal"
-      ? SessionExecutionTemporal.node
-      : SessionExecutionLocal.node
+    process.env.OPENCODE_SESSION_EXECUTION === "temporal" ? SessionExecutionTemporal.node : SessionExecutionLocal.node
   return AppNodeBuilder.build(applicationServices, [[SessionExecution.node, executionNode]])
 }
 

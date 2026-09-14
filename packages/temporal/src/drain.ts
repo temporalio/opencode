@@ -78,8 +78,7 @@ export const makeDrains = ({ store, locations, ctx, events, worktrees }: DrainDe
       // the attempt records Cancelled, not Failed) and an internal halt like a user declining a
       // permission (the signal did NOT fire). The latter must be non-retryable, or the supervisor
       // re-drives a turn the user explicitly stopped.
-      if (signal.aborted)
-        throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
+      if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
       const declined = encodeRunError(
         new SessionRunDeclinedError({ sessionID: SessionSchema.ID.make(input.sessionID) }),
       )

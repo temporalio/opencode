@@ -20,8 +20,7 @@ const question: QuestionV2.Info = {
   options: [{ label: "One", description: "First option" }],
 }
 
-const stack = (file: string) =>
-  AppNodeBuilder.build(QuestionV2.node, [[Database.node, Database.layerFromPath(file)]])
+const stack = (file: string) => AppNodeBuilder.build(QuestionV2.node, [[Database.node, Database.layerFromPath(file)]])
 
 const it = testEffect(Layer.empty)
 

@@ -377,9 +377,7 @@ describe("SessionRunnerModel", () => {
 
       const resolved = yield* Effect.gen(function* () {
         const svc = yield* SessionRunnerModel.Service
-        yield* Effect.forkScoped(
-          Effect.sleep(400).pipe(Effect.andThen(Effect.sync(() => models.push(catalogModel)))),
-        )
+        yield* Effect.forkScoped(Effect.sleep(400).pipe(Effect.andThen(Effect.sync(() => models.push(catalogModel)))))
         return yield* svc.resolve(session)
       }).pipe(
         Effect.provide(
@@ -431,9 +429,7 @@ describe("SessionRunnerModel", () => {
       const resolved = yield* Effect.gen(function* () {
         const svc = yield* SessionRunnerModel.Service
         yield* Effect.forkScoped(
-          Effect.sleep(400).pipe(
-            Effect.andThen(Effect.sync(() => (connection = { type: "env", name: "TEST_KEY" }))),
-          ),
+          Effect.sleep(400).pipe(Effect.andThen(Effect.sync(() => (connection = { type: "env", name: "TEST_KEY" })))),
         )
         return yield* svc.resolve(session)
       }).pipe(

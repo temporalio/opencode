@@ -68,9 +68,7 @@ const layer = Layer.effect(
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
     if (HOST_WORKER) {
-      const { NativeConnection, Worker } = yield* Effect.tryPromise(
-        () => import("@temporalio/worker"),
-      ).pipe(
+      const { NativeConnection, Worker } = yield* Effect.tryPromise(() => import("@temporalio/worker")).pipe(
         Effect.catch(() =>
           Effect.die(
             "The embedded Temporal worker is unavailable in this build. Run standalone workers " +
@@ -100,7 +98,6 @@ const layer = Layer.effect(
         }),
       )
     }
-
 
     // Worker-only process: it hosts activities but drives no workflows, so the client methods are
     // unused. Return a service whose driving methods fail loudly if something unexpectedly calls them.

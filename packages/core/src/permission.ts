@@ -339,15 +339,12 @@ const layer = Layer.effect(
           const existing = yield* readRow(value.id)
           if (existing) {
             if (existing.status === "approved") return
-            if (existing.status === "corrected")
-              return yield* new CorrectedError({ feedback: existing.message ?? "" })
+            if (existing.status === "corrected") return yield* new CorrectedError({ feedback: existing.message ?? "" })
             if (existing.status === "declined") return yield* EffectRuntime.die(new DeclinedError())
             // pending or expired: fall through; create adopts (insert no-ops) or revives the row.
           }
           const item = yield* create(value, input.agent)
-          return yield* restore(
-            EffectRuntime.raceFirst(Deferred.await(item.deferred), awaitRow(item.request.id)),
-          ).pipe(
+          return yield* restore(EffectRuntime.raceFirst(Deferred.await(item.deferred), awaitRow(item.request.id))).pipe(
             EffectRuntime.catchTag("PermissionV2.DeclinedError", (error) => EffectRuntime.die(error)),
             EffectRuntime.ensuring(
               EffectRuntime.sync(() => {
@@ -361,10 +358,7 @@ const layer = Layer.effect(
 
     // Complete the local waiter if the ask was raised in this process; a cross-process waiter
     // observes the row update through its poll.
-    const settleLocal = (
-      id: ID,
-      complete: (deferred: Pending["deferred"]) => EffectRuntime.Effect<boolean>,
-    ) =>
+    const settleLocal = (id: ID, complete: (deferred: Pending["deferred"]) => EffectRuntime.Effect<boolean>) =>
       EffectRuntime.suspend(() => {
         const item = pending.get(id)
         if (!item) return EffectRuntime.void

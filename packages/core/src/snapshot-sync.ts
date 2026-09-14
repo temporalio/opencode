@@ -77,8 +77,7 @@ const layer = Layer.effect(
         // Chain onto the previous sync commit only when this host has it; a base absent locally
         // would produce a delta pack the pack builder cannot compute.
         const base =
-          latest &&
-          (yield* run(["cat-file", "-e", `${latest.id}^{commit}`]).pipe(Effect.orDie)).exitCode === 0
+          latest && (yield* run(["cat-file", "-e", `${latest.id}^{commit}`]).pipe(Effect.orDie)).exitCode === 0
             ? latest.id
             : undefined
         const committed = yield* run([
@@ -104,9 +103,7 @@ const layer = Layer.effect(
         yield* Effect.promise(() => Promise.allSettled([rm(packFile), rm(`${prefix}-${packHash}.idx`)]))
         yield* db
           .insert(SnapshotPackTable)
-          .values([
-            { id: commit, directory: location.directory, worktree, tree, base: base ?? null, pack: bytes },
-          ])
+          .values([{ id: commit, directory: location.directory, worktree, tree, base: base ?? null, pack: bytes }])
           .onConflictDoNothing()
           .run()
           .pipe(Effect.orDie)
