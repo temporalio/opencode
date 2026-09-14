@@ -27,9 +27,8 @@ export interface StepInput {
   readonly force: boolean
 }
 
-/** Result of one step: whether it ran, whether to continue, and the next loop state. */
+/** Result of one step: whether to continue, and the next loop state. */
 export interface StepResult {
-  readonly ran: boolean
   readonly continue: boolean
   readonly step: number
   readonly promotion: SessionInput.Delivery | undefined

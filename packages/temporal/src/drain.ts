@@ -30,7 +30,6 @@ export interface StepDrainInput {
 }
 
 export interface StepDrainResult {
-  ran: boolean
   continue: boolean
   step: number
   promotion: string | null
@@ -54,7 +53,7 @@ export const makeDrains = ({ store, locations, ctx, events, worktrees }: DrainDe
     const exit = await Effect.runPromiseExit(
       Effect.gen(function* () {
         const session = yield* store.get(SessionSchema.ID.make(input.sessionID))
-        if (!session) return { ran: false, continue: false, step: input.step, promotion: null }
+        if (!session) return { continue: false, step: input.step, promotion: null }
         // Take the event log before running so a superseded attempt's later appends are fenced.
         if (input.owner) yield* events.claim(session.id, input.owner)
         // A worker resuming on a host without the project tree rebuilds it from snapshot packs.
@@ -68,7 +67,7 @@ export const makeDrains = ({ store, locations, ctx, events, worktrees }: DrainDe
             force: input.force,
           }),
         ).pipe(Effect.provide(locations.get(session.location)))
-        return { ran: r.ran, continue: r.continue, step: r.step, promotion: r.promotion ?? null }
+        return { continue: r.continue, step: r.step, promotion: r.promotion ?? null }
       }).pipe(Effect.provideService(EventV2.EventOwner, input.owner), Effect.provide(ctx), Effect.scoped),
       { signal },
     )

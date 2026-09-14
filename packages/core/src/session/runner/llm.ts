@@ -32,7 +32,7 @@ import { SessionInput } from "../input"
 import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
-import { type RunError, Service } from "./index"
+import { type RunError, Service, type StepInput } from "./index"
 import { SessionRunnerModel } from "./model"
 import { createLLMEventPublisher, emitToolResult } from "./publish-llm-event"
 import { toLLMMessages } from "./to-llm-message"
@@ -454,16 +454,24 @@ const layer = Layer.effect(
       }
     })
 
-    // Resume a crashed step from the durable log instead of re-streaming it. A Temporal step retry
-    // re-invokes runStep on the same log; if the in-flight step already DISPATCHED tools (Tool.Called
-    // is recorded before the side effect runs, so a running/completed tool may have run), re-streaming
-    // would re-run that side effect and duplicate the assistant message. Instead we close the step
-    // from the log: keep completed tool results, fail the ones still unsettled (their result never
-    // committed -- we can't know if they ran, so the model redoes them), and publish a synthesized
-    // Step.Ended. The model is NOT re-called. Returns undefined when there is nothing to finalize (a
-    // fresh step, or a partial with no dispatched tools, which is safe to re-stream). Token/cost
-    // metering is 0 for the resumed step only; faithful metering would need a durable step-sealed
-    // marker carrying the provider usage.
+    // Where the turn goes once a step has closed. Steering outranks the queue because it belongs to
+    // the turn that is running; a queued prompt starts a turn of its own, so its step count restarts.
+    const stepContinuation = Effect.fn("SessionRunner.stepContinuation")(function* (
+      sessionID: SessionSchema.ID,
+      needsContinuation: boolean,
+      step: number,
+    ) {
+      const steer = needsContinuation ? true : yield* SessionInput.hasPending(db, sessionID, "steer")
+      if (steer) return { continue: true, step: step + 1, promotion: "steer" as SessionInput.Delivery }
+      const queue = yield* SessionInput.hasPending(db, sessionID, "queue")
+      if (queue) return { continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
+      return { continue: false, step: step + 1, promotion: undefined }
+    })
+
+    // Tool.Called is recorded before the tool runs, so once a crashed step shows a dispatched tool,
+    // re-streaming it could run that side effect twice. The step is closed from the log instead,
+    // with no model call: completed results are kept, and only tools declared idempotent are run
+    // again. Usage is recorded as zero, since the provider's numbers died with the attempt.
     const resumeCrashedStep = Effect.fn("SessionRunner.resumeCrashedStep")(function* (
       input: {
         readonly sessionID: SessionSchema.ID
@@ -539,26 +547,13 @@ const layer = Layer.effect(
         snapshot: endSnapshot,
         files,
       })
-      // Mirror runStep's continuation tail: a step with local tool calls continues so the model sees
-      // the (reused or failed) results.
-      let needsContinuation = localTools
-      if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
-      if (needsContinuation)
-        return { ran: true, continue: true, step: input.step + 1, promotion: "steer" as SessionInput.Delivery }
-      const moreQueue = yield* SessionInput.hasPending(db, input.sessionID, "queue")
-      if (moreQueue) return { ran: true, continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
-      return { ran: true, continue: false, step: input.step + 1, promotion: undefined }
+      // A step with local tool calls continues so the model sees the reused or failed results.
+      return yield* stepContinuation(input.sessionID, localTools, input.step)
     })
 
     // One iteration of `run`'s loop, exposed so a Temporal workflow can drive the turn one step at
     // a time (each step = one runTurn = one provider attempt + its tools). Semantics match `run`.
-    const runStep = Effect.fn("SessionRunner.runStep")(function* (input: {
-      readonly sessionID: SessionSchema.ID
-      readonly step: number
-      readonly promotion: SessionInput.Delivery | undefined
-      readonly first: boolean
-      readonly force: boolean
-    }) {
+    const runStep = Effect.fn("SessionRunner.runStep")(function* (input: StepInput) {
       // One projected-history load serves all the entry checks; nothing mutates the projection
       // between them. The turn itself reloads after the first mutation.
       const entryContext = yield* getContext(input.sessionID)
@@ -579,7 +574,7 @@ const layer = Layer.effect(
           !hasQueue &&
           !(yield* hasRecoverableWork(input.sessionID, entryContext))
         )
-          return { ran: false, continue: false, step: input.step, promotion: undefined }
+          return { continue: false, step: input.step, promotion: undefined }
         promotion = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       }
       // Close tools left pending/running by an interrupted attempt before every turn, not just the
@@ -588,13 +583,7 @@ const layer = Layer.effect(
       // -- a retry poison loop. This is a no-op on a healthy step (the prior step settled its tools).
       yield* failInterruptedTools(input.sessionID, entryContext)
       const result = yield* runTurn(input.sessionID, promotion, input.step)
-      let needsContinuation = result.needsContinuation
-      if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
-      if (needsContinuation)
-        return { ran: true, continue: true, step: result.step + 1, promotion: "steer" as SessionInput.Delivery }
-      const moreQueue = yield* SessionInput.hasPending(db, input.sessionID, "queue")
-      if (moreQueue) return { ran: true, continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
-      return { ran: true, continue: false, step: result.step + 1, promotion: undefined }
+      return yield* stepContinuation(input.sessionID, result.needsContinuation, result.step)
     })
 
     return Service.of({

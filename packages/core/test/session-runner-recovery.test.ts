@@ -199,7 +199,6 @@ describe("SessionRunner crash-recovery eligibility", () => {
         yield* seedPromotedPrompt(sessionID)
         const runner = yield* SessionRunner.Service
         const result = yield* runner.runStep({ sessionID, step: 1, promotion: undefined, first: true, force: false })
-        expect(result.ran).toBe(true)
         expect(requests).toHaveLength(1)
       }),
     )

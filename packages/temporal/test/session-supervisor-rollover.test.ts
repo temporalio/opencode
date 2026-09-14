@@ -7,7 +7,7 @@ import { makeSupervisor, type SupervisorRuntime } from "../src/supervisor"
 import type { StepDrainResult } from "../src/activities"
 
 class ContinuedAsNew extends Error {}
-const DONE: StepDrainResult = { ran: true, continue: false, step: 1, promotion: null }
+const DONE: StepDrainResult = { continue: false, step: 1, promotion: null }
 const settle = () => new Promise((r) => setTimeout(r, 0))
 
 class FakeRuntime implements SupervisorRuntime {

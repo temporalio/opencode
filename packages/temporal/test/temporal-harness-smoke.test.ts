@@ -28,7 +28,7 @@ describe("temporal workflow harness", () => {
         activities: {
           runTurnStep: async () => {
             steps++
-            return { ran: true, continue: false, step: 1, promotion: null }
+            return { continue: false, step: 1, promotion: null }
           },
         },
       })

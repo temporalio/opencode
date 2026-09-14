@@ -53,7 +53,7 @@ describe("temporal workflow harness: interrupt", () => {
                 clearInterval(beat)
               }
             }
-            return { ran: true, continue: false, step: 1, promotion: null }
+            return { continue: false, step: 1, promotion: null }
           },
         },
       })
