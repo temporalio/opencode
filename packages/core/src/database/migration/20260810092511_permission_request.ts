@@ -20,6 +20,7 @@ export default {
       yield* tx.run(
         `CREATE INDEX \`permission_request_session_status_idx\` ON \`permission_request\` (\`session_id\`,\`status\`);`,
       )
+      yield* tx.run(`CREATE INDEX \`permission_request_status_idx\` ON \`permission_request\` (\`status\`);`)
     })
   },
 } satisfies DatabaseMigration.Migration
