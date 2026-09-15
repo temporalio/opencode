@@ -58,6 +58,7 @@ session runs as the workflow `session-exec-<sessionID>`.
 | `OPENCODE_TEMPORAL_TASK_QUEUE` | `opencode-session-exec` | |
 | `OPENCODE_TEMPORAL_ROLE` | `both` | `both` hosts the worker and the client in one process. `client` drives workflows without a worker. `worker` runs activities with no HTTP surface. |
 | `OPENCODE_SESSION_IDLE_TIMEOUT` | | How long an idle session's workflow stays open. Local mode honors the same variable. |
+| `OPENCODE_EVENT_POLL_MS` | | How often a live subscriber re-reads the log for events another process appended. `0` turns the tick off. |
 | `OPENCODE_DB` | | One absolute path shared by every process on a host. |
 | `OPENCODE_DB_URL`, `OPENCODE_DB_AUTH_TOKEN` | | A libSQL URL for a store shared across hosts. Takes precedence over `OPENCODE_DB`. |
 
@@ -152,6 +153,17 @@ Caveats of the shared backend:
   pay a transaction per token. The durable cost of a step is its handful of boundary and tool
   events, recorded as each settles. Coalescing them into one commit at step end would lose the
   completed-tool records the resume path reuses, so per-event durability is kept.
+
+### Live events across processes
+
+A commit publishes its wake in-process, so a subscriber on the serve process cannot see events a
+standalone worker appended: a live tail would show the prompt admitted and then silence. A durable
+tail can also re-read on a tick, which catches what the wake cannot see while in-process commits
+still wake it instantly. The tick is on only in the durable executor's composition root
+(`EventV2.pollingNode`), because a deployment that runs in one process wakes its own subscribers
+and would pay a query per second per subscribed session for events that cannot exist. Token deltas
+are live-only and never cross a process boundary either way; what does is block-level:
+`step.started`, `tool.called`, `tool.success`, `step.ended`.
 
 ## What resumes cross-host, and what does not
 
