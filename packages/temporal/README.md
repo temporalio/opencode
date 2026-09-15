@@ -59,7 +59,8 @@ session runs as the workflow `session-exec-<sessionID>`.
 | `OPENCODE_TEMPORAL_ROLE` | `both` | `both` hosts the worker and the client in one process. `client` drives workflows without a worker. `worker` runs activities with no HTTP surface. |
 | `OPENCODE_SESSION_IDLE_TIMEOUT` | | How long an idle session's workflow stays open. Local mode honors the same variable. |
 | `OPENCODE_TEMPORAL_STEPPED` | off | `1` runs each step as a model call, one activity per tool call, and a seal. |
-| `OPENCODE_TEMPORAL_SERIAL_TOOLS` | derived | Run a step's tool calls one at a time. On by default only where two hosts could write one step's tree: a shared store. |
+| `OPENCODE_TEMPORAL_WORKTREE_AFFINITY`, `OPENCODE_TEMPORAL_WORKTREE` | off | `1` routes a session to the workers serving its project tree, named by the second variable. |
+| `OPENCODE_TEMPORAL_SERIAL_TOOLS` | derived | Run a step's tool calls one at a time. On by default only where two hosts could write one step's tree: a shared store without affinity. |
 | `OPENCODE_EVENT_POLL_MS` | | How often a live subscriber re-reads the log for events another process appended. `0` turns the tick off. |
 | `OPENCODE_DB` | | One absolute path shared by every process on a host. |
 | `OPENCODE_DB_URL`, `OPENCODE_DB_AUTH_TOKEN` | | A libSQL URL for a store shared across hosts. Takes precedence over `OPENCODE_DB`. |
@@ -142,6 +143,24 @@ What the split costs is the overlap between the model's stream and its own tools
 activity starts each tool the moment the model asks for it, while here the attempt returns first.
 The tools of one step still run concurrently with each other. Against live providers that tail is
 under a tenth of a second, and no model tested emitted text after asking for its first tool.
+
+### Worker affinity
+
+Off by default. Without it every worker polls one queue, and a worker drawing a session whose tree it
+has never seen rebuilds that tree from snapshot packs. Affinity avoids the rebuild by routing: the
+queue name is derived from the project worktree, and only workers serving that tree poll it.
+
+```bash
+# a worker declares the tree it serves; defaults to the process directory
+OPENCODE_TEMPORAL_WORKTREE_AFFINITY=1 OPENCODE_TEMPORAL_WORKTREE=/srv/trees/acme \
+  OPENCODE_TEMPORAL_ROLE=worker ... bun run packages/server/src/worker.ts
+```
+
+This trades availability for latency. A session whose tree has no worker polling does not fall back
+to another worker; it waits. Two consequences follow. A worker serves one tree, so in the default
+`role=both` deployment a session in another project has no poller. And flipping the flag strands
+workflows already running: a workflow keeps the task queue it started on for life, so drain before
+flipping, in either direction. Both processes log the queue they use.
 
 ## Running workers separately
 

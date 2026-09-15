@@ -21,11 +21,19 @@ export interface Interface {
   /** Drive each step as a provider attempt, one activity per tool call, and a seal. Off by default:
    * the whole-step mode is what runs today, and this only changes how new sessions start. */
   readonly stepped?: boolean
+  /** Route a session's work to workers that already hold its project tree, instead of letting any
+   * worker draw it and rebuild the tree from snapshot packs. Off by default, because it trades the
+   * reconstruction fallback for latency: a session whose worktree has no worker polling waits
+   * rather than being served elsewhere. */
+  readonly worktreeAffinity?: boolean
+  /** The worktree this worker serves, when affinity is on. Defaults to the process directory, which
+   * is what a serve process with an embedded worker is already sitting in. */
+  readonly worktree?: string
   /** Run a step's tool calls one at a time instead of together. Tools of one step write the same
    * tree and each ships from the host that ran it, so two on two hosts each publish a tree without
    * the other's work: the second is refused rather than reverting the first, which leaves its work
    * stranded there. `OPENCODE_TEMPORAL_SERIAL_TOOLS=1` forces it on; it is on by default only where
-   * the store is shared, which is what lets one step's tools land on different workers. */
+   * the store is shared and no affinity keeps a session's tools on one worker. */
   readonly serialTools?: boolean
 }
 
@@ -35,6 +43,7 @@ const given = (name: string) => process.env[name] !== undefined && process.env[n
 const onOff = (name: string, fallback: boolean) => (given(name) ? process.env[name] === "1" : fallback)
 
 export const fromEnv = (): Interface => {
+  const worktreeAffinity = process.env.OPENCODE_TEMPORAL_WORKTREE_AFFINITY === "1"
   const sharedStore = !!process.env.OPENCODE_DB_URL
   return {
     address: process.env.TEMPORAL_ADDRESS ?? DEFAULTS.address,
@@ -43,8 +52,10 @@ export const fromEnv = (): Interface => {
     role: (process.env.OPENCODE_TEMPORAL_ROLE as Role | undefined) ?? "both",
     idleTimeout: process.env.OPENCODE_SESSION_IDLE_TIMEOUT,
     stepped: onOff("OPENCODE_TEMPORAL_STEPPED", false),
+    worktreeAffinity,
+    worktree: process.env.OPENCODE_TEMPORAL_WORKTREE,
     // Serial by default only where two hosts can end up writing one step's tree: a shared store,
     // with nothing keeping the step's tools on one worker.
-    serialTools: onOff("OPENCODE_TEMPORAL_SERIAL_TOOLS", sharedStore),
+    serialTools: onOff("OPENCODE_TEMPORAL_SERIAL_TOOLS", !worktreeAffinity && sharedStore),
   }
 }
