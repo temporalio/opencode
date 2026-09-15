@@ -350,4 +350,7 @@ an outcome query or a person to decide what happened.
 `scripts/detached-session-check.sh` runs the client story against a Temporal dev server, one
 standalone worker, two serve processes and one shared store: a turn started on serve A survives A
 being killed mid-tool, serve B replays it, and `start`, `running`, `watch` and `schedule` work from
-a cold client. It needs an OpenAI key and does not run in CI.
+a cold client. `scripts/cross-host-check.sh` runs the worktree story in containers
+(`docker/compose.yml`): a session writes a file on worker A, A's host is killed, and worker B, whose
+project volume is empty, continues the session and reads the file back. Both need an OpenAI key,
+and neither runs in CI.
