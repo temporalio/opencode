@@ -47,6 +47,7 @@ const layer = Layer.effectDiscard(
         [name]: Tool.make({
           description:
             "Find files by glob pattern within the active Location. Returns concise relative file resources. Use a relative path to narrow the search and limit to bound the result count.",
+          idempotent: true,
           input: Input,
           output: Output,
           toModelOutput: ({ output }) => [

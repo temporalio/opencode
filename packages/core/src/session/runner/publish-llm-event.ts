@@ -50,6 +50,50 @@ const settledOutput = (value: ToolOutput | undefined, result: ToolResultValue): 
   return { structured: record(settled.structured), content: settled.content }
 }
 
+/**
+ * Publish the durable Tool.Success / Tool.Failed for one settled tool call. Shared by the streaming
+ * publisher below and the crash-resume path (which re-settles idempotent tools without a live
+ * publisher instance), so both encode the outcome identically.
+ */
+export const emitToolResult = (
+  events: EventV2.Interface,
+  params: {
+    readonly sessionID: SessionSchema.ID
+    readonly assistantMessageID: SessionMessage.ID
+    readonly callID: string
+    readonly result: ToolResultValue
+    readonly output?: ToolOutput
+    readonly outputPaths?: ReadonlyArray<string>
+    readonly provider: { readonly executed: boolean; readonly metadata?: ProviderMetadata }
+  },
+) =>
+  Effect.gen(function* () {
+    const timestamp = yield* DateTime.now
+    const settled = settledOutput(params.output, params.result)
+    if ("error" in settled) {
+      yield* events.publish(SessionEvent.Tool.Failed, {
+        sessionID: params.sessionID,
+        timestamp,
+        assistantMessageID: params.assistantMessageID,
+        callID: params.callID,
+        error: settled.error,
+        result: params.result,
+        provider: params.provider,
+      })
+      return
+    }
+    yield* events.publish(SessionEvent.Tool.Success, {
+      sessionID: params.sessionID,
+      timestamp,
+      assistantMessageID: params.assistantMessageID,
+      callID: params.callID,
+      ...settled,
+      outputPaths: params.outputPaths ?? [],
+      ...(params.provider.executed ? { result: params.result } : {}),
+      provider: params.provider,
+    })
+  })
+
 /** Persist one provider turn without executing tools or starting a continuation turn. */
 export const createLLMEventPublisher = (events: EventV2.Interface, input: Input) => {
   const tools = new Map<
@@ -344,32 +388,17 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
           return yield* Effect.die(`Duplicate tool result: ${event.id}`)
         }
         tool.settled = true
-        const result = settledOutput(event.output, event.result)
-        const provider = {
-          executed: event.providerExecuted === true || tool.providerExecuted,
-          ...(event.providerMetadata === undefined ? {} : { metadata: event.providerMetadata }),
-        }
-        if ("error" in result) {
-          yield* events.publish(SessionEvent.Tool.Failed, {
-            sessionID: input.sessionID,
-            timestamp: yield* timestamp,
-            assistantMessageID: tool.assistantMessageID,
-            callID: event.id,
-            error: result.error,
-            result: event.result,
-            provider,
-          })
-          return
-        }
-        yield* events.publish(SessionEvent.Tool.Success, {
+        yield* emitToolResult(events, {
           sessionID: input.sessionID,
-          timestamp: yield* timestamp,
           assistantMessageID: tool.assistantMessageID,
           callID: event.id,
-          ...result,
+          result: event.result,
+          output: event.output,
           outputPaths,
-          ...(provider.executed ? { result: event.result } : {}),
-          provider,
+          provider: {
+            executed: event.providerExecuted === true || tool.providerExecuted,
+            ...(event.providerMetadata === undefined ? {} : { metadata: event.providerMetadata }),
+          },
         })
         return
       }

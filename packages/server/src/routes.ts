@@ -10,6 +10,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
+import { SessionExecutionTemporal } from "@opencode-ai/temporal/executor"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -48,8 +49,40 @@ export function createEmbeddedRoutes() {
   return makeRoutes(ServerAuth.Config.configLayer({ username: "opencode", password: Option.none() }))
 }
 
+// The application-service context (no HTTP surface), with the execution engine selected by env.
+// Shared by the HTTP routes and the standalone worker entrypoint (src/worker.ts) so both build the
+// exact same context.
+export function createServiceLayer() {
+  // The factory: two modes. "temporal" runs each session as a per-step Temporal workflow
+  // (@opencode-ai/temporal, wired here as one dependency); anything else runs it in-process on the
+  // proven SessionRunCoordinator
+  // (execution/local.ts) -- no server, no ports. Both drive SessionRunner over the same durable
+  // event log; the local coordinator owns the wake/resume/interrupt lifecycle and is shared with
+  // the v1 server path, so it is the well-exercised default.
+  const temporal = process.env.OPENCODE_SESSION_EXECUTION === "temporal"
+  const executionNode = temporal ? SessionExecutionTemporal.node : SessionExecutionLocal.node
+  return AppNodeBuilder.build(applicationServices, [
+    [SessionExecution.node, executionNode],
+    // Only the durable executor can put a turn in another process, and only then does a live tail
+    // need to re-read on its own: the wake it otherwise runs on is published in-process. Local mode
+    // keeps the wake alone, so the default deployment pays nothing for a case it does not have.
+    [EventV2.node, temporal ? EventV2.pollingNode : EventV2.node],
+  ])
+}
+
+// The context for a standalone worker (src/worker.ts). Same services as serve, but with
+// SessionExecution as a built member so constructing the layer eagerly starts the Temporal worker
+// (with OPENCODE_TEMPORAL_ROLE=worker there is no HTTP handler to pull it in lazily).
+export function createWorkerLayer() {
+  // A standalone worker only makes sense in temporal mode.
+  return AppNodeBuilder.build(LayerNode.group([applicationServices, SessionExecution.node]), [
+    [SessionExecution.node, SessionExecutionTemporal.node],
+    [EventV2.node, EventV2.pollingNode],
+  ])
+}
+
 function makeRoutes<AuthError, AuthServices>(auth: Layer.Layer<ServerAuth.Config, AuthError, AuthServices>) {
-  const serviceLayer = AppNodeBuilder.build(applicationServices, [[SessionExecution.node, SessionExecutionLocal.node]])
+  const serviceLayer = createServiceLayer()
 
   return HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
     Layer.provide(handlers),

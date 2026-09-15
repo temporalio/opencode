@@ -45,6 +45,10 @@ export const Flag = {
   OPENCODE_MODELS_URL: process.env["OPENCODE_MODELS_URL"],
   OPENCODE_MODELS_PATH: process.env["OPENCODE_MODELS_PATH"],
   OPENCODE_DB: process.env["OPENCODE_DB"],
+  // A libSQL URL (self-hosted sqld or Turso) for a shared, durable event store so any worker can
+  // resume any session. Takes precedence over OPENCODE_DB (the local file) when set.
+  OPENCODE_DB_URL: process.env["OPENCODE_DB_URL"],
+  OPENCODE_DB_AUTH_TOKEN: process.env["OPENCODE_DB_AUTH_TOKEN"],
 
   OPENCODE_WORKSPACE_ID: process.env["OPENCODE_WORKSPACE_ID"],
   OPENCODE_EXPERIMENTAL_WORKSPACES: enabledByExperimental("OPENCODE_EXPERIMENTAL_WORKSPACES"),

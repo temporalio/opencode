@@ -89,26 +89,20 @@ describe("QuestionV2", () => {
     }),
   )
 
-  it.effect("isolates pending requests by location-layer instance and rejects them on finalization", () =>
+  // Cross-instance visibility now goes through the durable rows (question-durable.test.ts); what
+  // finalization still owes a parked asker is a rejection, not silence.
+  it.effect("rejects pending asks when the owning layer finalizes", () =>
     Effect.gen(function* () {
-      const firstScope = yield* Scope.make()
-      const secondScope = yield* Scope.make()
-      const first = Context.get(yield* Layer.buildWithScope(Layer.fresh(questions), firstScope), QuestionV2.Service)
-      const second = Context.get(yield* Layer.buildWithScope(Layer.fresh(questions), secondScope), QuestionV2.Service)
-      const fiber = yield* first.ask({ sessionID, questions: [question] }).pipe(Effect.forkScoped)
-      yield* Effect.yieldNow
-      const request = (yield* first.list())[0]!
+      const scope = yield* Scope.make()
+      const service = Context.get(yield* Layer.buildWithScope(Layer.fresh(questions), scope), QuestionV2.Service)
+      const fiber = yield* service.ask({ sessionID, questions: [question] }).pipe(Effect.forkScoped)
+      for (let i = 0; i < 100 && (yield* service.list()).length === 0; i++) yield* Effect.yieldNow
+      expect(yield* service.list()).toHaveLength(1)
 
-      expect(yield* second.list()).toEqual([])
-      expect(yield* second.reply({ requestID: request.id, answers: [["One"]] }).pipe(Effect.flip)).toEqual(
-        new QuestionV2.NotFoundError({ requestID: request.id }),
-      )
-
-      yield* Scope.close(firstScope, Exit.void)
+      yield* Scope.close(scope, Exit.void)
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(exit.cause.toString()).toContain("QuestionV2.RejectedError")
-      yield* Scope.close(secondScope, Exit.void)
     }),
   )
 })
