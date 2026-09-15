@@ -430,6 +430,67 @@ describe("stepped turn, pinned to a worker", () => {
     }
   })
 
+  it("closes the step elsewhere when a started pinned attempt times out", async () => {
+    // Heartbeat expiry also covers a process that can still write its directory, so its calls stay
+    // where they are and only the seal moves, without the tree.
+    const hostGone = () =>
+      new ActivityFailure(
+        "activity Heartbeat timeout",
+        "runToolCall",
+        "1",
+        undefined,
+        undefined,
+        new TimeoutFailure("heartbeat timed out", undefined, "HEARTBEAT" as never),
+      )
+    const shared = fakes(withQueue)
+    const failed = hostGone()
+    const run = makeSteppedTurn({
+      activities: shared.activities,
+      isCancellation,
+      isHalt,
+      pinnedTo: () => ({
+        runToolCall: async () => {
+          throw failed
+        },
+        sealStep: async () => SEALED,
+      }),
+    })(INPUT)
+
+    expect(await run).toEqual(SEALED)
+    expect(shared.tools).toHaveLength(0)
+    expect(shared.seals.map((s) => s.withoutTheTree)).toEqual([true])
+  })
+
+  it("keeps an uncertain pinned sibling's calls off the shared queue and seals without the tree", async () => {
+    const release = Promise.withResolvers<ToolCallDrainResult>()
+    const refused = Promise.withResolvers<void>()
+    let sharedBeforeTheSiblingEnded = 0
+    const shared = fakes(withQueue)
+    const run = makeSteppedTurn({
+      activities: shared.activities,
+      isCancellation,
+      isHalt,
+      pinnedTo: () => ({
+        runToolCall: async (input) => {
+          if (input.call.id === "call_a") return release.promise
+          refused.resolve()
+          throw unclaimed()
+        },
+        sealStep: async () => SEALED,
+      }),
+    })(INPUT)
+    await refused.promise
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    sharedBeforeTheSiblingEnded = shared.tools.length
+    const failed = new Error("the started activity timed out")
+    release.reject(failed)
+    expect(await run).toEqual(SEALED)
+
+    expect(sharedBeforeTheSiblingEnded).toBe(0)
+    expect(shared.tools).toHaveLength(0)
+    expect(shared.seals.map((s) => s.withoutTheTree)).toEqual([true])
+  })
+
   it("uses the shared queue when the model call reported no queue of its own", async () => {
     const { run, tools, pinnedTools } = called({ ...withQueue, queue: undefined })
 

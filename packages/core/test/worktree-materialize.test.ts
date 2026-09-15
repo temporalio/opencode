@@ -12,6 +12,8 @@ import { Effect, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventSequenceTable } from "@opencode-ai/core/event/sql"
 import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -448,3 +450,57 @@ describe("WorktreeMaterializer", () => {
   )
 })
 
+// A dispatch the session stopped waiting for keeps running, and the files it ships afterwards would
+// be the newest state the store holds: the tip check cannot refuse them, because the host is still
+// standing exactly where it was told to stand. The event log already fences a superseded attempt
+// out of the transcript, and the packs travel under the same token.
+describe("SnapshotSync owner fence", () => {
+  it.live("refuses a pack from an attempt the session has moved past", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const root = realpathSync(tmp.path)
+      const worktree = path.join(root, "project")
+      const file = path.join(root, "shared.db")
+      yield* Effect.promise(async () => {
+        await mkdir(worktree, { recursive: true })
+        await $`git init -q ${worktree}`.quiet()
+        await $`git -C ${worktree} config user.email t@t`.quiet()
+        await $`git -C ${worktree} config user.name t`.quiet()
+        await writeFile(path.join(worktree, "tracked.txt"), "v1\n")
+        await $`git -C ${worktree} add .`.quiet()
+        await $`git -C ${worktree} commit -qm seed`.quiet()
+      })
+
+      const A = yield* Layer.build(captureStack(file, worktree, path.join(root, "host-a-data")))
+      const onDatabase = <A2, E2>(use: (db: Database.Interface["db"]) => Effect.Effect<A2, E2>) =>
+        Database.Service.use(({ db }) => use(db)).pipe(
+          Effect.orDie,
+          Effect.provide(Database.layerFromPath(file)),
+          Effect.scoped,
+        )
+      // The session is on a later attempt than the one that is about to publish.
+      yield* onDatabase((db) =>
+        db.insert(EventSequenceTable).values({ aggregate_id: "ses_fenced", seq: 1, owner_id: "run:1:2" }).run(),
+      )
+
+      const captured = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
+      if (!captured) throw new Error("expected a capture")
+      const shipped = (owner: string) =>
+        Effect.exit(
+          SnapshotSync.Service.use((s) => s.push(captured, "ses_fenced")).pipe(
+            Effect.provideService(EventV2.EventOwner, owner),
+            Effect.provide(A),
+          ),
+        )
+
+      const stale = yield* shipped("run:1:1")
+      expect(stale._tag).toBe("Failure")
+      expect(yield* onDatabase((db) => db.select().from(SnapshotPackTable).all())).toHaveLength(0)
+
+      // The attempt the session is actually on ships as usual.
+      const current = yield* shipped("run:1:2")
+      expect(current._tag).toBe("Success")
+      expect(yield* onDatabase((db) => db.select().from(SnapshotPackTable).all())).toHaveLength(1)
+    }),
+  )
+})

@@ -13,6 +13,8 @@ import { ChildProcess } from "effect/unstable/process"
 import { eq } from "drizzle-orm"
 import { Database } from "./database/database"
 import { makeLocationNode } from "./effect/app-node"
+import { EventV2 } from "./event"
+import { EventSequenceTable } from "./event/sql"
 import { FSUtil } from "./fs-util"
 import { Git } from "./git"
 import { Global } from "./global"
@@ -26,8 +28,23 @@ import { readWorktreeTip, writeWorktreeTip } from "./snapshot/tip"
 import { Hash } from "./util/hash"
 
 export interface Interface {
-  /** A stale tip fails the caller; packing and insertion errors are logged. */
-  readonly push: (tree: Snapshot.ID) => Effect.Effect<void>
+  /**
+   * A stale tip fails the caller; packing and insertion errors are logged.
+   *
+   * `sessionID` is what the files are being shipped for. Given it, a publisher a newer attempt has
+   * superseded is refused, which is the one case the tip check cannot answer: a tool whose dispatch
+   * was abandoned is still standing on the tree it read, so its pack is clean and reverts whatever
+   * ran in its place. Omitted by callers with no session behind them, and then nothing is fenced.
+   *
+   * Two clauses a lost host is held to, and a change here has to keep both:
+   *
+   *   1. The seal that closes a step away from its host publishes nothing. Between the dispatch
+   *      failing and the next attempt claiming the log there is a window where nothing fences the
+   *      old host, and the only thing that makes it harmless is that nobody else publishes then.
+   *   2. Once the session has moved past that host, what it publishes for the closed step is
+   *      refused.
+   */
+  readonly push: (tree: Snapshot.ID, sessionID?: string) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SnapshotSync") {}
@@ -73,7 +90,29 @@ const layer = Layer.effect(
         .all()
         .pipe(Effect.orDie, Effect.map(chainHead))
 
-    const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID) {
+    // Whether a newer attempt holds this session's log. The token is the one the drain claimed and
+    // provided, so this asks the same question the log's own fence asks of every append: is what is
+    // writing still the attempt the session is on?
+    const superseded = Effect.fn("SnapshotSync.superseded")(function* (sessionID: string) {
+      const owner = yield* EventV2.EventOwner
+      // Outside a drain nothing claimed anything, so there is nothing to be superseded by.
+      if (owner === undefined) return false
+      const row = yield* db
+        .select({ ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      return row?.ownerID != null && row.ownerID !== owner
+    })
+
+    const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID, sessionID?: string) {
+      // The files travel under the token the transcript does. A dispatch the session stopped
+      // waiting for keeps running, and what it publishes afterwards would otherwise be the newest
+      // state the store holds, because it is standing exactly where it was told to stand.
+      if (source && sessionID && (yield* superseded(sessionID))) {
+        return yield* Effect.die(new Error(`refusing to ship ${worktree}: a newer attempt holds ${sessionID}`))
+      }
       // A host that has not caught up must not publish its older files as the next tree.
       // This reading is not an atomic head claim and does not fence concurrent publishers.
       if (source) {

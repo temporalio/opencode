@@ -220,5 +220,34 @@ export const makeSteppedTurn =
     if (unsettled.length > 0)
       log?.("step did not settle every call it dispatched", { step: model.step, calls: unsettled })
 
-    return seal(false)
+    // A pinned attempt that started and failed does not take the turn with it, even though nothing
+    // can say whether the tool over there has stopped: the log fences a superseded attempt out of
+    // the transcript, and the pack store refuses its files under the same token, so what that host
+    // is still doing cannot reach the session. The step is closed on the shared queue, where a
+    // worker that is answering can take it, and the turn goes on with whatever the seal says
+    // follows. What does not move is the rest of this step: its calls stay where their host has them.
+    const closeElsewhere = () => {
+      log?.("the step lost its host; closing it elsewhere and carrying the turn on", {
+        sessionID: input.sessionID,
+        step: model.step,
+      })
+      // Without the tree. This seal is standing in a directory that never ran the step's tools, so
+      // what it would ship is the state before them, and the host that did run them may still be
+      // inside one. Between the dispatch failing and the next step claiming the log there is a
+      // window where nothing fences that host, and the only thing that makes the window harmless
+      // is that nobody else publishes during it.
+      return activities.sealStep({ ...sealing(false), withoutTheTree: true })
+    }
+    const resumes = () => uncertain !== undefined
+    if (resumes()) return closeElsewhere()
+    try {
+      return await seal(false)
+    } catch (error) {
+      // The seal is the other way a step loses its host, and it is the half that has to be written
+      // down: a step with no ending recorded is one no follower ever hears about. Re-sealing where
+      // a worker is answering is what an ordinary retry of this activity does; the pinned rule is
+      // the only reason it did not already happen.
+      if (stopped || !resumes()) throw error
+      return await closeElsewhere()
+    }
   }

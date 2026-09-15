@@ -57,6 +57,10 @@ export interface InSessionOptions {
   /** Take the event log for this attempt. True for the writer that supersedes the attempt before it;
    * the other units of a stepped turn ride that writer's token. */
   readonly claim?: boolean
+  /** Leave the project tree alone. For a seal closing a step away from its host: rebuilding here
+   * would put this host on the newest state while the one that ran the tools may still be writing,
+   * and nothing the seal does needs the files. */
+  readonly withoutTheTree?: boolean
 }
 
 /** Run `use` against a session's runner. Undefined when the session is gone, which is not a run
@@ -78,7 +82,7 @@ export const makeInSession =
       // Take the event log before running so a superseded attempt's later appends are fenced.
       if (options.claim && owner) yield* events.claim(session.id, owner)
       // A worker taking this step on a host without the project tree rebuilds it from snapshot packs.
-      yield* worktrees.ensure(session.location.directory)
+      if (!options.withoutTheTree) yield* worktrees.ensure(session.location.directory)
       return yield* SessionRunner.Service.use((runner) => use(runner, session)).pipe(
         Effect.provide(locations.get(session.location)),
       )

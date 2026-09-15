@@ -54,6 +54,10 @@ export interface SealDrainInput {
   readonly assistantMessageID?: string
   readonly needsContinuation?: boolean
   readonly owner: string
+  /** This step is being closed away from the host that was running it. The tree is not this seal's
+   * to rebuild or to ship: the host that ran the tools is the only one holding what they did, and
+   * it may still be inside one of them. Writing the step down is the whole job. */
+  readonly withoutTheTree?: boolean
 }
 
 export interface SteppedDrainDeps {
@@ -120,7 +124,7 @@ export const makeSteppedDrains = ({ inSession, stepQueue }: SteppedDrainDeps) =>
     runAtBoundary(
       input.sessionID,
       signal,
-      inSession(input.sessionID, input.owner, {}, (runner, session) =>
+      inSession(input.sessionID, input.owner, { withoutTheTree: input.withoutTheTree }, (runner, session) =>
         runner
           .sealStep({
             sessionID: session.id,
@@ -128,6 +132,7 @@ export const makeSteppedDrains = ({ inSession, stepQueue }: SteppedDrainDeps) =>
             settlement: input.settlement,
             assistantMessageID: input.assistantMessageID,
             needsContinuation: input.needsContinuation,
+            withoutTheTree: input.withoutTheTree,
           })
           .pipe(Effect.map((result) => toStepResult(input.step, result))),
       ).pipe(Effect.map((result) => result ?? toStepResult(input.step))),
