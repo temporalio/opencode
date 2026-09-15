@@ -32,14 +32,51 @@ export interface StepDrainResult {
   continue: boolean
   step: number
   promotion: string | null
+  /** What this step's provider attempt was billed for, as the attempt itself reported it. The
+   * supervisor adds these up for the turn's budget. Absent from a step that made no attempt. */
+  spent?: { readonly tokens: number }
+  /** What the session has been billed in total, as its own row holds it. Read off the record rather
+   * than added up by the supervisor, so it survives everything the supervisor does not: a run that
+   * rolled over, a session that went idle and was woken again, a turn some other client ran. */
+  session?: { readonly tokens: number }
+}
+
+/**
+ * What the session has been billed in total, off its own row. Every count the record keeps, because
+ * a provider bills for all of them and a bound that drops the cached ones is one a long context
+ * walks straight through.
+ *
+ * Read before the step runs, so it lags by the step now running. A session's bound overshoots by
+ * the same step a turn's does, and for the same reason: what a step cost is not known until it is
+ * taken.
+ */
+export const sessionSpend = (session: SessionSchema.Info | undefined) => {
+  const t = session?.tokens
+  // Nothing rather than zero when the row has no counts: a bound that reads a missing number as
+  // nothing spent is one that never stops a session.
+  if (!t) return undefined
+  return {
+    tokens: (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0),
+  }
 }
 
 /** The step result as it crosses the activity boundary. A missing session reads as a step with
  * nothing left to do, which is what a resume waiting on it should see. */
-export const toStepResult = (step: number, result?: SessionRunner.StepResult): StepDrainResult =>
-  result === undefined
-    ? { continue: false, step, promotion: null }
-    : { continue: result.continue, step: result.step, promotion: result.promotion ?? null }
+export const toStepResult = (
+  step: number,
+  result?: SessionRunner.StepResult,
+  session?: SessionSchema.Info,
+): StepDrainResult => {
+  if (result === undefined) return { continue: false, step, promotion: null }
+  const total = sessionSpend(session)
+  return {
+    continue: result.continue,
+    step: result.step,
+    promotion: result.promotion ?? null,
+    ...(result.spent ? { spent: result.spent } : {}),
+    ...(total ? { session: total } : {}),
+  }
+}
 
 export interface DrainDeps {
   readonly store: SessionStore.Interface
@@ -109,7 +146,7 @@ export const makeDrains = (deps: DrainDeps) => {
             first: input.first,
             force: input.force,
           })
-          .pipe(Effect.map((result) => toStepResult(input.step, result))),
+          .pipe(Effect.map((result) => toStepResult(input.step, result, session))),
       ).pipe(Effect.map((result) => result ?? toStepResult(input.step))),
       // A whole step turns a declined permission into an interrupt to halt its own loop, so an
       // interrupt with nothing cancelling it is that refusal and nothing else.

@@ -65,6 +65,9 @@ session runs as the workflow `session-exec-<sessionID>`.
 | `OPENCODE_TEMPORAL_PROFILE` | `local` | `fleet` sets the defaults a multi-host deployment needs and refuses combinations that cannot work. See below. |
 | `OPENCODE_TEMPORAL_API_KEY`, `OPENCODE_TEMPORAL_API_KEY_FILE` | | Temporal Cloud credentials, the second read from a file. |
 | `OPENCODE_TEMPORAL_TLS_CERT`, `OPENCODE_TEMPORAL_TLS_KEY`, `OPENCODE_TEMPORAL_TLS_CA` | | A certificate pair for a cluster with mTLS. `OPENCODE_TEMPORAL_TLS=1` for TLS without a client certificate. |
+| `OPENCODE_TEMPORAL_BUDGET_TOKENS`, `OPENCODE_TEMPORAL_BUDGET_SECONDS` | | What one turn may spend before the supervisor stops driving it, checked between steps. |
+| `OPENCODE_TEMPORAL_BUDGET_HARD_SECONDS` | | A deadline for one turn. It stops the step that is running, where the other bounds let it finish. |
+| `OPENCODE_TEMPORAL_BUDGET_SESSION_TOKENS`, `OPENCODE_TEMPORAL_BUDGET_SESSION_SECONDS` | | The same two bounds for the whole session, across every turn it runs. |
 | `OPENCODE_EVENT_POLL_MS` | | How often a live subscriber re-reads the log for events another process appended. `0` turns the tick off. |
 | `OPENCODE_WATCH_POLL_MS` | 30000 | How often `session watch` asks the running set whether the turn ended in a gap it could not see. |
 | `OPENCODE_DB` | | One absolute path shared by every process on a host. |
@@ -345,6 +348,7 @@ TEMPORAL_ADDRESS=temporal.internal:7233 \
 | A fresh worker receives a project | Needs the directory | Packs rebuild the tracked files at the recorded path; ignored files do not travel |
 | A later turn reuses a directory an abandoned tool may still write | Not reachable | The directory is refused until the call can be shown to be over, then moved aside and rebuilt |
 | A turn never stops stepping | The coordinator's own loop | The supervisor stops after 200 steps and says so |
+| A turn spends more than intended | Nothing bounds it | An operator's budget on the supervisor stops the turn on tokens or wall clock |
 
 An unknown tool outcome is a loss of evidence, not proof that the tool stopped or failed. The model
 can ask for a new call after reading it. A non-idempotent external effect needs an idempotency key,

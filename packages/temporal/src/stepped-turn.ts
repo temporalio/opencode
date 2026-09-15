@@ -175,20 +175,45 @@ export const makeSteppedTurn =
     } else {
       dispatched.push(...(await Promise.allSettled(model.calls.map(dispatch))))
     }
+    // What the attempt cost, from the counts the provider returned with it. Cache reads and writes
+    // are billed too, and at different rates, so they are counted rather than dropped: a bound that
+    // ignores them is one a long context walks straight through.
+    //
+    // The same arithmetic as `billed` in `session/runner/publish-llm-event.ts`, which the whole-step
+    // path uses, and written out again here because this file is bundled into the workflow sandbox
+    // and may not import core at runtime. Change one, change the other.
+    const tokens = model.settlement?.tokens
+    const spent = tokens
+      ? {
+          tokens:
+            (tokens.input ?? 0) +
+            (tokens.output ?? 0) +
+            (tokens.reasoning ?? 0) +
+            (tokens.cache?.read ?? 0) +
+            (tokens.cache?.write ?? 0),
+        }
+      : undefined
+    // What the session has been billed in total, as its own row held it when this attempt opened it.
+    const session = model.session
+    const withSpend = (result: StepDrainResult): StepDrainResult => ({
+      ...result,
+      ...(spent ? { spent } : {}),
+      ...(session ? { session } : {}),
+    })
 
     const sealing = (stopped: boolean): SealDrainInput => ({
       sessionID: input.sessionID,
       step: model.step,
       // A stopped step is not one that continues. The settlement carries the model's own finish
       // reason, and for a step that asked for tools that is `tool-calls`, which every follower
-      // reads as "another step follows". Passing it through on the way out would record a turn the
+      // reads as "another step follows". Passing it through on the way out recorded a turn the
       // user stopped as a turn still going.
       settlement: stopped && model.settlement ? { ...model.settlement, finish: "stop" } : model.settlement,
       assistantMessageID: model.assistantMessageID,
       needsContinuation: stopped ? false : model.needsContinuation,
       owner: model.owner,
     })
-    const seal = (stopped: boolean) => viaPinned((on) => on.sealStep(sealing(stopped)), stopped)
+    const seal = (stopped: boolean) => viaPinned((on) => on.sealStep(sealing(stopped)), stopped).then(withSpend)
 
     for (const outcome of dispatched) {
       if (outcome.status !== "rejected") continue
@@ -240,7 +265,7 @@ export const makeSteppedTurn =
       // inside one. Between the dispatch failing and the next step claiming the log there is a
       // window where nothing fences that host, and the only thing that makes the window harmless
       // is that nobody else publishes during it.
-      return activities.sealStep({ ...sealing(false), withoutTheTree: true })
+      return activities.sealStep({ ...sealing(false), withoutTheTree: true }).then(withSpend)
     }
     const resumes = () => uncertain !== undefined
     if (resumes()) return closeElsewhere()

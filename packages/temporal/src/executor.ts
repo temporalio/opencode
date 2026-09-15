@@ -70,6 +70,9 @@ const layer = Layer.effect(
     // Only the client can read whether the store is shared, so whether a step's tools may overlap
     // is decided here and rides the workflow input.
     const SERIAL_TOOLS = config.serialTools === true
+    // The operator's bound on what a turn may spend. It rides the workflow input like the mode does,
+    // because the sandbox cannot read env and a rollover has to carry it.
+    const BUDGET = config.budget
     const AFFINITY = config.worktreeAffinity === true
     // The tree this process serves when affinity is on. A serve process with an embedded worker is
     // already sitting in it, so the process directory is the right default.
@@ -226,6 +229,7 @@ const layer = Layer.effect(
                 idleTimeout: IDLE_TIMEOUT,
                 stepped: STEPPED,
                 serialTools: SERIAL_TOOLS,
+                ...(BUDGET ? { budget: BUDGET } : {}),
               } satisfies WF.SessionTurnOptions,
             ],
             signal: WF.wake,
@@ -292,6 +296,7 @@ const layer = Layer.effect(
                       idleTimeout: IDLE_TIMEOUT,
                       stepped: STEPPED,
                       serialTools: SERIAL_TOOLS,
+                      ...(BUDGET ? { budget: BUDGET } : {}),
                     } satisfies WF.SessionTurnOptions,
                   ],
                   workflowIdConflictPolicy: "USE_EXISTING",

@@ -56,6 +56,18 @@ export interface Interface {
   /** Whether the store is shared across hosts (`OPENCODE_DB_URL`). A fleet without it is a set of
    * workers that cannot see each other's sessions. */
   readonly sharedStore: boolean
+  /** What one turn, and the whole session, may spend before the supervisor stops driving it. Off
+   * unless set. Tokens are what the provider reported billed, added up as each attempt reports;
+   * seconds are wall clock on the workflow's own clock. `hardSeconds` is a deadline that stops the
+   * step that is running, where the other bounds wait for it to finish. Rides the workflow input,
+   * like the mode does, because the sandbox cannot read env and a rollover has to carry it. */
+  readonly budget?: {
+    readonly tokens?: number
+    readonly seconds?: number
+    readonly hardSeconds?: number
+    readonly sessionTokens?: number
+    readonly sessionSeconds?: number
+  }
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/temporal/Config") {}
@@ -63,6 +75,30 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/te
 const read = (path: string | undefined) => (path ? readFileSync(path, "utf8") : undefined)
 const given = (name: string) => process.env[name] !== undefined && process.env[name] !== ""
 const onOff = (name: string, fallback: boolean) => (given(name) ? process.env[name] === "1" : fallback)
+
+const BUDGET_VARS = {
+  tokens: "OPENCODE_TEMPORAL_BUDGET_TOKENS",
+  seconds: "OPENCODE_TEMPORAL_BUDGET_SECONDS",
+  hardSeconds: "OPENCODE_TEMPORAL_BUDGET_HARD_SECONDS",
+  sessionTokens: "OPENCODE_TEMPORAL_BUDGET_SESSION_TOKENS",
+  sessionSeconds: "OPENCODE_TEMPORAL_BUDGET_SESSION_SECONDS",
+} as const
+
+// A number a bound can be read as, or nothing. What is set but unreadable is left for `preflight`
+// to refuse: a bound that silently reads as none is worse than a process that will not start.
+const bound = (name: string) => {
+  if (!given(name)) return undefined
+  const value = Number(process.env[name])
+  return Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+const budgetFromEnv = (): Interface["budget"] => {
+  const set = Object.entries(BUDGET_VARS).flatMap(([key, name]) => {
+    const value = bound(name)
+    return value === undefined ? [] : [[key, value] as const]
+  })
+  return set.length === 0 ? undefined : Object.fromEntries(set)
+}
 
 export const fromEnv = (): Interface => {
   const stepAffinity = process.env.OPENCODE_TEMPORAL_STEP_AFFINITY !== "0"
@@ -96,6 +132,7 @@ export const fromEnv = (): Interface => {
     // neither kind of affinity keeping the step's tools on one worker.
     serialTools: onOff("OPENCODE_TEMPORAL_SERIAL_TOOLS", !stepAffinity && !worktreeAffinity && sharedStore),
     sharedStore,
+    budget: budgetFromEnv(),
   }
 }
 
@@ -146,6 +183,9 @@ export const preflight = (config: Interface): string[] => {
     problems.push("an API key is set but TEMPORAL_NAMESPACE is `default`, which is not a Cloud namespace")
   if (!!process.env.OPENCODE_TEMPORAL_TLS_CERT !== !!process.env.OPENCODE_TEMPORAL_TLS_KEY)
     problems.push("OPENCODE_TEMPORAL_TLS_CERT and OPENCODE_TEMPORAL_TLS_KEY come as a pair")
+  for (const name of Object.values(BUDGET_VARS))
+    if (given(name) && bound(name) === undefined)
+      problems.push(`${name} is \`${process.env[name]}\`, which is not a positive number`)
   return problems
 }
 
@@ -176,4 +216,9 @@ export const describe = (config: Interface): Record<string, string> => ({
   stepAffinity: String(config.stepAffinity !== false),
   serialTools: String(config.serialTools === true),
   credentials: config.apiKey ? "api key" : config.tls ? "certificate pair" : "none (plaintext)",
+  budget: config.budget
+    ? Object.entries(config.budget)
+        .map(([name, value]) => `${name}=${value}`)
+        .join(" ")
+    : "none",
 })

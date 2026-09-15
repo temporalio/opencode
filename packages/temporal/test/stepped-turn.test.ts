@@ -55,6 +55,16 @@ const fakes = (
 }
 
 describe("stepped turn", () => {
+  it("reports nothing for a step whose attempt said nothing about tokens", async () => {
+    const { activities } = fakes({ kind: "called", step: 2, calls: [call("call_a")], owner: "run-1:model-1:1" })
+
+    const result = await makeSteppedTurn({ activities, isCancellation, isHalt })(INPUT)
+
+    // Absent rather than zero: a budget that reads a missing count as nothing spent is one that
+    // never stops a turn whose attempts do not report.
+    expect(result.spent).toBeUndefined()
+  })
+
   it("dispatches nothing and does not seal when the step is already settled", async () => {
     const settled: StepDrainResult = { continue: false, step: 2, promotion: null }
     const { activities, tools, seals } = fakes({ kind: "settled", result: settled })
@@ -87,7 +97,8 @@ describe("stepped turn", () => {
     expect(seals[0]?.owner).toBe("run-1:model-1:1")
     // The finish reason lives only in the attempt's memory, so the seal has to be handed it.
     expect(seals[0]?.settlement?.finish).toBe("tool-calls")
-    expect(result).toEqual(SEALED)
+    // And what the step cost rides back with the seal's own result, for the turn's budget.
+    expect(result).toEqual({ ...SEALED, spent: { tokens: 3 } })
   })
 
   it("reports the calls it did not settle, and says nothing when they all settled", async () => {

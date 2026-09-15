@@ -13,7 +13,7 @@ import type { StepSettlement } from "@opencode-ai/core/session/runner/publish-ll
 import type { SessionInput } from "@opencode-ai/core/session/input"
 import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktree"
 import { runAtBoundary } from "./boundary"
-import { type InSession, type StepDrainInput, type StepDrainResult, toStepResult } from "./drain"
+import { type InSession, type StepDrainInput, type StepDrainResult, sessionSpend, toStepResult } from "./drain"
 
 /** The provider attempt of one step. Same shape as a whole-step drain: the difference is what it
  * does with the tool calls, not what it needs to start. */
@@ -36,6 +36,8 @@ export type ModelCallDrainResult =
        * worker was not given a queue of its own, and never required: the step falls back to the
        * shared queue and the tree is rebuilt there. */
       readonly queue?: string
+      /** What the session has been billed in total, off its own row. See `sessionSpend`. */
+      readonly session?: { readonly tokens: number }
     }
 
 export interface ToolCallDrainInput {
@@ -90,19 +92,28 @@ export const makeSteppedDrains = ({ inSession, worktrees, stepQueue }: SteppedDr
       input.sessionID,
       signal,
       inSession(input.sessionID, input.owner, { claim: true }, (runner, session) =>
-        runner.runModelCall({
-          sessionID: session.id,
-          step: input.step,
-          promotion: (input.promotion ?? undefined) as SessionInput.Delivery | undefined,
-          first: input.first,
-          force: input.force,
-        }),
+        runner
+          .runModelCall({
+            sessionID: session.id,
+            step: input.step,
+            promotion: (input.promotion ?? undefined) as SessionInput.Delivery | undefined,
+            first: input.first,
+            force: input.force,
+          })
+          // The session's own totals, off the row this drain already loaded. The attempt says what
+          // it cost; the row says what the session has cost, which is what outlives this run.
+          .pipe(Effect.map((called) => ({ ...called, session: sessionSpend(session) }))),
       ).pipe(
         Effect.map(
           (result): ModelCallDrainResult =>
             result === undefined || result.kind === "settled"
               ? { kind: "settled", result: toStepResult(input.step, result?.result) }
-              : { ...result, owner: input.owner, ...(stepQueue === undefined ? {} : { queue: stepQueue }) },
+              : {
+                  ...result,
+                  owner: input.owner,
+                  ...(stepQueue === undefined ? {} : { queue: stepQueue }),
+                  ...(result.session ? { session: result.session } : {}),
+                },
         ),
       ),
     )
@@ -156,7 +167,14 @@ export const makeSteppedDrains = ({ inSession, worktrees, stepQueue }: SteppedDr
             needsContinuation: input.needsContinuation,
             withoutTheTree: input.withoutTheTree,
           })
-          .pipe(Effect.map((result) => toStepResult(input.step, result))),
+          // Only the loop decision: what the step spent was reported by its model call.
+          .pipe(
+            Effect.map((result) => ({
+              continue: result.continue,
+              step: result.step,
+              promotion: result.promotion ?? null,
+            })),
+          ),
       ).pipe(Effect.map((result) => result ?? toStepResult(input.step))),
     )
 

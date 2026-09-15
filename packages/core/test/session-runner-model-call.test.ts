@@ -44,6 +44,25 @@ const callsTool: LLMClientShape["stream"] = () =>
     LLMEvent.toolCall({ id: "call_probe", name: "probe_write", input: {} }),
     LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
   ])
+// The same, with what the provider says it billed for. A budget outside the agent adds these up,
+// so what the whole-step path carries out of a turn is as load-bearing as what it recorded.
+const callsToolAndBills: LLMClientShape["stream"] = () =>
+  Stream.fromIterable([
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.toolCall({ id: "call_probe", name: "probe_write", input: {} }),
+    LLMEvent.stepFinish({
+      index: 0,
+      reason: "tool-calls",
+      usage: {
+        inputTokens: 10,
+        nonCachedInputTokens: 8,
+        outputTokens: 4,
+        reasoningTokens: 1,
+        cacheReadInputTokens: 2,
+        cacheWriteInputTokens: 3,
+      },
+    }),
+  ])
 // Calls the tool that declines.
 const callsDecliningTool: LLMClientShape["stream"] = () =>
   Stream.fromIterable([
@@ -307,6 +326,27 @@ describe("SessionRunner model-only attempt", () => {
       const context = yield* store.context(sessionID)
       expect(toolStatus(context, "call_probe")).toBe("completed")
       expect(closed(context)).toBe(true)
+    }),
+  )
+
+  runnerHarness(callsToolAndBills).effect("carries what the attempt was billed for out of a whole step", () =>
+    Effect.gen(function* () {
+      yield* seedSession(sessionID)
+      yield* registerProbes(counters())
+      const runner = yield* SessionRunner.Service
+
+      const result = yield* runner.runStep({
+        sessionID,
+        step: 2,
+        promotion: undefined,
+        first: false,
+        force: false,
+      })
+
+      // 8 not-cached in, 3 visible out (4 less the 1 of reasoning), 1 reasoning, 2 cache read and
+      // 3 cache write. A deployment that never splits a step has no other way to know what a turn
+      // cost, and every one of those five is billed.
+      expect(result.spent).toEqual({ tokens: 17 })
     }),
   )
 

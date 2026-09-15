@@ -38,6 +38,26 @@ export interface StepSettlement {
   readonly tokens: ReturnType<typeof tokens>
 }
 
+/**
+ * What the attempt was billed for, as one number, for a budget to add up. Cache reads and writes
+ * are billed too, and at different rates, so they are counted rather than dropped: a bound that
+ * ignores them is one a long context walks straight through.
+ *
+ * Undefined when the attempt said nothing, which a budget must read as "unknown" rather than as
+ * nothing spent.
+ *
+ * The split path in `packages/temporal/src/l2-step.ts` writes this arithmetic out again, because
+ * that file is bundled into the workflow sandbox and may not import this one. Change one, change
+ * the other.
+ */
+export const billed = (settlement: StepSettlement | undefined) => {
+  const t = settlement?.tokens
+  if (!t) return undefined
+  return {
+    tokens: (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0),
+  }
+}
+
 /** The shape a tool call's input is recorded in. Exported so a dispatcher publishing Tool.Called
  * for a deferred call records it exactly as the streaming path would. */
 export const record = (value: unknown): Record<string, unknown> =>

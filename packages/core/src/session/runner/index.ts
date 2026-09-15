@@ -33,6 +33,9 @@ export interface StepResult {
   readonly continue: boolean
   readonly step: number
   readonly promotion: SessionInput.Delivery | undefined
+  /** What this step's provider attempt was billed for, for a caller keeping a budget. Absent from a
+   * step that made no attempt, and from one whose attempt reported no counts. */
+  readonly spent?: { readonly tokens: number }
 }
 
 /** A tool call the provider asked for, recorded but not run, handed to the caller to dispatch. Every

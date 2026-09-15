@@ -44,12 +44,24 @@ export interface SupervisorRuntime {
   readonly allHandlersFinished?: () => boolean
   /** Restart the run with fresh history, carrying whether work is still pending. History-keeping
    * drivers only (Temporal). */
-  readonly continueAsNew?: (sessionID: string, startWithWake: boolean) => Promise<never>
+  readonly continueAsNew?: (
+    sessionID: string,
+    startWithWake: boolean,
+    /** What the session has spent so far. Carried, or a session gets its allowance back every time
+     * it outgrows a run's history. */
+    spent?: Spent,
+  ) => Promise<never>
   /** Whether the driver says this run's history is large enough to roll over. A drain count cannot
    * answer this: one drain is a whole turn, and a stepped turn of 200 steps is thousands of events,
    * so a handful of drains can cross the server's limit long before the count does. Optional:
    * drivers without a history return false. */
   readonly historyWantsRollover?: () => boolean
+  /** The workflow's own clock, so a turn's elapsed time reads the same on a replay. Optional:
+   * a driver without one is not asked for a wall-clock bound. */
+  readonly now?: () => number
+  /** Wait, in the driver's own time. Only used for a turn's deadline, which is the one bound that
+   * has to fire while a step is running rather than between two of them. */
+  readonly sleep?: (ms: number) => Promise<void>
   /** Where a turn says it stopped because it ran out of steps rather than because it finished. */
   readonly warn?: (message: string, attributes: Record<string, unknown>) => void
 }
@@ -61,6 +73,44 @@ export interface WorkflowOptions {
   readonly maxDrainsPerRun?: number
   /** Steps one turn may take before the supervisor stops driving it. */
   readonly maxStepsPerTurn?: number
+  /**
+   * What one turn may spend before the supervisor stops driving it. Enforced between steps, never
+   * inside one: a step that has started is left to finish, because stopping it would leave a tool
+   * call the next attempt's transcript cannot be made from.
+   *
+   * This is what the workflow having the loop buys. The agent is not asked to keep to it and cannot
+   * be: the model decides what to ask for, so the thing that says no has to be somewhere the model
+   * does not reach. Off unless an operator sets it, because a bound that ends real work is worse
+   * than none and only the operator knows which is which.
+   */
+  readonly budget?: {
+    // Tokens the turn's provider attempts may spend, added up as each one reports.
+    readonly tokens?: number
+    // Wall clock for the whole turn, in seconds. A number rather than a duration string: the parser
+    // for those is not something a workflow bundle should be reaching for, and a bound nobody can
+    // be sure of the units of is worse than one that says them.
+    readonly seconds?: number
+    // Wall clock again, but as a deadline rather than a bound checked between steps. At `seconds`
+    // the turn stops where it can; at this one it stops where it is, which is what a user pressing
+    // stop does: what has results keeps them, what is in flight comes back as an outcome nobody can
+    // vouch for, and the tools over there keep running until they are done. Opt-in on top.
+    readonly hardSeconds?: number
+    // And the same two for the session, across every turn it runs. A per-turn bound says what one
+    // answer may cost; this says what the whole session may, which is the number somebody is
+    // billed for.
+    readonly sessionTokens?: number
+    readonly sessionSeconds?: number
+  }
+  /** What the session had spent when this run started, from the run that rolled over. */
+  readonly spent?: Spent
+}
+
+/** What a session has spent so far, carried between runs of its workflow. */
+export interface Spent {
+  readonly tokens: number
+  // Wall clock its turns have used, rather than how long the session has existed: one sitting idle
+  // overnight has spent nothing.
+  readonly seconds: number
 }
 
 export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions) => {
@@ -74,6 +124,16 @@ export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions)
   // the supervisor can see it, because each step is its own activity and each one succeeds. High
   // enough that real work never reaches it.
   const MAX_STEPS_PER_TURN = options?.maxStepsPerTurn ?? 200
+  const BUDGET = options?.budget
+  // What this session has spent, across every turn it has run, carried in from the run that rolled
+  // over. A session does not get its allowance back by outgrowing a run's history.
+  const spent = { tokens: options?.spent?.tokens ?? 0, seconds: options?.spent?.seconds ?? 0 }
+  const outOfBudget = (turnTokens: number, turnSeconds: number, recorded?: number) =>
+    BUDGET !== undefined &&
+    ((BUDGET.tokens !== undefined && turnTokens > BUDGET.tokens) ||
+      (BUDGET.seconds !== undefined && turnSeconds > BUDGET.seconds) ||
+      (BUDGET.sessionTokens !== undefined && (recorded ?? spent.tokens + turnTokens) > BUDGET.sessionTokens) ||
+      (BUDGET.sessionSeconds !== undefined && spent.seconds + turnSeconds > BUDGET.sessionSeconds))
 
   // Each step (one provider attempt + its tools) is its own activity; the step loop is supervisor
   // control flow (step / promotion / first mirror SessionRunner.run's loop). `startWithWake` is the
@@ -99,6 +159,30 @@ export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions)
           let step = 1
           let promotion: string | null = null
           let first = true
+          // A deadline that ends the turn where it is. The wait lives in this drain's own scope, so
+          // a turn that finishes first cancels it on the way out, and the rejection that follows is
+          // the scope's own.
+          if (BUDGET?.hardSeconds !== undefined && rt.sleep) {
+            void rt.sleep(BUDGET.hardSeconds * 1000).then(
+              () => {
+                rt.warn?.("turn stopped where it was: its deadline passed", {
+                  sessionID,
+                  seconds: BUDGET.hardSeconds,
+                })
+                rt.cancelCurrentScope()
+              },
+              () => undefined,
+            )
+          }
+          // What this turn has spent, and when it started spending it. Both are the supervisor's
+          // own state: the session's log holds what every turn spent, and this bound is about one.
+          const startedAt = rt.now?.() ?? 0
+          let tokens = 0
+          // What the record says the session has been billed, as of the last step that reported it.
+          // The count below is about a run; this one is about the session, and it is what a
+          // session's bound is measured against wherever the host can say it.
+          let recorded: { readonly tokens: number } | undefined
+          const turnSeconds = () => (rt.now ? (rt.now() - startedAt) / 1000 : 0)
           for (let taken = 0; ; taken++) {
             if (taken >= MAX_STEPS_PER_TURN) {
               rt.warn?.("turn hit the step ceiling and was left where it stopped", {
@@ -107,7 +191,25 @@ export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions)
               })
               break
             }
+            // Between steps, never inside one, and after the step whose cost crossed the bound:
+            // what a step spent is not known until it has been taken.
+            if (outOfBudget(tokens, turnSeconds(), recorded?.tokens)) {
+              rt.warn?.("turn stopped where it was: it is out of budget", {
+                sessionID,
+                steps: taken,
+                turn: { tokens, seconds: Math.round(turnSeconds()) },
+                session: {
+                  tokens: recorded?.tokens ?? spent.tokens + tokens,
+                  seconds: Math.round(spent.seconds + turnSeconds()),
+                  recorded: recorded !== undefined,
+                },
+                budget: BUDGET,
+              })
+              break
+            }
             const r: StepDrainResult = await rt.runTurnStep({ sessionID, step, promotion, first, force })
+            tokens += r.spent?.tokens ?? 0
+            recorded = r.session ?? recorded
             // Inside the loop as well, because one drain is a whole turn: a long one outgrows the
             // history without ever reaching the next drain's check.
             if (rt.historyWantsRollover?.()) rolloverPending = true
@@ -124,6 +226,9 @@ export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions)
             promotion = r.promotion
             first = false
           }
+          // Whatever ended the turn, the provider billed for what it ran.
+          spent.tokens += tokens
+          spent.seconds += turnSeconds()
         })
         .finally(() => {
           inFlight = null
@@ -171,7 +276,7 @@ export const makeSupervisor = (rt: SupervisorRuntime, options?: WorkflowOptions)
         // continue-as-new: only from the main method, only when quiescent. Carry the pending wake so
         // queued work survives the boundary (a pure rollover carries false -> no spurious drain).
         if (rt.continueAsNew && rolloverPending && quiescent()) {
-          await rt.continueAsNew(sessionID, pendingWake)
+          await rt.continueAsNew(sessionID, pendingWake, spent)
         }
         if (pendingWake) {
           pendingWake = false

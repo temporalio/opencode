@@ -182,7 +182,11 @@ export const SessionScheduleCommand = cmd({
               {
                 sessionID,
                 text: args.prompt,
-                session: { idleTimeout: config.idleTimeout, stepped: config.stepped === true },
+                session: {
+                  idleTimeout: config.idleTimeout,
+                  stepped: config.stepped === true,
+                  ...(config.budget ? { budget: config.budget } : {}),
+                },
               },
             ],
           },

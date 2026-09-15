@@ -28,7 +28,7 @@ import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common"
 import type { StepActivities, SteppedTurnActivities } from "./activities"
 import { isHaltFailure, makeSteppedTurn } from "./stepped-turn"
 import { SIGNALS, RESUME_UPDATE, WORKFLOW_ID_PREFIX } from "./protocol"
-import { makeSupervisor, type SupervisorRuntime } from "./supervisor"
+import { makeSupervisor, type SupervisorRuntime, type WorkflowOptions } from "./supervisor"
 
 const activityOptions = {
   // The heartbeat is the liveness bound (it stops within seconds of a worker death and Temporal
@@ -133,6 +133,9 @@ const runtime: SupervisorRuntime = {
   // The server's own read of whether this run has grown enough to roll over. The drain count alone
   // misses it: a stepped turn is thousands of events, so a handful of drains can cross the limit.
   historyWantsRollover: () => workflowInfo().continueAsNewSuggested,
+  // The workflow's clock, not the machine's: it reads the same on a replay, and so does its timer.
+  now: () => Date.now(),
+  sleep: (ms) => sleep(ms),
   warn: (message, attributes) => log.warn(message, attributes),
 }
 
@@ -174,6 +177,11 @@ export interface SessionTurnOptions {
    * on two hosts each publish a tree without the other's work. The client decides, because only it
    * can read whether the store is shared. */
   readonly serialTools?: boolean
+  /** What one turn may spend before the supervisor stops driving it, on tokens or on wall clock.
+   * Off unless set. See `WorkflowOptions` in the supervisor for what it does and does not bound. */
+  readonly budget?: WorkflowOptions["budget"]
+  /** What the session had spent when this run started. Set by a rollover, not by a client. */
+  readonly spent?: WorkflowOptions["spent"]
 }
 
 export async function sessionTurn(sessionID: string, options?: SessionTurnOptions): Promise<void> {
@@ -182,16 +190,31 @@ export async function sessionTurn(sessionID: string, options?: SessionTurnOption
   const idleTimeout = options?.idleTimeout
   const stepped = options?.stepped === true
   const serialTools = options?.serialTools === true
-  if (!idleTimeout && !stepped) return workflows.sessionTurn(sessionID, startWithWake)
+  const budget = options?.budget
+  if (!idleTimeout && !stepped && !budget) return workflows.sessionTurn(sessionID, startWithWake)
   return makeSupervisor(
     {
       ...(stepped ? steppedRuntime(serialTools) : runtime),
       // The mode has to survive the boundary, or a long session silently reverts to whole-step
-      // activities the first time it rolls over.
-      continueAsNew: (id, wake) =>
-        continueAsNew<typeof sessionTurn>(id, { startWithWake: wake, idleTimeout, stepped, serialTools }),
+      // activities the first time it rolls over. The budget travels for the same reason: a turn
+      // that starts after a rollover is a turn, and it is the operator's bound either way.
+      continueAsNew: (id, wake, spent) =>
+        continueAsNew<typeof sessionTurn>(id, {
+          startWithWake: wake,
+          idleTimeout,
+          stepped,
+          serialTools,
+          budget,
+          spent,
+        }),
     },
-    idleTimeout ? { idleTimeout } : undefined,
+    idleTimeout || budget
+      ? {
+          ...(idleTimeout ? { idleTimeout } : {}),
+          ...(budget ? { budget } : {}),
+          ...(options?.spent ? { spent: options.spent } : {}),
+        }
+      : undefined,
   ).sessionTurn(sessionID, startWithWake)
 }
 

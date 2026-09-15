@@ -45,7 +45,7 @@ import {
   Service,
 } from "./index"
 import { SessionRunnerModel } from "./model"
-import { createLLMEventPublisher, emitToolResult, record } from "./publish-llm-event"
+import { billed, createLLMEventPublisher, emitToolResult, record } from "./publish-llm-event"
 import { toLLMMessages } from "./to-llm-message"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { DEFAULT_MAX_STEPS, REPEAT_LIMIT, REPEATED_CALLS_PROMPT, trailingIdenticalToolSteps } from "./loop-guard"
@@ -859,7 +859,12 @@ const layer = Layer.effect(
       const prologue = yield* stepPrologue(input)
       if (prologue.kind === "settled") return prologue.result
       const result = yield* runTurn(input.sessionID, prologue.promotion, input.step)
-      return yield* stepContinuation(input.sessionID, result.needsContinuation, result.step)
+      const closed = yield* stepContinuation(input.sessionID, result.needsContinuation, result.step)
+      // The attempt's own counts, carried out for a caller keeping a budget. The split path gets
+      // them from the settlement it hands back; this path publishes its own step ending, so
+      // without this a whole-step deployment has no bound on what a turn spends.
+      const spent = billed(result.settlement)
+      return spent ? { ...closed, spent } : closed
     })
 
     const runModelCall = Effect.fn("SessionRunner.runModelCall")(function* (input: StepInput) {
