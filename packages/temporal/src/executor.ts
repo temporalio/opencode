@@ -13,8 +13,9 @@ import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
-import { makeStepActivities } from "./activities"
+import { makeStepActivities, makeSteppedTurnActivities } from "./activities"
 import { makeDrains } from "./drain"
+import { makeSteppedDrains } from "./stepped-drain"
 import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktree"
 import { toRunError } from "./run-error-codec"
 import * as WF from "./workflow"
@@ -58,12 +59,19 @@ const layer = Layer.effect(
     // Same knob local mode honors; the workflow sandbox cannot read env, so the client forwards the
     // override as a workflow argument.
     const IDLE_TIMEOUT = config.idleTimeout
+    const STEPPED = config.stepped === true
+    // Only the client can read whether the store is shared, so whether a step's tools may overlap
+    // is decided here and rides the workflow input.
+    const SERIAL_TOOLS = config.serialTools === true
     const events = yield* EventV2.Service
     const worktrees = yield* WorktreeMaterializer.Service
 
     // The per-step drain (drain.ts) wraps SessionRunner.runStep for the activity boundary. Local
     // mode runs whole turns through SessionRunner.run on the coordinator; both share SessionRunner.
-    const { stepDrain } = makeDrains({ store, locations, ctx, events, worktrees })
+    const drains = makeDrains({ store, locations, ctx, events, worktrees })
+    // The stepped mode's three drains. Registered unconditionally: which mode a session runs is a
+    // property of its workflow input, so a worker has to be able to serve either.
+    const stepped = makeSteppedDrains({ inSession: drains.inSession })
 
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
@@ -86,7 +94,7 @@ const layer = Layer.effect(
           namespace: NAMESPACE,
           taskQueue: TASK_QUEUE,
           workflowsPath: fileURLToPath(new URL("./workflow.ts", import.meta.url)),
-          activities: makeStepActivities(stepDrain),
+          activities: { ...makeStepActivities(drains.stepDrain), ...makeSteppedTurnActivities(stepped) },
         }),
       )
       const runHandle = worker.run()
@@ -126,7 +134,15 @@ const layer = Layer.effect(
         client.workflow.signalWithStart(WORKFLOW_TYPE, {
           taskQueue: TASK_QUEUE,
           workflowId: workflowId(id),
-          args: [id, { startWithWake: true, idleTimeout: IDLE_TIMEOUT } satisfies WF.SessionTurnOptions],
+          args: [
+            id,
+            {
+              startWithWake: true,
+              idleTimeout: IDLE_TIMEOUT,
+              stepped: STEPPED,
+              serialTools: SERIAL_TOOLS,
+            } satisfies WF.SessionTurnOptions,
+          ],
           signal: WF.wake,
           signalArgs: [],
         }),
@@ -177,7 +193,15 @@ const layer = Layer.effect(
                 // startWithWake=false: a fresh resume-with-start must not manufacture a wake drain;
                 // its forced drain comes from the resume update. Ignored when USE_EXISTING joins a
                 // running workflow (which keeps its own state).
-                args: [id, { startWithWake: false, idleTimeout: IDLE_TIMEOUT } satisfies WF.SessionTurnOptions],
+                args: [
+                  id,
+                  {
+                    startWithWake: false,
+                    idleTimeout: IDLE_TIMEOUT,
+                    stepped: STEPPED,
+                    serialTools: SERIAL_TOOLS,
+                  } satisfies WF.SessionTurnOptions,
+                ],
                 workflowIdConflictPolicy: "USE_EXISTING",
               })
               return client.workflow.executeUpdateWithStart(WF.resume, {

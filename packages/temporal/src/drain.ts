@@ -1,11 +1,10 @@
-// The per-step drain body for the Temporal layer: it runs inside the runTurnStep activity. It wraps
-// one SessionRunner.runStep, claims the event log for the attempt, ensures the worktree, and encodes
-// the error for the activity boundary. Local mode does not use this: it runs whole turns through
-// SessionRunner.run on the SessionRunCoordinator (execution/local.ts). Both modes go through the
-// same SessionRunner and the same durable event log.
+// The drain bodies the Temporal activities run: one whole step, or the three units a stepped turn
+// is made of (the provider attempt, one tool call, the seal). Each wraps a SessionRunner call for
+// the activity boundary: find the session, claim the event log for the attempt, bring the project
+// tree forward, and run under the session's location. Local mode does not use these; it runs whole
+// turns through SessionRunner.run on the coordinator. Both modes share SessionRunner and the log.
 
-import { Cause, Context, Effect, Exit, type LayerMap } from "effect"
-import { ApplicationFailure } from "@temporalio/activity"
+import { Context, Effect, type LayerMap } from "effect"
 import type { LocationServiceMap } from "@opencode-ai/core/location-service-map"
 import type { Location } from "@opencode-ai/core/location"
 import type { LocationError, LocationServices } from "@opencode-ai/core/location-services"
@@ -14,9 +13,9 @@ import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktr
 import { SessionRunner } from "@opencode-ai/core/session/runner"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionStore } from "@opencode-ai/core/session/store"
-import { SessionRunDeclinedError } from "@opencode-ai/core/session/error"
 import type { SessionInput } from "@opencode-ai/core/session/input"
-import { encodeRunError } from "./run-error-codec"
+import { runAtBoundary } from "./boundary"
+
 // One step of a turn, as any executor drives it. `promotion` is null (not undefined) so it
 // serializes cleanly across an executor's process boundary.
 export interface StepDrainInput {
@@ -35,6 +34,13 @@ export interface StepDrainResult {
   promotion: string | null
 }
 
+/** The step result as it crosses the activity boundary. A missing session reads as a step with
+ * nothing left to do, which is what a resume waiting on it should see. */
+export const toStepResult = (step: number, result?: SessionRunner.StepResult): StepDrainResult =>
+  result === undefined
+    ? { continue: false, step, promotion: null }
+    : { continue: result.continue, step: result.step, promotion: result.promotion ?? null }
+
 export interface DrainDeps {
   readonly store: SessionStore.Interface
   readonly locations: LayerMap.LayerMap<Location.Ref, LocationServices, LocationError>
@@ -47,60 +53,60 @@ export interface DrainDeps {
   readonly worktrees: WorktreeMaterializer.Interface
 }
 
-export const makeDrains = ({ store, locations, ctx, events, worktrees }: DrainDeps) => {
+export interface InSessionOptions {
+  /** Take the event log for this attempt. True for the writer that supersedes the attempt before it;
+   * the other units of a stepped turn ride that writer's token. */
+  readonly claim?: boolean
+}
+
+/** Run `use` against a session's runner. Undefined when the session is gone, which is not a run
+ * error: deleting a session while its workflow is alive is allowed, and a resume waiting on it
+ * should resolve rather than reject. */
+export type InSession = <A>(
+  sessionID: string,
+  owner: string | undefined,
+  options: InSessionOptions,
+  use: (runner: SessionRunner.Interface, session: SessionSchema.Info) => Effect.Effect<A, SessionRunner.RunError>,
+) => Effect.Effect<A | undefined, SessionRunner.RunError>
+
+export const makeInSession =
+  ({ store, locations, ctx, events, worktrees }: DrainDeps): InSession =>
+  (sessionID, owner, options, use) =>
+    Effect.gen(function* () {
+      const session = yield* store.get(SessionSchema.ID.make(sessionID))
+      if (!session) return undefined
+      // Take the event log before running so a superseded attempt's later appends are fenced.
+      if (options.claim && owner) yield* events.claim(session.id, owner)
+      // A worker taking this step on a host without the project tree rebuilds it from snapshot packs.
+      yield* worktrees.ensure(session.location.directory)
+      return yield* SessionRunner.Service.use((runner) => use(runner, session)).pipe(
+        Effect.provide(locations.get(session.location)),
+      )
+    }).pipe(Effect.provideService(EventV2.EventOwner, owner), Effect.provide(ctx), Effect.scoped)
+
+export const makeDrains = (deps: DrainDeps) => {
+  const inSession = makeInSession(deps)
+
   // Run exactly one step of the turn (the supervisor loops it); returns the next loop state.
-  const stepDrain = async (input: StepDrainInput, signal: AbortSignal): Promise<StepDrainResult> => {
-    const exit = await Effect.runPromiseExit(
-      Effect.gen(function* () {
-        const session = yield* store.get(SessionSchema.ID.make(input.sessionID))
-        if (!session) return { continue: false, step: input.step, promotion: null }
-        // Take the event log before running so a superseded attempt's later appends are fenced.
-        if (input.owner) yield* events.claim(session.id, input.owner)
-        // A worker resuming on a host without the project tree rebuilds it from snapshot packs.
-        yield* worktrees.ensure(session.location.directory)
-        const r = yield* SessionRunner.Service.use((runner) =>
-          runner.runStep({
+  const stepDrain = async (input: StepDrainInput, signal: AbortSignal): Promise<StepDrainResult> =>
+    runAtBoundary(
+      input.sessionID,
+      signal,
+      inSession(input.sessionID, input.owner, { claim: input.owner !== undefined }, (runner, session) =>
+        runner
+          .runStep({
             sessionID: session.id,
             step: input.step,
             promotion: (input.promotion ?? undefined) as SessionInput.Delivery | undefined,
             first: input.first,
             force: input.force,
-          }),
-        ).pipe(Effect.provide(locations.get(session.location)))
-        return { continue: r.continue, step: r.step, promotion: r.promotion ?? null }
-      }).pipe(Effect.provideService(EventV2.EventOwner, input.owner), Effect.provide(ctx), Effect.scoped),
-      { signal },
+          })
+          .pipe(Effect.map((result) => toStepResult(input.step, result))),
+      ).pipe(Effect.map((result) => result ?? toStepResult(input.step))),
+      // A whole step turns a declined permission into an interrupt to halt its own loop, so an
+      // interrupt with nothing cancelling it is that refusal and nothing else.
+      { declineIsInterrupt: true },
     )
-    if (Exit.isSuccess(exit)) return exit.value
-    const cause = exit.cause
-    if (Cause.hasInterruptsOnly(cause)) {
-      // Two interrupt sources: driver cancellation (the AbortSignal fired; rethrow its reason so
-      // the attempt records Cancelled, not Failed) and an internal halt like a user declining a
-      // permission (the signal did NOT fire). The latter must be non-retryable, or the supervisor
-      // re-drives a turn the user explicitly stopped.
-      if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("session run interrupted")
-      const declined = encodeRunError(
-        new SessionRunDeclinedError({ sessionID: SessionSchema.ID.make(input.sessionID) }),
-      )
-      throw ApplicationFailure.create({
-        message: "session run halted (user declined)",
-        type: "SessionRunDeclined",
-        nonRetryable: true,
-        details: declined === undefined ? undefined : [declined],
-      })
-    }
-    // A genuine run error is thrown non-retryable so Temporal surfaces it (to resume) rather than
-    // retrying; only crashes / task timeouts (never thrown here) go through the retry policy. The
-    // error is encoded faithfully in `details` so the caller can reconstruct the exact RunError.
-    const squashed = Cause.squash(cause) as { _tag?: string; message?: string }
-    const encoded = encodeRunError(squashed)
-    throw ApplicationFailure.create({
-      message: squashed?.message ?? Cause.pretty(cause),
-      type: squashed?._tag ?? "SessionRunError",
-      nonRetryable: true,
-      details: encoded === undefined ? undefined : [encoded],
-    })
-  }
 
-  return { stepDrain }
+  return { inSession, stepDrain }
 }

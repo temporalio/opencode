@@ -58,6 +58,8 @@ session runs as the workflow `session-exec-<sessionID>`.
 | `OPENCODE_TEMPORAL_TASK_QUEUE` | `opencode-session-exec` | |
 | `OPENCODE_TEMPORAL_ROLE` | `both` | `both` hosts the worker and the client in one process. `client` drives workflows without a worker. `worker` runs activities with no HTTP surface. |
 | `OPENCODE_SESSION_IDLE_TIMEOUT` | | How long an idle session's workflow stays open. Local mode honors the same variable. |
+| `OPENCODE_TEMPORAL_STEPPED` | off | `1` runs each step as a model call, one activity per tool call, and a seal. |
+| `OPENCODE_TEMPORAL_SERIAL_TOOLS` | derived | Run a step's tool calls one at a time. On by default only where two hosts could write one step's tree: a shared store. |
 | `OPENCODE_EVENT_POLL_MS` | | How often a live subscriber re-reads the log for events another process appended. `0` turns the tick off. |
 | `OPENCODE_DB` | | One absolute path shared by every process on a host. |
 | `OPENCODE_DB_URL`, `OPENCODE_DB_AUTH_TOKEN` | | A libSQL URL for a store shared across hosts. Takes precedence over `OPENCODE_DB`. |
@@ -91,6 +93,55 @@ tagged `RunError`, encoded through a `Schema.Union` of every member in `run-erro
 `active` is the set of open per-session workflows, so it survives a restart of the serve process.
 A user decline inside an activity is a non-retryable failure, so the workflow does not re-drive a
 turn the user stopped.
+
+## A step as three activities
+
+`OPENCODE_TEMPORAL_STEPPED=1` splits a step into three activities instead of one:
+
+```
+runModelCall  ->  runToolCall (one per call, concurrent)  ->  sealStep
+```
+
+`SessionRunner.runModelCall` performs the attempt, records each call as `Tool.Called`, and hands the
+calls back rather than running them. `runToolCall` settles one call. `sealStep` takes the end
+snapshot, diffs it against the start, and publishes `Step.Ended`. The loop between them is workflow
+code (`stepped-turn.ts`), so a retry policy, a timeout, an approval or a budget can sit between the
+model asking for a tool and the tool running. Each activity carries its own bounds: sealing does not
+inherit a turn-sized backstop, and one tool waiting on a human no longer holds the attempt and its
+sibling tools under a single timeout.
+
+The supervisor is the same. Wake, interrupt, idle self-termination and continue-as-new only ever
+called one `runTurnStep`, so the stepped mode supplies a different one. The mode rides the workflow
+input, so a session that rolls over keeps it.
+
+Three rules carry the split:
+
+- **One owner token per step, not per activity.** The event log fences a publish behind the current
+  owner, so a step's writers share one token. Only `runModelCall` claims; the tool and seal
+  activities publish under the token it returns.
+- **A call that already started is not silently repeated.** `runToolCall` publishes `Tool.Called`
+  before it runs the tool, so a call the log shows as running is one a dispatch was already inside.
+  On a second dispatch only a tool declaring `idempotent` runs again; anything else reaches the model
+  as an unknown outcome. The attempt number cannot stand in for this: it counts every way a dispatch
+  can die, including the ones that never reached the tool.
+- **A stop closes the calls it cut short, and a hand-off does not.** A dispatch closes its own call
+  when the cancellation means the turn is over. When it means this attempt is being handed to another
+  (a worker shutting down, a pause, a heartbeat timeout), the call is left as it was found, or the
+  next attempt would read a closed call and never run the tool.
+
+A declined permission crosses the activity boundary as its own error type, so the workflow tells a
+refusal apart from a tool that failed. The whole-step path still raises it as an interrupt, which is
+the behaviour its own tests pin, so that drain says so at the boundary.
+
+Each tool call ships the tree from the host that ran it, because the seal can land on any worker and
+a capture there would miss what the tool wrote. Where two hosts could run one step's tools, they run
+one at a time (`OPENCODE_TEMPORAL_SERIAL_TOOLS`), or the second to ship would publish a tree without
+the first's work.
+
+What the split costs is the overlap between the model's stream and its own tools: a whole-step
+activity starts each tool the moment the model asks for it, while here the attempt returns first.
+The tools of one step still run concurrently with each other. Against live providers that tail is
+under a tenth of a second, and no model tested emitted text after asking for its first tool.
 
 ## Running workers separately
 

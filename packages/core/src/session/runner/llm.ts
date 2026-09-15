@@ -26,21 +26,33 @@ import { ToolRegistry } from "../../tool/registry"
 import { ToolOutputStore } from "../../tool-output-store"
 import { SessionContextEpoch } from "../context-epoch"
 import { SessionCompaction } from "../compaction"
+import { SessionRunDeclinedError } from "../error"
 import { SessionEvent } from "../event"
 import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
 import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
-import { type RunError, Service, type StepInput } from "./index"
+import {
+  type DeferredToolCall,
+  type ModelCallResult,
+  type RunError,
+  type SealStepInput,
+  type StepInput,
+  type ToolCallInput,
+  type ToolCallResult,
+  type TurnAttemptResult,
+  Service,
+} from "./index"
 import { SessionRunnerModel } from "./model"
-import { createLLMEventPublisher, emitToolResult } from "./publish-llm-event"
+import { createLLMEventPublisher, emitToolResult, record } from "./publish-llm-event"
 import { toLLMMessages } from "./to-llm-message"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { DEFAULT_MAX_STEPS, REPEAT_LIMIT, REPEATED_CALLS_PROMPT, trailingIdenticalToolSteps } from "./loop-guard"
 import { Snapshot } from "../../snapshot"
 import { SnapshotSync } from "../../snapshot-sync"
 import { makeLocationNode } from "../../effect/app-node"
+import { KeyedMutex } from "../../effect/keyed-mutex"
 import { llmClient } from "../../effect/app-node-platform"
 
 /**
@@ -92,6 +104,13 @@ import { llmClient } from "../../effect/app-node-platform"
  * provider turn. Registry definitions are advertised, local tool calls are settled durably, and an
  * explicit loop starts the next provider turn after local settlement. Configured agent step limits bound the loop.
  */
+
+// Shipping the tree, one at a time per directory. Two tools of one step run at once and both end by
+// capturing and pushing: a capture writes the git index and a push compares against the store's
+// head, so two of them in one directory race on both, and the loser's work is refused rather than
+// shipped. Module-level, because what has to be excluded is two activities in one process, and each
+// builds its own runner.
+const shipping = KeyedMutex.makeUnsafe<string>()
 
 const layer = Layer.effect(
   Service,
@@ -201,6 +220,9 @@ const layer = Layer.effect(
       promotion: SessionInput.Delivery | undefined,
       step: number,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
+      // When set, tool calls are recorded and returned instead of run, and the step is left open for
+      // whoever runs them. This is what lets a durable executor make each call its own unit of work.
+      deferTools = false,
     ) {
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
@@ -208,6 +230,7 @@ const layer = Layer.effect(
       const agent = yield* agents.select(session.agent)
       const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent), session.id)
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
+      const deferred: DeferredToolCall[] = []
       let needsContinuation = false
       let currentStep = step
       if (promotion) {
@@ -267,6 +290,7 @@ const layer = Layer.effect(
           ...(session.model?.variant === undefined ? {} : { variant: session.model.variant }),
         },
         snapshot: startSnapshot,
+        deferCalls: deferTools,
       })
       const withPublication = Semaphore.makeUnsafe(1).withPermit
       const publish = (event: LLMEvent, outputPaths: ReadonlyArray<string> = []) =>
@@ -290,6 +314,13 @@ const layer = Layer.effect(
             }
             needsContinuation = true
             const assistantMessageID = yield* publisher.assistantMessageID(event.id)
+            // Tool.Called is already durable (the publish above), so handing the call back is enough
+            // for the caller to run it later. Nothing forks here, which is why the step ends when the
+            // stream does and the overlap between the model and its tools is lost.
+            if (deferTools) {
+              deferred.push({ id: event.id, name: event.name, assistantMessageID })
+              return
+            }
             yield* Effect.uninterruptibleMask((restore) =>
               restore(
                 toolMaterialization.settle({
@@ -357,7 +388,9 @@ const layer = Layer.effect(
             yield* withPublication(publisher.failUnsettledTools(`Tool execution failed: ${message}`))
           }
           const stepSettlement = publisher.stepSettlement()
-          if (stepSettlement && !publisher.hasProviderError()) {
+          // Deferred tools have not run yet, so the step is not over and the end snapshot would be
+          // taken before their side effects. Whoever runs them seals it, with the settlement below.
+          if (stepSettlement && !publisher.hasProviderError() && !deferTools) {
             const endSnapshot = yield* snapshots.capture()
             // Ship the post-step tree: this is the state a resumed step on another host needs.
             if (endSnapshot) yield* snapshotSync.push(endSnapshot)
@@ -387,7 +420,23 @@ const layer = Layer.effect(
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
             return yield* Effect.failCause(settled.cause)
-          return { needsContinuation: !publisher.hasProviderError() && needsContinuation, step: currentStep }
+          // A provider turn can finish having published nothing at all (no text, no tool call), and
+          // then no assistant message exists for the seal to close. The whole-step path never hits
+          // this because it mints one right here, inside Step.Ended. Mint it the same way and carry
+          // the id, rather than leave the seal to guess from the projection.
+          const assistantMessageID =
+            deferTools && stepSettlement && !publisher.hasProviderError()
+              ? yield* withPublication(publisher.startAssistant())
+              : undefined
+          return {
+            needsContinuation: !publisher.hasProviderError() && needsContinuation,
+            step: currentStep,
+            // A provider error already failed every recorded call, so handing them back would only
+            // buy a dispatch that reads them as settled.
+            calls: publisher.hasProviderError() ? [] : deferred,
+            settlement: stepSettlement,
+            assistantMessageID,
+          }
         }),
       )
     }, Effect.scoped)
@@ -395,31 +444,32 @@ const layer = Layer.effect(
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
-    ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number }, RunError>
+      deferTools?: boolean,
+    ) => Effect.Effect<TurnAttemptResult, RunError>
 
-    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step).pipe(
+    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, deferTools) {
+      return yield* runTurnAttempt(sessionID, promotion, step, undefined, deferTools).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
               return yield* Effect.die("Post-compaction provider attempt cannot recover another overflow")
             yield* Effect.yieldNow
-            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
+            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, deferTools)
           }),
         ),
       )
     })
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow).pipe(
+    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, deferTools) {
+      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow, deferTools).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             yield* Effect.yieldNow
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
-              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
-            return yield* runTurn(sessionID, undefined, defect.transition.step)
+              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, deferTools)
+            return yield* runTurn(sessionID, undefined, defect.transition.step, deferTools)
           }),
         ),
       )
@@ -433,8 +483,7 @@ const layer = Layer.effect(
       const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
       const entryContext = yield* getContext(input.sessionID)
       const recover =
-        !input.force && !hasSteer && !hasQueue &&
-        (yield* hasRecoverableWork(input.sessionID, entryContext))
+        !input.force && !hasSteer && !hasQueue && (yield* hasRecoverableWork(input.sessionID, entryContext))
       if (!input.force && !hasSteer && !hasQueue && !recover) return
       yield* failInterruptedTools(input.sessionID, entryContext)
       let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
@@ -486,12 +535,8 @@ const layer = Layer.effect(
         (message): message is SessionMessage.Assistant => message.type === "assistant" && !message.time.completed,
       )
       if (!inFlight) return undefined
-      const toolParts = inFlight.content.filter(
-        (part): part is SessionMessage.AssistantTool => part.type === "tool",
-      )
-      const dispatched = toolParts.some(
-        (part) => part.state.status === "running" || part.state.status === "completed",
-      )
+      const toolParts = inFlight.content.filter((part): part is SessionMessage.AssistantTool => part.type === "tool")
+      const dispatched = toolParts.some((part) => part.state.status === "running" || part.state.status === "completed")
       if (!dispatched) return undefined
       // A tool declared idempotent (a pure read) has no external side effect, so it is safe to
       // re-run: re-settle it for a real result instead of failing it. Everything else still open is
@@ -551,16 +596,17 @@ const layer = Layer.effect(
       return yield* stepContinuation(input.sessionID, localTools, input.step)
     })
 
-    // One iteration of `run`'s loop, exposed so a Temporal workflow can drive the turn one step at
-    // a time (each step = one runTurn = one provider attempt + its tools). Semantics match `run`.
-    const runStep = Effect.fn("SessionRunner.runStep")(function* (input: StepInput) {
+    // The checks every step runs before the provider is called. Shared by the whole-step path and
+    // the model-only path so the two cannot drift apart. Returns the terminal result when the step
+    // is already over, otherwise the promotion the turn should apply.
+    const stepPrologue = Effect.fn("SessionRunner.stepPrologue")(function* (input: StepInput) {
       // One projected-history load serves all the entry checks; nothing mutates the projection
       // between them. The turn itself reloads after the first mutation.
       const entryContext = yield* getContext(input.sessionID)
       // Re-drive of a crashed step: finalize it from the log rather than re-calling the model and
       // re-running its already-dispatched tools.
       const resumed = yield* resumeCrashedStep(input, entryContext)
-      if (resumed) return resumed
+      if (resumed) return { kind: "settled", result: resumed } as const
       let promotion = input.promotion
       if (input.first) {
         const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
@@ -568,13 +614,11 @@ const layer = Layer.effect(
         // Same recovery gate as `run`: a first-step retry whose prompt was already promoted (and
         // whose crash predates any tool dispatch, so resumeCrashedStep had nothing to finalize)
         // must re-stream, not no-op.
-        if (
-          !input.force &&
-          !hasSteer &&
-          !hasQueue &&
-          !(yield* hasRecoverableWork(input.sessionID, entryContext))
-        )
-          return { continue: false, step: input.step, promotion: undefined }
+        if (!input.force && !hasSteer && !hasQueue && !(yield* hasRecoverableWork(input.sessionID, entryContext)))
+          return {
+            kind: "settled",
+            result: { continue: false, step: input.step, promotion: undefined },
+          } as const
         promotion = hasSteer ? "steer" : hasQueue ? "queue" : undefined
       }
       // Close tools left pending/running by an interrupted attempt before every turn, not just the
@@ -582,13 +626,252 @@ const layer = Layer.effect(
       // re-stream a request with a dangling tool_use and no tool_result, which the provider rejects
       // -- a retry poison loop. This is a no-op on a healthy step (the prior step settled its tools).
       yield* failInterruptedTools(input.sessionID, entryContext)
-      const result = yield* runTurn(input.sessionID, promotion, input.step)
+      return { kind: "run", promotion } as const
+    })
+
+    const sealStep = Effect.fn("SessionRunner.sealStep")(function* (input: SealStepInput) {
+      const context = yield* getContext(input.sessionID)
+      const inFlight = context.findLast(
+        (message): message is SessionMessage.Assistant => message.type === "assistant" && !message.time.completed,
+      )
+      // On a retry that lands after Step.Ended was published there is nothing open, but the loop
+      // decision still has to come out the same, so it is read off the step we just closed.
+      const carried = input.assistantMessageID
+      const target =
+        (carried
+          ? context.findLast((m): m is SessionMessage.Assistant => m.type === "assistant" && m.id === carried)
+          : undefined) ??
+        inFlight ??
+        context.findLast((message): message is SessionMessage.Assistant => message.type === "assistant")
+      if (!target) return yield* stepContinuation(input.sessionID, false, input.step)
+      const toolParts = target.content.filter((part): part is SessionMessage.AssistantTool => part.type === "tool")
+      // A step continues so the model can see its tool results. Provider-executed calls need no
+      // follow-up turn, so a step holding only those finalizes as a plain stop.
+      const localTools = toolParts.some((part) => part.provider?.executed !== true)
+      if (target.time.completed)
+        return yield* stepContinuation(input.sessionID, input.needsContinuation ?? localTools, input.step)
+      // A dispatch that failed outright leaves its call open. Close it here, or the next attempt
+      // sends a request carrying a tool_use with no tool_result and the provider rejects it.
+      yield* failInterruptedTools(input.sessionID, context)
+      const startSnapshot = target.snapshot?.start
+      const endSnapshot = yield* snapshots.capture()
+      // Ship the post-step tree: this is the state a later step on another host needs.
+      if (endSnapshot) yield* snapshotSync.push(endSnapshot)
+      const files =
+        startSnapshot && endSnapshot
+          ? yield* snapshots
+              .files({ from: Snapshot.ID.make(startSnapshot), to: endSnapshot })
+              .pipe(Effect.catch(() => Effect.succeed(undefined)))
+          : undefined
+      yield* events.publish(SessionEvent.Step.Ended, {
+        sessionID: input.sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID: target.id,
+        // The attempt's own settlement when the caller carried it; otherwise the same fallback the
+        // crash-resume path uses, which costs only the metering on that step.
+        finish: input.settlement?.finish ?? (localTools ? "tool-calls" : "stop"),
+        cost: 0,
+        tokens: input.settlement?.tokens ?? { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        snapshot: endSnapshot,
+        files,
+      })
+      return yield* stepContinuation(input.sessionID, input.needsContinuation ?? localTools, input.step)
+    })
+
+    // A point read, not the whole projected history. The call carries the message that owns it, so
+    // decoding every message to find one part would make a step cost O(session) per tool instead
+    // of O(1). Message ids are looked up on their own, so the session has to be checked too: a call
+    // from another session must not resolve here.
+    const recordedCall = Effect.fnUntraced(function* (input: ToolCallInput) {
+      const owner = yield* store.message(SessionMessage.ID.make(input.call.assistantMessageID))
+      if (owner?.sessionID !== input.sessionID || owner.message.type !== "assistant") return undefined
+      // findLast to agree with the projector, which writes tool updates the same way.
+      return owner.message.content.findLast(
+        (item): item is SessionMessage.AssistantTool => item.type === "tool" && item.id === input.call.id,
+      )
+    })
+
+    const runToolCall = Effect.fn("SessionRunner.runToolCall")(function* (input: ToolCallInput) {
+      const session = yield* getSession(input.sessionID)
+      const assistantMessageID = SessionMessage.ID.make(input.call.assistantMessageID)
+      const part = yield* recordedCall(input)
+      // The call has to be in the log already: the attempt that produced it recorded its input
+      // before handing it over. Missing means the log moved under us (a fence), and running a tool
+      // whose call is not recorded would leave an orphan result.
+      if (!part || part.type !== "tool")
+        return yield* Effect.die(`Tool call ${input.call.id} is not recorded on session ${input.sessionID}`)
+      // At-least-once: a duplicate dispatch landing after the result did must not run anything.
+      if (part.state.status !== "pending" && part.state.status !== "running")
+        return { outcome: "already-settled" } satisfies ToolCallResult
+      const agent = yield* agents.select(session.agent)
+      const materialization = yield* tools.materialize(agent.info?.permissions)
+      // `running` means a dispatch already published Tool.Called and was about to run the tool, so
+      // the side effect may have happened and nothing that reads the log afterwards can tell. Only
+      // a tool that declares itself repeatable runs again. The rest are reported unknown and the
+      // model decides, because re-running the `git push` that may already have landed is the worse
+      // failure. The attempt number would say the same thing far less precisely: it counts every
+      // way a dispatch can die, including the ones that never reached the tool.
+      if (part.state.status === "running" && !materialization.idempotent(input.call.name)) {
+        yield* events.publish(SessionEvent.Tool.Failed, {
+          sessionID: input.sessionID,
+          timestamp: yield* DateTime.now,
+          assistantMessageID,
+          callID: input.call.id,
+          error: { type: "unknown", message: "The outcome of this tool call is unknown" },
+          provider: { executed: false },
+        })
+        return { outcome: "unknown" } satisfies ToolCallResult
+      }
+      // The arguments, off the log rather than off the hand-off. A pending call holds the provider's
+      // raw JSON text, which is what the stream delivered; a re-dispatch of a running one reads the
+      // object the first dispatch recorded. A defect either way if the text is not JSON, because
+      // only the recording path could have written that, and a tool handed a string it cannot parse
+      // reports a wrong reason to the model.
+      const recorded = part.state
+      const args =
+        recorded.status === "pending"
+          ? yield* Effect.try({
+              try: () => JSON.parse(recorded.input) as unknown,
+              catch: () =>
+                new Error(
+                  recorded.input === ""
+                    ? `Tool call ${input.call.id} has no recorded input to run it with`
+                    : `Tool call ${input.call.id} has a recorded input that is not JSON`,
+                ),
+            }).pipe(Effect.orDie)
+          : recorded.input
+      // The durable record that this call is being run, published before the tool can do anything.
+      // It is also the last point a fenced dispatch dies at: under a superseded owner this publish
+      // fails and the tool never runs, instead of running and losing its result.
+      yield* events.publish(
+        SessionEvent.Tool.Called,
+        {
+          sessionID: input.sessionID,
+          timestamp: yield* DateTime.now,
+          assistantMessageID,
+          callID: input.call.id,
+          tool: input.call.name,
+          input: record(args),
+          // Deferred calls are never provider-executed: those are filtered out before the hand-off.
+          provider: { executed: false },
+        },
+        materialization.idempotent(input.call.name)
+          ? undefined
+          : {
+              // A shared step owner cannot distinguish overlapping dispatches of one call.
+              id: EventV2.ID.make(`evt_dispatch_${assistantMessageID}_${input.call.id}`),
+            },
+      )
+      const settlement = yield* materialization
+        .settle({
+          sessionID: input.sessionID,
+          agent: agent.id,
+          assistantMessageID,
+          call: LLMEvent.toolCall({
+            id: input.call.id,
+            name: input.call.name,
+            input: args,
+          }),
+        })
+        .pipe(
+          // The tool itself ran: what failed is storing its output. Letting that fail the dispatch
+          // would retry a side effect that already happened and finally tell the model the call was
+          // interrupted, which is not what happened to it. The whole-step path reports the same
+          // reason the same way. A decline is a defect, so it passes through this untouched.
+          Effect.catch((error) => Effect.succeed({ failure: error })),
+          // A decline is the user stopping the turn, not a tool that failed. It is named here
+          // rather than raised as a bare interrupt, so nothing downstream has to infer from the
+          // absence of a cancellation what the user meant.
+          Effect.catchCause((cause) =>
+            isUserDeclined(cause)
+              ? Effect.fail(new SessionRunDeclinedError({ sessionID: input.sessionID }))
+              : Effect.failCause(cause),
+          ),
+        )
+      if ("failure" in settlement) {
+        const reason = settlement.failure instanceof Error ? settlement.failure.message : String(settlement.failure)
+        yield* Effect.uninterruptible(
+          events.publish(SessionEvent.Tool.Failed, {
+            sessionID: input.sessionID,
+            timestamp: yield* DateTime.now,
+            assistantMessageID,
+            callID: input.call.id,
+            error: { type: "unknown", message: `Tool execution failed: ${reason}` },
+            provider: { executed: false },
+          }),
+        )
+        return { outcome: "failed" } satisfies ToolCallResult
+      }
+      // The tool has run by here, so losing the result to an interrupt would hide a
+      // side effect that already happened.
+      yield* Effect.uninterruptible(
+        emitToolResult(events, {
+          sessionID: input.sessionID,
+          assistantMessageID,
+          callID: input.call.id,
+          result: settlement.result,
+          output: settlement.output,
+          outputPaths: settlement.outputPaths,
+          // Deferred calls are never provider-executed: those are filtered out before the hand-off.
+          provider: { executed: false },
+        }),
+      )
+      // Shipped from the host that ran the tool, because it is the only one holding what the tool
+      // did. The seal can land anywhere, and a capture there would ship a tree that never saw this
+      // write. Best effort in the same sense the seal's is: the result is already durable, and a
+      // pack that does not reach the store costs the next host a rebuild from further back.
+      yield* shipping.withLock(location.directory)(
+        Effect.gen(function* () {
+          const afterTool = yield* snapshots.capture().pipe(Effect.catch(() => Effect.succeed(undefined)))
+          if (afterTool) yield* snapshotSync.push(afterTool)
+        }),
+      )
+      return { outcome: "settled" } as ToolCallResult
+    })
+
+    const failToolCall = Effect.fn("SessionRunner.failToolCall")(function* (input: ToolCallInput) {
+      const part = yield* recordedCall(input)
+      // Only a call a dispatch had started is closed. One that never reached its tool is left
+      // pending for the next turn's entry check, and a settled one keeps the result it earned.
+      if (part?.state.status !== "running") return
+      yield* events.publish(SessionEvent.Tool.Failed, {
+        sessionID: input.sessionID,
+        timestamp: yield* DateTime.now,
+        assistantMessageID: SessionMessage.ID.make(input.call.assistantMessageID),
+        callID: input.call.id,
+        error: { type: "unknown", message: "Tool execution interrupted" },
+        provider: { executed: false },
+      })
+    })
+
+    const runStep = Effect.fn("SessionRunner.runStep")(function* (input: StepInput) {
+      const prologue = yield* stepPrologue(input)
+      if (prologue.kind === "settled") return prologue.result
+      const result = yield* runTurn(input.sessionID, prologue.promotion, input.step)
       return yield* stepContinuation(input.sessionID, result.needsContinuation, result.step)
+    })
+
+    const runModelCall = Effect.fn("SessionRunner.runModelCall")(function* (input: StepInput) {
+      const prologue = yield* stepPrologue(input)
+      if (prologue.kind === "settled") return { kind: "settled", result: prologue.result } satisfies ModelCallResult
+      const result = yield* runTurn(input.sessionID, prologue.promotion, input.step, true)
+      return {
+        kind: "called",
+        step: result.step,
+        calls: result.calls,
+        settlement: result.settlement,
+        assistantMessageID: result.assistantMessageID,
+        needsContinuation: result.needsContinuation,
+      } satisfies ModelCallResult
     })
 
     return Service.of({
       run,
       runStep,
+      runModelCall,
+      runToolCall,
+      failToolCall,
+      sealStep,
     })
   }),
 )

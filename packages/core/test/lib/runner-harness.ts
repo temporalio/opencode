@@ -64,7 +64,15 @@ export const mockClient = (stream: LLMClientShape["stream"]) =>
 export const emptyStep: LLMClientShape["stream"] = () =>
   Stream.fromIterable([LLMEvent.stepStart({ index: 0 }), LLMEvent.stepFinish({ index: 0, reason: "stop" })])
 
-export const runnerHarness = (stream: LLMClientShape["stream"]) =>
+/** The fixtures a test can swap: a model with other limits, a config that compacts, a store that
+ * cannot keep tool output. Everything else in the graph stays the same. */
+export interface HarnessOverrides {
+  readonly model?: typeof models
+  readonly config?: typeof config
+  readonly outputStore?: typeof ToolOutputStore.nodeWithoutConfig | Layer.Layer<ToolOutputStore.Service>
+}
+
+export const runnerHarness = (stream: LLMClientShape["stream"], overrides: HarnessOverrides = {}) =>
   testEffect(
     AppNodeBuilder.build(
       LayerNode.group([
@@ -86,13 +94,13 @@ export const runnerHarness = (stream: LLMClientShape["stream"]) =>
       [
         [LayerNodePlatform.llmClient, mockClient(stream)],
         [PermissionV2.node, permission],
-        [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
-        [SessionRunnerModel.node, models],
+        [ToolOutputStore.node, overrides.outputStore ?? ToolOutputStore.nodeWithoutConfig],
+        [SessionRunnerModel.node, overrides.model ?? models],
         [SystemContextRegistry.node, systemContext],
         [Location.node, Location.boundNode({ directory: PROJECT })],
         [SkillGuidance.node, skillGuidance],
         [ReferenceGuidance.node, referenceGuidance],
-        [Config.node, config],
+        [Config.node, overrides.config ?? config],
         [Snapshot.node, Snapshot.noopLayer],
       ],
     ),

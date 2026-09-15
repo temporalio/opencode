@@ -1,0 +1,129 @@
+// The three drain bodies a stepped turn is made of: the provider attempt, one tool call, and the
+// seal. A whole-step drain runs one attempt plus all of its tools in a single activity, so nothing
+// can sit between the model asking for a tool and the tool running. Splitting them is what gives
+// each tool call its own retry policy, timeout and approval window.
+//
+// All three write to the same session log, so they publish under one owner token: the model call
+// claims it and hands it back, the other two inherit it. A token per activity execution, which is
+// right when the activity is the whole step, would make a step's writers fence each other out.
+
+import { Effect } from "effect"
+import type { DeferredToolCall, ToolCallOutcome } from "@opencode-ai/core/session/runner"
+import type { StepSettlement } from "@opencode-ai/core/session/runner/publish-llm-event"
+import type { SessionInput } from "@opencode-ai/core/session/input"
+import { runAtBoundary } from "./boundary"
+import { type InSession, type StepDrainInput, type StepDrainResult, toStepResult } from "./drain"
+
+/** The provider attempt of one step. Same shape as a whole-step drain: the difference is what it
+ * does with the tool calls, not what it needs to start. */
+export type ModelCallDrainInput = StepDrainInput
+
+export type ModelCallDrainResult =
+  | { readonly kind: "settled"; readonly result: StepDrainResult }
+  | {
+      readonly kind: "called"
+      readonly step: number
+      readonly calls: ReadonlyArray<DeferredToolCall>
+      readonly settlement?: StepSettlement
+      readonly assistantMessageID?: string
+      readonly needsContinuation?: boolean
+      /** The event-log token this attempt claimed. The tool and seal activities of this step must
+       * publish under it, so it travels with the calls instead of being minted again. */
+      readonly owner: string
+    }
+
+export interface ToolCallDrainInput {
+  readonly sessionID: string
+  readonly call: DeferredToolCall
+  readonly owner: string
+}
+
+export interface ToolCallDrainResult {
+  readonly outcome: ToolCallOutcome
+}
+
+export interface SealDrainInput {
+  readonly sessionID: string
+  readonly step: number
+  readonly settlement?: StepSettlement
+  readonly assistantMessageID?: string
+  readonly needsContinuation?: boolean
+  readonly owner: string
+}
+
+export interface SteppedDrainDeps {
+  readonly inSession: InSession
+}
+
+export const makeSteppedDrains = ({ inSession }: SteppedDrainDeps) => {
+  // Only the model call claims the log: it is the writer that supersedes a previous attempt, and
+  // the rest of the step rides its token.
+  const modelCallDrain = async (
+    input: ModelCallDrainInput & { readonly owner: string },
+    signal: AbortSignal,
+  ): Promise<ModelCallDrainResult> =>
+    runAtBoundary(
+      input.sessionID,
+      signal,
+      inSession(input.sessionID, input.owner, { claim: true }, (runner, session) =>
+        runner.runModelCall({
+          sessionID: session.id,
+          step: input.step,
+          promotion: (input.promotion ?? undefined) as SessionInput.Delivery | undefined,
+          first: input.first,
+          force: input.force,
+        }),
+      ).pipe(
+        Effect.map(
+          (result): ModelCallDrainResult =>
+            result === undefined || result.kind === "settled"
+              ? { kind: "settled", result: toStepResult(input.step, result?.result) }
+              : { ...result, owner: input.owner },
+        ),
+      ),
+    )
+
+  const toolCallDrain = async (
+    input: ToolCallDrainInput,
+    signal: AbortSignal,
+    /** Whether a cancellation means the turn is over rather than this attempt being handed on.
+     * Only the first closes the call: a worker shutting down leaves it for the next attempt, which
+     * has to be free to decide whether the tool may run again. */
+    turnEnded: () => boolean = () => false,
+  ): Promise<ToolCallDrainResult> =>
+    runAtBoundary(
+      input.sessionID,
+      signal,
+      inSession(input.sessionID, input.owner, {}, (runner, session) =>
+        runner.runToolCall({ sessionID: session.id, call: input.call }).pipe(
+          // A stop landing mid-tool leaves the call recorded as running, where a whole step closes
+          // the tools it opened before it returns. Nothing else closes it until the next turn's
+          // entry check, so a transcript would show the call still going long after the stop.
+          Effect.onInterrupt(() =>
+            turnEnded()
+              ? runner.failToolCall({ sessionID: session.id, call: input.call }).pipe(Effect.ignore)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.map((result) => result ?? { outcome: "already-settled" as const })),
+    )
+
+  const sealDrain = async (input: SealDrainInput, signal: AbortSignal): Promise<StepDrainResult> =>
+    runAtBoundary(
+      input.sessionID,
+      signal,
+      inSession(input.sessionID, input.owner, {}, (runner, session) =>
+        runner
+          .sealStep({
+            sessionID: session.id,
+            step: input.step,
+            settlement: input.settlement,
+            assistantMessageID: input.assistantMessageID,
+            needsContinuation: input.needsContinuation,
+          })
+          .pipe(Effect.map((result) => toStepResult(input.step, result))),
+      ).pipe(Effect.map((result) => result ?? toStepResult(input.step))),
+    )
+
+  return { modelCallDrain, toolCallDrain, sealDrain }
+}

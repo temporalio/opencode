@@ -21,7 +21,8 @@ import {
   log,
   workflowInfo,
 } from "@temporalio/workflow"
-import type { StepActivities } from "./activities"
+import type { StepActivities, SteppedTurnActivities } from "./activities"
+import { isHaltFailure, makeSteppedTurn } from "./stepped-turn"
 import { SIGNALS, RESUME_UPDATE } from "./protocol"
 import { makeSupervisor, type SupervisorRuntime } from "./supervisor"
 
@@ -37,6 +38,13 @@ const activityOptions = {
 } as const
 
 const { runTurnStep } = proxyActivities<StepActivities>(activityOptions)
+
+// The stepped mode's activities. Each is its own activity, so a tool that hangs, or that waits on
+// a human, no longer holds the provider attempt and its sibling tools under one shared timeout.
+const { runModelCall, runToolCall } = proxyActivities<SteppedTurnActivities>(activityOptions)
+// Sealing is a snapshot, a diff and one event. It should not inherit a turn-sized backstop.
+const sealOptions = { ...activityOptions, startToCloseTimeout: "10 minutes" } as const
+const { sealStep } = proxyActivities<SteppedTurnActivities>(sealOptions)
 
 export const wake = defineSignal(SIGNALS.wake)
 export const interrupt = defineSignal(SIGNALS.interrupt)
@@ -93,6 +101,22 @@ const runtime: SupervisorRuntime = {
   warn: (message, attributes) => log.warn(message, attributes),
 }
 
+// Same supervisor, different step body: wake, interrupt, idle timeout and continue-as-new are
+// unchanged, and only what "one step" means differs. Built per run rather than once, because
+// whether a step's tools may overlap rides the workflow input: the sandbox cannot read env.
+const steppedRuntime = (serial: boolean): SupervisorRuntime => ({
+  ...runtime,
+  runTurnStep: makeSteppedTurn({
+    activities: { runModelCall, runToolCall, sealStep },
+    isCancellation,
+    isHalt: isHaltFailure,
+    serial,
+    nonCancellable: (fn) => CancellationScope.nonCancellable(fn),
+    // The SDK's logger, so a line carries its workflow and run id and is suppressed on replay.
+    log: (message, attributes) => log.info(message, attributes),
+  }),
+})
+
 // The scope of the drain currently running, so an interrupt signal can cancel exactly that turn.
 let activeDrainScope: CancellationScope | undefined
 // The workflow's root scope, captured at entry, to detect a whole-run cancellation.
@@ -107,18 +131,30 @@ const workflows = makeSupervisor(runtime)
 export interface SessionTurnOptions {
   readonly startWithWake?: boolean
   readonly idleTimeout?: string
+  /** Drive each step as a provider attempt, one activity per tool call, and a seal, instead of one
+   * activity for the whole step. Off by default: the whole-step mode is what runs today. */
+  readonly stepped?: boolean
+  /** Run a step's tool calls one at a time. Each ships the tree from the host that ran it, so two
+   * on two hosts each publish a tree without the other's work. The client decides, because only it
+   * can read whether the store is shared. */
+  readonly serialTools?: boolean
 }
 
 export async function sessionTurn(sessionID: string, options?: SessionTurnOptions): Promise<void> {
   rootScope = CancellationScope.current()
   const startWithWake = options?.startWithWake ?? true
   const idleTimeout = options?.idleTimeout
-  if (!idleTimeout) return workflows.sessionTurn(sessionID, startWithWake)
+  const stepped = options?.stepped === true
+  const serialTools = options?.serialTools === true
+  if (!idleTimeout && !stepped) return workflows.sessionTurn(sessionID, startWithWake)
   return makeSupervisor(
     {
-      ...runtime,
-      continueAsNew: (id, wake) => continueAsNew<typeof sessionTurn>(id, { startWithWake: wake, idleTimeout }),
+      ...(stepped ? steppedRuntime(serialTools) : runtime),
+      // The mode has to survive the boundary, or a long session silently reverts to whole-step
+      // activities the first time it rolls over.
+      continueAsNew: (id, wake) =>
+        continueAsNew<typeof sessionTurn>(id, { startWithWake: wake, idleTimeout, stepped, serialTools }),
     },
-    { idleTimeout },
+    idleTimeout ? { idleTimeout } : undefined,
   ).sessionTurn(sessionID, startWithWake)
 }

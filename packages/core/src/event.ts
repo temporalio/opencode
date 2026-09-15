@@ -3,7 +3,7 @@ export * as EventV2 from "./event"
 import { Cause, Context, Duration, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
-import { and, asc, eq, gt, inArray } from "drizzle-orm"
+import { and, asc, eq, gt, inArray, isNull } from "drizzle-orm"
 import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { Flag } from "./flag/flag"
@@ -182,6 +182,39 @@ export interface LayerOptions {
    * Zero (the default) relies on the wake alone, which is the whole story for a deployment that
    * runs in one process. */
   readonly livePollInterval?: Duration.Input
+}
+
+// Same-run tokens order retries and generated activity IDs. Cross-run age needs a separate epoch.
+const supersededBy = (held: string, claimer: string): boolean => {
+  const split = (token: string) => {
+    const cut = token.lastIndexOf(":")
+    const head = token.slice(0, cut)
+    const idAt = head.lastIndexOf(":")
+    const id = head.slice(idAt + 1)
+    return {
+      run: head.slice(0, idAt),
+      id,
+      // Temporal hands out activity ids as an increasing sequence within a run, so they order the
+      // units of work. A token from an earlier step is a zombie, whatever its attempt number says.
+      activity: Number(id),
+      attempt: Number(token.slice(cut + 1)),
+    }
+  }
+  const a = split(held)
+  const b = split(claimer)
+  // Different runs cannot be ordered from the tokens alone, and a continue-as-new legitimately
+  // starts a new one, so those are allowed through. A zombie from a run that rolled over is the
+  // case this does not cover.
+  if (a.run !== b.run) return false
+  const ordered = Number.isInteger(a.activity) && Number.isInteger(b.activity)
+  // Activity ids are an increasing sequence when Temporal assigns them, but a caller may set its
+  // own. Without numbers to compare, two different units of work cannot be ordered, and only two
+  // attempts of the same one can.
+  if (ordered && a.activity !== b.activity) return a.activity > b.activity
+  // Compared as written, not as parsed: two ids that are not numbers both parse to NaN, which
+  // reads as equal and would make every later activity look like a retry of the one before it.
+  if (!ordered && a.id !== b.id) return false
+  return Number.isInteger(a.attempt) && Number.isInteger(b.attempt) && a.attempt > b.attempt
 }
 
 /** Chosen to be well under what a person notices in a transcript while staying one cheap indexed
@@ -568,13 +601,64 @@ export const layerWith = (options?: LayerOptions) =>
           .pipe(Effect.orDie)
       }
 
+      // A compare and set, not a write. Two attempts of one activity can be alive at once and they
+      // do not arrive in order: a paused attempt 1 that resumes after attempt 2 has claimed must not
+      // take the log back, or every publish from attempt 2's tool activities dies on the fence for
+      // a step that is going fine.
       function claim(aggregateID: string, ownerID: string) {
-        return db
-          .update(EventSequenceTable)
-          .set({ owner_id: ownerID })
-          .where(eq(EventSequenceTable.aggregate_id, aggregateID))
-          .run()
-          .pipe(Effect.orDie)
+        return Effect.gen(function* () {
+          const row = yield* db
+            .select({ ownerID: EventSequenceTable.owner_id })
+            .from(EventSequenceTable)
+            .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+            .get()
+            .pipe(Effect.orDie)
+          // No sequence row yet, so there is nothing to fence and nothing to lose a race to: the
+          // first publish inserts the row with this owner on it.
+          if (row === undefined) return
+          if (row.ownerID != null && supersededBy(row.ownerID, ownerID)) {
+            yield* Effect.die(
+              new InvalidDurableEventError({
+                type: "session.claim",
+                message: `Stale claim for aggregate ${aggregateID}: held by ${row.ownerID}, claimer ${ownerID}`,
+              }),
+            )
+          }
+          // Conditional on what was just read, because the read and the write are two statements
+          // and over a network store they are two requests. Two attempts of one activity reaching
+          // here together both pass the check above, and an unconditional write would let the loser
+          // land last and fence out the winner's tools.
+          yield* db
+            .update(EventSequenceTable)
+            .set({ owner_id: ownerID })
+            .where(
+              and(
+                eq(EventSequenceTable.aggregate_id, aggregateID),
+                row.ownerID == null
+                  ? isNull(EventSequenceTable.owner_id)
+                  : eq(EventSequenceTable.owner_id, row.ownerID),
+              ),
+            )
+            .run()
+            .pipe(Effect.orDie)
+          // Read back rather than trusting a driver-specific affected-row count. Losing means
+          // somebody claimed between the two statements, and a loser that carried on would publish
+          // under a token the fence rejects.
+          const after = yield* db
+            .select({ ownerID: EventSequenceTable.owner_id })
+            .from(EventSequenceTable)
+            .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+            .get()
+            .pipe(Effect.orDie)
+          if (after?.ownerID !== ownerID) {
+            yield* Effect.die(
+              new InvalidDurableEventError({
+                type: "session.claim",
+                message: `Lost the claim for aggregate ${aggregateID}: held by ${after?.ownerID}, claimer ${ownerID}`,
+              }),
+            )
+          }
+        })
       }
 
       const subscribe = <D extends Definition>(definition: D): Stream.Stream<Payload<D>> =>

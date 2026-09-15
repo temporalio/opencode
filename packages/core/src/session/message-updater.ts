@@ -208,6 +208,10 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
       },
       "session.next.step.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+          // A step's writers share one owner token, so two seal attempts are both admitted. The
+          // tool cases guard on status; this one has to guard on the step already being closed, or
+          // a late attempt overwrites the end snapshot and file diff with a different instant.
+          if (draft.time.completed) return
           draft.time.completed = event.data.timestamp
           draft.finish = event.data.finish
           draft.cost = event.data.cost

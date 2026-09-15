@@ -773,6 +773,41 @@ describe("EventV2", () => {
     }),
   )
 
+  // Two attempts of one activity can be alive at once, and they do not arrive in order. A paused
+  // attempt 1 resuming after attempt 2 has claimed must not take the log back, or it fences out the
+  // tool activities of the step that is going.
+  it.effect("a resumed earlier attempt cannot take the log back", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      yield* events.publish(DurableMessage, durableData(aggregateID, "seed"))
+
+      // Activity ids as Temporal writes them: an increasing sequence within the run.
+      yield* events.claim(aggregateID, "run:11:1")
+      yield* events.claim(aggregateID, "run:11:2")
+      const stale = yield* events.claim(aggregateID, "run:11:1").pipe(Effect.exit)
+      expect(Exit.isFailure(stale)).toBe(true)
+
+      const { db } = yield* Database.Service
+      const row = yield* db
+        .select({ ownerID: EventSequenceTable.owner_id })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+        .get()
+      expect(row?.ownerID).toBe("run:11:2")
+
+      // A later activity is a different unit of work, so it still takes the log: this is the seal
+      // claiming after the model call, not a zombie.
+      yield* events.claim(aggregateID, "run:12:1")
+
+      // And an earlier one never does, whatever its attempt says. A model call paused before it
+      // claimed, with three steps completing under other activity ids while it was away, used to
+      // come back and fence out the step that was actually running.
+      const fromAnEarlierStep = yield* events.claim(aggregateID, "run:4:1").pipe(Effect.exit)
+      expect(Exit.isFailure(fromAnEarlierStep)).toBe(true)
+    }),
+  )
+
   it.effect("claim fences replay owners", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
@@ -1128,6 +1163,45 @@ describe("EventV2", () => {
         durableData(aggregateID, "seed").messageID,
         durableData(aggregateID, "fresh").messageID,
       ])
+    }),
+  )
+
+  it.effect("admits every writer holding the claimed token, concurrently", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      // One step's writers share the token its model attempt claimed: the model call, each tool
+      // call, and the seal. They run as separate activities, so the fence has to admit all of them
+      // while still rejecting the attempt they superseded.
+      const step = "run-1:model-1:1"
+      const superseded = "run-1:model-1:0"
+
+      yield* events.claim(aggregateID, step)
+      yield* Effect.all(
+        ["model", "tool-a", "tool-b", "seal"].map((writer) =>
+          events
+            .publish(DurableMessage, durableData(aggregateID, writer))
+            .pipe(Effect.provideService(EventV2.EventOwner, step)),
+        ),
+        { concurrency: "unbounded" },
+      )
+      const stale = yield* events
+        .publish(DurableMessage, durableData(aggregateID, "zombie"))
+        .pipe(Effect.provideService(EventV2.EventOwner, superseded), Effect.exit)
+
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(String(stale)).toContain("Owner fence")
+      expect(rows.map((row) => row.seq)).toEqual([0, 1, 2, 3])
+      expect(rows.map((row) => (row.data as { messageID: string }).messageID).sort()).toEqual(
+        ["model", "tool-a", "tool-b", "seal"].map((writer) => durableData(aggregateID, writer).messageID).sort(),
+      )
     }),
   )
 

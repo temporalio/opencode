@@ -1,7 +1,3 @@
-// Faithful round-trip of a SessionRunner.RunError across the Temporal boundary. Every member of the
-// union is a Schema.TaggedErrorClass, so we can encode the error to JSON in the activity and decode
-// it back into the exact tagged instance in the layer, instead of flattening it to a carrier.
-
 import { Schema } from "effect"
 import { LLMError } from "@opencode-ai/llm"
 import { Integration } from "@opencode-ai/core/integration"
