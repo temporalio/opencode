@@ -32,6 +32,7 @@
     "@babel/core": "7.28.4",
     "@octokit/webhooks-types": "7.6.1",
     "@opencode-ai/core": "workspace:*",
+    "@opencode-ai/temporal": "workspace:*",
     "@opencode-ai/http-recorder": "workspace:*",
     "@opencode-ai/script": "workspace:*",
     "@standard-schema/spec": "1.0.0",

@@ -62,6 +62,9 @@ session runs as the workflow `session-exec-<sessionID>`.
 | `OPENCODE_TEMPORAL_WORKTREE_AFFINITY`, `OPENCODE_TEMPORAL_WORKTREE` | off | `1` routes a session to the workers serving its project tree, named by the second variable. |
 | `OPENCODE_TEMPORAL_STEP_AFFINITY` | on | Send a step's tool calls and seal back to the worker that made its model call. `0` turns it off. |
 | `OPENCODE_TEMPORAL_SERIAL_TOOLS` | derived | Run a step's tool calls one at a time. On by default only where two hosts could write one step's tree: a shared store with neither kind of affinity. |
+| `OPENCODE_TEMPORAL_PROFILE` | `local` | `fleet` sets the defaults a multi-host deployment needs and refuses combinations that cannot work. See below. |
+| `OPENCODE_TEMPORAL_API_KEY`, `OPENCODE_TEMPORAL_API_KEY_FILE` | | Temporal Cloud credentials, the second read from a file. |
+| `OPENCODE_TEMPORAL_TLS_CERT`, `OPENCODE_TEMPORAL_TLS_KEY`, `OPENCODE_TEMPORAL_TLS_CA` | | A certificate pair for a cluster with mTLS. `OPENCODE_TEMPORAL_TLS=1` for TLS without a client certificate. |
 | `OPENCODE_EVENT_POLL_MS` | | How often a live subscriber re-reads the log for events another process appended. `0` turns the tick off. |
 | `OPENCODE_DB` | | One absolute path shared by every process on a host. |
 | `OPENCODE_DB_URL`, `OPENCODE_DB_AUTH_TOKEN` | | A libSQL URL for a store shared across hosts. Takes precedence over `OPENCODE_DB`. |
@@ -260,3 +263,29 @@ One rule bounds what the rebuild may touch, because checking a stored tree out o
 destroys work: a tree is moved only when a host-local note (`snapshot/tip.ts`) says this host is
 behind the store, so a host holding a capture that never shipped is left alone. Packs are ordered
 by their chain, not by `time_created`, because hosts do not agree on the time.
+
+## Picking a deployment rather than assembling one
+
+The settings are not independent, and getting them wrong fails as something else later: a store
+only one process can see reads as a worker that never picks anything up. `OPENCODE_TEMPORAL_PROFILE`
+picks one deployment and the rest follow.
+
+| | `local` (default) | `fleet` |
+|---|---|---|
+| what it is | one serve, worker inside it | serve processes and workers, separate |
+| store | this process only | you set `OPENCODE_DB_URL` |
+| role | `both` | `client` for serve, `worker` for workers |
+| unit of work | a whole step | the model call, each tool call, the seal |
+
+Individual settings override the profile's defaults. `opencode session doctor` prints what this
+process resolved and refuses what cannot work: a fleet without a shared store, a serve that also
+polls, an API key pointed at a dev server, half a certificate pair. It checks one process; it does
+not compare processes or probe another host's store.
+
+```bash
+TEMPORAL_ADDRESS=your-ns.a1b2c.tmprl.cloud:7233 TEMPORAL_NAMESPACE=your-ns.a1b2c \
+  OPENCODE_TEMPORAL_API_KEY_FILE=/run/secrets/temporal-key     # Temporal Cloud
+TEMPORAL_ADDRESS=temporal.internal:7233 \
+  OPENCODE_TEMPORAL_TLS_CERT=/run/secrets/tls.crt \
+  OPENCODE_TEMPORAL_TLS_KEY=/run/secrets/tls.key               # a cluster with mTLS
+```
