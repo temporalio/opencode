@@ -17,6 +17,7 @@ import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { makeStepActivities, makeSteppedTurnActivities } from "./activities"
 import { makeDrains } from "./drain"
 import { makeSteppedDrains } from "./stepped-drain"
+import { makeScheduleDrains } from "./schedule-drain"
 import { queueForWorktree, queueForWorker } from "./queue"
 import { Database } from "@opencode-ai/core/database/database"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -115,6 +116,9 @@ const layer = Layer.effect(
     // The stepped mode's three drains. Registered unconditionally: which mode a session runs is a
     // property of its workflow input, so a worker has to be able to serve either.
     const stepped = makeSteppedDrains({ inSession: drains.inSession, stepQueue: STEP_QUEUE })
+    // What a schedule fires into: admitting a prompt is a row in the store, and a workflow cannot
+    // write one. Registered on every worker, because a firing lands wherever one is polling.
+    const schedules = makeScheduleDrains({ db, events })
 
     // Worker connection (native) hosts the runTurnStep activity + the workflow. Skipped in
     // client-only role so serve can run without an embedded worker.
@@ -137,7 +141,11 @@ const layer = Layer.effect(
           namespace: NAMESPACE,
           taskQueue: POLL_QUEUE,
           workflowsPath: fileURLToPath(new URL("./workflow.ts", import.meta.url)),
-          activities: { ...makeStepActivities(drains.stepDrain), ...makeSteppedTurnActivities(stepped) },
+          activities: {
+            ...makeStepActivities(drains.stepDrain),
+            ...makeSteppedTurnActivities(stepped),
+            promptSession: schedules.promptDrain,
+          },
         }),
       )
       const runHandle = worker.run()
@@ -159,7 +167,11 @@ const layer = Layer.effect(
             connection: nativeConn,
             namespace: NAMESPACE,
             taskQueue: STEP_QUEUE,
-            activities: { ...makeStepActivities(drains.stepDrain), ...makeSteppedTurnActivities(stepped) },
+            activities: {
+              ...makeStepActivities(drains.stepDrain),
+              ...makeSteppedTurnActivities(stepped),
+              promptSession: schedules.promptDrain,
+            },
           }),
         )
         const pinnedHandle = pinnedWorker.run()

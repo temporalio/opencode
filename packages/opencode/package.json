@@ -33,6 +33,8 @@
     "@octokit/webhooks-types": "7.6.1",
     "@opencode-ai/core": "workspace:*",
     "@opencode-ai/temporal": "workspace:*",
+    "@temporalio/client": "^1.21.0",
+    "@temporalio/common": "^1.21.0",
     "@opencode-ai/http-recorder": "workspace:*",
     "@opencode-ai/script": "workspace:*",
     "@standard-schema/spec": "1.0.0",

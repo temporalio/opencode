@@ -281,6 +281,9 @@ opencode session running --attach http://gateway:4096
 
 # follow one from anywhere, and stop when the turn stops
 opencode session watch ses_abc123 --attach http://gateway:4096
+
+# a turn nobody starts: the firing needs no client and no serve process
+opencode session schedule "review yesterday's merges" --cron "0 9 * * *" --attach http://gateway:4096
 ```
 
 `--attach` takes any serve in the deployment, because they are interchangeable: each reads the same
@@ -292,6 +295,11 @@ turn's own ending, `session.next.turn.ended`, which is durable so that a process
 can read it from the replayable stream. A turn the user stopped or a provider error ended publishes
 no ordinary ending, so `watch` also asks the running set on a slow poll, the one reading that can
 end a follow without being able to hang one.
+
+`schedule` creates a Temporal schedule whose firing runs a workflow that admits the prompt itself
+and starts the session's supervisor, so at firing time there is no client and no serve process. The
+prompt is admitted as queued, so a firing that lands while the last turn is still working is drained
+when that turn ends, and overlapping firings are skipped rather than stacked.
 
 ### Picking a deployment rather than assembling one
 
@@ -341,5 +349,5 @@ an outcome query or a person to decide what happened.
 
 `scripts/detached-session-check.sh` runs the client story against a Temporal dev server, one
 standalone worker, two serve processes and one shared store: a turn started on serve A survives A
-being killed mid-tool, serve B replays it, and `start`, `running` and `watch` work from a cold
-client. It needs an OpenAI key and does not run in CI.
+being killed mid-tool, serve B replays it, and `start`, `running`, `watch` and `schedule` work from
+a cold client. It needs an OpenAI key and does not run in CI.

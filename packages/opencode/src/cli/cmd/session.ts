@@ -1,7 +1,13 @@
 import type { Argv } from "yargs"
 import { Effect } from "effect"
 import { cmd } from "./cmd"
-import { SessionDoctorCommand, SessionRunningCommand, SessionStartCommand, SessionWatchCommand } from "./detached"
+import {
+  SessionDoctorCommand,
+  SessionRunningCommand,
+  SessionScheduleCommand,
+  SessionStartCommand,
+  SessionWatchCommand,
+} from "./detached"
 import { effectCmd, fail } from "../effect-cmd"
 import { Session } from "@/session/session"
 import { SessionID } from "../../session/schema"
@@ -52,6 +58,7 @@ export const SessionCommand = cmd({
       .command(SessionStartCommand)
       .command(SessionRunningCommand)
       .command(SessionWatchCommand)
+      .command(SessionScheduleCommand)
       .command(SessionDoctorCommand)
       .demandCommand(),
   async handler() {},
