@@ -10,7 +10,7 @@ import os from "node:os"
 import path from "path"
 import { Cause, Context, Effect, Layer } from "effect"
 import { ChildProcess } from "effect/unstable/process"
-import { desc, eq } from "drizzle-orm"
+import { eq } from "drizzle-orm"
 import { Database } from "./database/database"
 import { makeLocationNode } from "./effect/app-node"
 import { FSUtil } from "./fs-util"
@@ -21,10 +21,12 @@ import { AppProcess } from "./process"
 import { AbsolutePath } from "./schema"
 import type { Snapshot } from "./snapshot"
 import { SnapshotPackTable } from "./snapshot/sql"
+import { chainHead } from "./snapshot/chain"
+import { readWorktreeTip, writeWorktreeTip } from "./snapshot/tip"
 import { Hash } from "./util/hash"
 
 export interface Interface {
-  /** Ship a captured tree to the shared store as an incremental pack. Never fails the caller. */
+  /** A stale tip fails the caller; packing and insertion errors are logged. */
   readonly push: (tree: Snapshot.ID) => Effect.Effect<void>
 }
 
@@ -61,19 +63,39 @@ const layer = Layer.effect(
         { stdin },
       )
 
+    // The newest state the store holds for this worktree, read off the chain the packs form rather
+    // than off `time_created`, which is whichever host wrote the row.
+    const newest = () =>
+      db
+        .select()
+        .from(SnapshotPackTable)
+        .where(eq(SnapshotPackTable.worktree, worktree))
+        .all()
+        .pipe(Effect.orDie, Effect.map(chainHead))
+
     const push = Effect.fn("SnapshotSync.push")(function* (tree: Snapshot.ID) {
+      // A host that has not caught up must not publish its older files as the next tree.
+      // This reading is not an atomic head claim and does not fence concurrent publishers.
+      if (source) {
+        const stoodOn = yield* readWorktreeTip(global.data, worktree)
+        const ahead = yield* newest()
+        if (ahead && ahead.tree !== tree && stoodOn !== ahead.tree) {
+          yield* Effect.die(
+            new Error(
+              `refusing to ship ${worktree}: this host stood on ${stoodOn ?? "nothing"}, ` +
+                `and the store is at ${ahead.tree}`,
+            ),
+          )
+        }
+      }
       yield* Effect.gen(function* () {
         if (!source) return
-        const latest = yield* db
-          .select()
-          .from(SnapshotPackTable)
-          .where(eq(SnapshotPackTable.worktree, worktree))
-          .orderBy(desc(SnapshotPackTable.time_created))
-          .limit(1)
-          .get()
-          .pipe(Effect.orDie)
-        // The newest shipped state already is this tree: nothing to pack.
-        if (latest?.tree === tree) return
+        const latest = yield* newest()
+        // The newest shipped state already is this tree: nothing to pack, and the note is true.
+        if (latest?.tree === tree) {
+          yield* writeWorktreeTip(global.data, worktree, tree)
+          return
+        }
         // Chain onto the previous sync commit only when this host has it; a base absent locally
         // would produce a delta pack the pack builder cannot compute.
         const base =
@@ -107,6 +129,8 @@ const layer = Layer.effect(
           .onConflictDoNothing()
           .run()
           .pipe(Effect.orDie)
+        // A note must not name a state whose insertion failed.
+        yield* writeWorktreeTip(global.data, worktree, tree)
       }).pipe(
         Effect.catchCauseIf(
           (cause) => !Cause.hasInterrupts(cause),

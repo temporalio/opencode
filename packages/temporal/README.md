@@ -181,3 +181,8 @@ Host-local state that does not ride the store: the snapshot object store and the
 tool-output files under the data directory. The runner never reads these to rebuild context; they
 only affect the diff, restore and full-output features. Point the data directory at shared storage
 to make them portable.
+
+One rule bounds what the rebuild may touch, because checking a stored tree out over the wrong one
+destroys work: a tree is moved only when a host-local note (`snapshot/tip.ts`) says this host is
+behind the store, so a host holding a capture that never shipped is left alone. Packs are ordered
+by their chain, not by `time_created`, because hosts do not agree on the time.
