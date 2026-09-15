@@ -514,6 +514,15 @@ const layer = Layer.effect(
       if (steer) return { continue: true, step: step + 1, promotion: "steer" as SessionInput.Delivery }
       const queue = yield* SessionInput.hasPending(db, sessionID, "queue")
       if (queue) return { continue: true, step: 1, promotion: "queue" as SessionInput.Delivery }
+      // A step ending is not a turn ending, because a steer or a queued prompt continues the same
+      // turn through another step. This is the one place that knows the turn is over, for both
+      // modes. Only the ordinary ending: a turn the user stopped, or one a provider error ended,
+      // does not reach here, so a follower still needs its other reasons to stop waiting.
+      yield* events.publish(SessionEvent.Turn.Ended, {
+        sessionID,
+        timestamp: yield* DateTime.now,
+        finish: "stop",
+      })
       return { continue: false, step: step + 1, promotion: undefined }
     })
 

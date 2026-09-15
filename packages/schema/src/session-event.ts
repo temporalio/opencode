@@ -145,6 +145,24 @@ export namespace Shell {
   export type Ended = typeof Ended.Type
 }
 
+// The turn, as opposed to the steps it was made of. A step ending is not a turn ending: a steer or
+// a queued prompt continues the same turn through another step, so a follower cannot tell the two
+// apart from a finish reason. Durable, because the follower that needs it is another process
+// reading the replayable stream, which is built from the rows and nothing else.
+export namespace Turn {
+  export const Ended = Event.define({
+    type: "session.next.turn.ended",
+    ...options,
+    schema: {
+      ...Base,
+      // What the last step of the turn came to, so a follower can say why it stopped rather than
+      // only that it did.
+      finish: Schema.String,
+    },
+  })
+  export type Ended = typeof Ended.Type
+}
+
 export namespace Step {
   export const Started = Event.define({
     type: "session.next.step.started",
@@ -458,6 +476,7 @@ export const DurableDefinitions = Event.inventory(
   Step.Started,
   Step.Ended,
   Step.Failed,
+  Turn.Ended,
   Text.Started,
   Text.Ended,
   Tool.Input.Started,

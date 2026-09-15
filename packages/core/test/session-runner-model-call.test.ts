@@ -34,7 +34,7 @@ import { eq } from "drizzle-orm"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
 import { Auth } from "@opencode-ai/llm/route"
 import { describe, expect, spyOn } from "bun:test"
-import { Cause, DateTime, Deferred, Effect, Exit, Layer, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import { emptyStep, runnerHarness, seedSession } from "./lib/runner-harness"
 
 // One tool call, then a clean finish: the shape a step that wants to keep going produces.
@@ -307,6 +307,25 @@ describe("SessionRunner model-only attempt", () => {
       const context = yield* store.context(sessionID)
       expect(toolStatus(context, "call_probe")).toBe("completed")
       expect(closed(context)).toBe(true)
+    }),
+  )
+
+  // A step ending is not a turn ending: a steer or a queued prompt continues the same turn through
+  // another step, so the one place that decides publishes the turn's own ending.
+  runnerHarness(textOnly).effect("says the turn ended, once, when nothing follows it", () =>
+    Effect.gen(function* () {
+      yield* seedSession(sessionID)
+      const events = yield* EventV2.Service
+      const ended = yield* events
+        .subscribe(SessionEvent.Turn.Ended)
+        .pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped)
+      const runner = yield* SessionRunner.Service
+
+      yield* runner.runStep({ sessionID, step: 2, promotion: undefined, first: false, force: false })
+
+      const seen = yield* Fiber.join(ended)
+      expect(seen.length).toBe(1)
+      expect(seen[0]?.data.sessionID).toBe(sessionID)
     }),
   )
 })

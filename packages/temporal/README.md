@@ -66,6 +66,7 @@ session runs as the workflow `session-exec-<sessionID>`.
 | `OPENCODE_TEMPORAL_API_KEY`, `OPENCODE_TEMPORAL_API_KEY_FILE` | | Temporal Cloud credentials, the second read from a file. |
 | `OPENCODE_TEMPORAL_TLS_CERT`, `OPENCODE_TEMPORAL_TLS_KEY`, `OPENCODE_TEMPORAL_TLS_CA` | | A certificate pair for a cluster with mTLS. `OPENCODE_TEMPORAL_TLS=1` for TLS without a client certificate. |
 | `OPENCODE_EVENT_POLL_MS` | | How often a live subscriber re-reads the log for events another process appended. `0` turns the tick off. |
+| `OPENCODE_WATCH_POLL_MS` | 30000 | How often `session watch` asks the running set whether the turn ended in a gap it could not see. |
 | `OPENCODE_DB` | | One absolute path shared by every process on a host. |
 | `OPENCODE_DB_URL`, `OPENCODE_DB_AUTH_TOKEN` | | A libSQL URL for a store shared across hosts. Takes precedence over `OPENCODE_DB`. |
 
@@ -264,7 +265,35 @@ destroys work: a tree is moved only when a host-local note (`snapshot/tip.ts`) s
 behind the store, so a host holding a capture that never shipped is left alone. Packs are ordered
 by their chain, not by `time_created`, because hosts do not agree on the time.
 
-## Picking a deployment rather than assembling one
+## A session that outlives its client
+
+The pieces above make a session survive a worker. Together they make it survive the client: start
+something, close the laptop, and pick it up from a machine that has never seen it. A session is a
+workflow rather than a process, the running set comes from Temporal visibility, the store is
+shared, and a live tail re-reads. What was missing was a way to say so from a command line:
+
+```bash
+# hand over a prompt and walk away; prints the session id and exits
+opencode session start "port the auth module to the new API" --attach http://gateway:4096
+
+# what this deployment is running right now, across every client that ever connected
+opencode session running --attach http://gateway:4096
+
+# follow one from anywhere, and stop when the turn stops
+opencode session watch ses_abc123 --attach http://gateway:4096
+```
+
+`--attach` takes any serve in the deployment, because they are interchangeable: each reads the same
+store and signals the same workflows. `$OPENCODE_SERVER` sets the endpoint once. For an interactive
+terminal rather than a follower, `opencode attach <url> --session <id>` puts the TUI on the session.
+
+`start`, `running` and `watch` are plain HTTP clients. `watch` exits when the runner publishes the
+turn's own ending, `session.next.turn.ended`, which is durable so that a process on another host
+can read it from the replayable stream. A turn the user stopped or a provider error ended publishes
+no ordinary ending, so `watch` also asks the running set on a slow poll, the one reading that can
+end a follow without being able to hang one.
+
+### Picking a deployment rather than assembling one
 
 The settings are not independent, and getting them wrong fails as something else later: a store
 only one process can see reads as a worker that never picks anything up. `OPENCODE_TEMPORAL_PROFILE`
@@ -289,3 +318,28 @@ TEMPORAL_ADDRESS=temporal.internal:7233 \
   OPENCODE_TEMPORAL_TLS_CERT=/run/secrets/tls.crt \
   OPENCODE_TEMPORAL_TLS_KEY=/run/secrets/tls.key               # a cluster with mTLS
 ```
+
+### What recovers on its own, and what needs a person
+
+| Failure | Local executor | Temporal executor |
+|---|---|---|
+| Process dies mid-turn | Nothing restarts it; a later `resume` reads the record | The step's activities retry. A started pinned tool call stays with its host; its step is closed on the shared queue and the turn goes on |
+| Tool outcome is absent | Completed results are kept, declared-idempotent tools run again, other started calls are reported unknown | The same runner rule |
+| Two dispatches read one pending call | One coordinator serializes its own turn | One deterministic admission event admits one dispatch; idempotent tools may run again |
+| Attempts overlap | One process | Same-run owner tokens fence later appends; a step's tools and seal share their model call's token |
+| User stops the turn | The coordinator cancels its run | The drain is cancelled and the supervisor keeps serving; a declined permission is a halt, not a failed tool |
+| Restart during an approval or question | The pending row is kept; execution has to be restarted | A retried ask adopts the row and can be answered from another process |
+| A behind host publishes files | Not reachable | Refused: the pack store checks the chain and the owner token |
+| A fresh worker receives a project | Needs the directory | Packs rebuild the tracked files at the recorded path; ignored files do not travel |
+| A turn never stops stepping | The coordinator's own loop | The supervisor stops after 200 steps and says so |
+
+An unknown tool outcome is a loss of evidence, not proof that the tool stopped or failed. The model
+can ask for a new call after reading it. A non-idempotent external effect needs an idempotency key,
+an outcome query or a person to decide what happened.
+
+### Checks that need real processes
+
+`scripts/detached-session-check.sh` runs the client story against a Temporal dev server, one
+standalone worker, two serve processes and one shared store: a turn started on serve A survives A
+being killed mid-tool, serve B replays it, and `start`, `running` and `watch` work from a cold
+client. It needs an OpenAI key and does not run in CI.
