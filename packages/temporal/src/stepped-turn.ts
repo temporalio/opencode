@@ -10,7 +10,7 @@
 // because a workflow cannot consume a stream. The tools of one step still run concurrently with
 // each other; what is lost is the overlap between the model and its own tools.
 
-import { ActivityFailure, type ApplicationFailure } from "@temporalio/workflow"
+import { ActivityFailure, type ApplicationFailure, TimeoutFailure } from "@temporalio/workflow"
 import { HALTED_FAILURE_TYPE } from "./protocol"
 import type { StepDrainInput, StepDrainResult } from "./drain"
 import type {
@@ -31,6 +31,13 @@ import type {
  */
 export const isHaltFailure = (error: unknown) =>
   error instanceof ActivityFailure && (error.cause as ApplicationFailure | undefined)?.type === HALTED_FAILURE_TYPE
+
+// This permits migration only when pinned dispatches have no automatic retries.
+// A later attempt can time out in the queue after an earlier attempt took effect.
+export const isUnclaimedFailure = (error: unknown) =>
+  error instanceof ActivityFailure &&
+  error.cause instanceof TimeoutFailure &&
+  error.cause.timeoutType === "SCHEDULE_TO_START"
 
 /** The three activities a stepped turn drives. */
 export interface SteppedActivities {
@@ -54,8 +61,14 @@ export interface SteppedTurnDeps {
   readonly log?: (message: string, attributes: Record<string, unknown>) => void
   /** Run the calls one at a time. Each tool ships the tree from the host that ran it, so two on two
    * hosts each publish a tree without the other's work and the second is refused, leaving its work
-   * stranded there. Serial is what moving files between hosts costs. */
+   * stranded there. Serial is what moving files between hosts costs, and it is what pinning a
+   * step's tools to one worker buys back. */
   readonly serial?: boolean
+  /** The same activities, addressed to one worker's own queue. A step's tools write the tree the
+   * model call's worker is standing in, so keeping them there is what lets them run at once: they
+   * see each other's writes through the filesystem rather than through the store. Only offered a
+   * queue the model call reported. Only a dispatch that queue never started may move off it. */
+  readonly pinnedTo?: (queue: string) => Pick<SteppedActivities, "runToolCall" | "sealStep">
   /** Run something where the driver's cancellation cannot reach it. An interrupt landing during the
    * tool phase otherwise leaves the step with no ending published at all, so a follower waiting on
    * the turn never hears it stop. */
@@ -67,18 +80,81 @@ export interface SteppedTurnDeps {
  * of a whole-step activity.
  */
 export const makeSteppedTurn =
-  ({ activities, isCancellation, isHalt, log, serial, nonCancellable }: SteppedTurnDeps) =>
+  ({ activities, isCancellation, isHalt, log, serial, nonCancellable, pinnedTo }: SteppedTurnDeps) =>
   async (input: StepDrainInput): Promise<StepDrainResult> => {
     const model = await activities.runModelCall(input)
     // A crashed step finalized from the log, or the recovery gate finding no work: the step is over
     // and there is nothing to dispatch or seal.
     if (model.kind === "settled") return model.result
 
+    // The worker that made the model call, when it offered its own queue. Everything else in this
+    // step goes to it first, because it is the host holding the tree the tools are about to write.
+    const pinned = model.queue && pinnedTo ? pinnedTo(model.queue) : undefined
+    let unclaimed = false
+    let uncertain: { error: unknown } | undefined
+    let stopped: { error: unknown } | undefined
+    const observeStop = (error: unknown): never => {
+      if (isCancellation(error) || isHalt(error)) stopped = { error }
+      throw error
+    }
+    // Shared dispatches must wait for the pinned batch because the hosts do not share a worktree.
+    let shared: Promise<unknown> = Promise.resolve()
+    const pendingPins = new Set<Promise<unknown>>()
+    const onShared = <A>(run: (on: SteppedActivities) => Promise<A>, allowStopped = false): Promise<A> => {
+      const next = shared.then(async () => {
+        // Queue saturation can leave a sibling running on the pinned host.
+        await Promise.allSettled(pendingPins)
+        if (uncertain) throw uncertain.error
+        if (stopped && !allowStopped) throw stopped.error
+        return run(activities).catch(observeStop)
+      })
+      shared = next.then(
+        () => undefined,
+        () => undefined,
+      )
+      return next
+    }
+    // A timeout settles the workflow promise; it does not stop the tool process behind it. So a
+    // pinned attempt that started is not evidence that its directory is free, and the rest of the
+    // step stays off that host until the process is known to have stopped or its workspace is its
+    // own. Only a dispatch nobody started moves, and only after every pinned sibling has settled.
+    const viaPinned = async <A>(
+      run: (on: Pick<SteppedActivities, "runToolCall" | "sealStep">) => Promise<A>,
+      allowStopped = false,
+    ): Promise<A> => {
+      if (stopped && !allowStopped) throw stopped.error
+      if (uncertain) throw uncertain.error
+      if (!pinned) return run(activities).catch(observeStop)
+      if (unclaimed) return onShared(run, allowStopped)
+      const attempt = run(pinned)
+      pendingPins.add(attempt)
+      try {
+        return await attempt
+      } catch (error) {
+        if (isCancellation(error) || isHalt(error)) {
+          stopped = { error }
+          throw error
+        }
+        if (!isUnclaimedFailure(error)) {
+          uncertain = { error }
+          throw error
+        }
+        unclaimed = true
+        log?.("the pinned activity did not start; remaining calls move to the shared queue", {
+          sessionID: input.sessionID,
+          step: model.step,
+        })
+        return onShared(run, allowStopped)
+      } finally {
+        pendingPins.delete(attempt)
+      }
+    }
+
     // Each call is its own unit of work. A tool that fails outright does not take the turn with it:
     // the seal closes its call as an error and the model gets to react, which is better than losing
     // the step. A cancel and a user halt are different, and both have to propagate.
     const dispatch = (call: (typeof model.calls)[number]) =>
-      activities.runToolCall({ sessionID: input.sessionID, call, owner: model.owner })
+      viaPinned((on) => on.runToolCall({ sessionID: input.sessionID, call, owner: model.owner }))
     const dispatched: PromiseSettledResult<ToolCallDrainResult>[] = []
     if (serial) {
       // One at a time, and still settled rather than thrown, so a tool that fails does not take the
@@ -108,7 +184,7 @@ export const makeSteppedTurn =
       needsContinuation: stopped ? false : model.needsContinuation,
       owner: model.owner,
     })
-    const seal = (stopped: boolean) => activities.sealStep(sealing(stopped))
+    const seal = (stopped: boolean) => viaPinned((on) => on.sealStep(sealing(stopped)), stopped)
 
     for (const outcome of dispatched) {
       if (outcome.status !== "rejected") continue

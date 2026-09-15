@@ -30,6 +30,11 @@ export type ModelCallDrainResult =
       /** The event-log token this attempt claimed. The tool and seal activities of this step must
        * publish under it, so it travels with the calls instead of being minted again. */
       readonly owner: string
+      /** The queue this worker polls on its own, when it has one. The tools of this step write the
+       * tree this worker is standing in, so sending them here keeps them on it. Absent when the
+       * worker was not given a queue of its own, and never required: the step falls back to the
+       * shared queue and the tree is rebuilt there. */
+      readonly queue?: string
     }
 
 export interface ToolCallDrainInput {
@@ -53,9 +58,12 @@ export interface SealDrainInput {
 
 export interface SteppedDrainDeps {
   readonly inSession: InSession
+  /** The queue this worker polls on its own, reported by the model call so the rest of the step can
+   * be sent back to it. Absent when the worker has none. */
+  readonly stepQueue?: string
 }
 
-export const makeSteppedDrains = ({ inSession }: SteppedDrainDeps) => {
+export const makeSteppedDrains = ({ inSession, stepQueue }: SteppedDrainDeps) => {
   // Only the model call claims the log: it is the writer that supersedes a previous attempt, and
   // the rest of the step rides its token.
   const modelCallDrain = async (
@@ -78,7 +86,7 @@ export const makeSteppedDrains = ({ inSession }: SteppedDrainDeps) => {
           (result): ModelCallDrainResult =>
             result === undefined || result.kind === "settled"
               ? { kind: "settled", result: toStepResult(input.step, result?.result) }
-              : { ...result, owner: input.owner },
+              : { ...result, owner: input.owner, ...(stepQueue === undefined ? {} : { queue: stepQueue }) },
         ),
       ),
     )

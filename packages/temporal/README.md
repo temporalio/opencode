@@ -60,7 +60,8 @@ session runs as the workflow `session-exec-<sessionID>`.
 | `OPENCODE_SESSION_IDLE_TIMEOUT` | | How long an idle session's workflow stays open. Local mode honors the same variable. |
 | `OPENCODE_TEMPORAL_STEPPED` | off | `1` runs each step as a model call, one activity per tool call, and a seal. |
 | `OPENCODE_TEMPORAL_WORKTREE_AFFINITY`, `OPENCODE_TEMPORAL_WORKTREE` | off | `1` routes a session to the workers serving its project tree, named by the second variable. |
-| `OPENCODE_TEMPORAL_SERIAL_TOOLS` | derived | Run a step's tool calls one at a time. On by default only where two hosts could write one step's tree: a shared store without affinity. |
+| `OPENCODE_TEMPORAL_STEP_AFFINITY` | on | Send a step's tool calls and seal back to the worker that made its model call. `0` turns it off. |
+| `OPENCODE_TEMPORAL_SERIAL_TOOLS` | derived | Run a step's tool calls one at a time. On by default only where two hosts could write one step's tree: a shared store with neither kind of affinity. |
 | `OPENCODE_EVENT_POLL_MS` | | How often a live subscriber re-reads the log for events another process appended. `0` turns the tick off. |
 | `OPENCODE_DB` | | One absolute path shared by every process on a host. |
 | `OPENCODE_DB_URL`, `OPENCODE_DB_AUTH_TOKEN` | | A libSQL URL for a store shared across hosts. Takes precedence over `OPENCODE_DB`. |
@@ -135,9 +136,12 @@ refusal apart from a tool that failed. The whole-step path still raises it as an
 the behaviour its own tests pin, so that drain says so at the boundary.
 
 Each tool call ships the tree from the host that ran it, because the seal can land on any worker and
-a capture there would miss what the tool wrote. Where two hosts could run one step's tools, they run
-one at a time (`OPENCODE_TEMPORAL_SERIAL_TOOLS`), or the second to ship would publish a tree without
-the first's work.
+a capture there would miss what the tool wrote. By default the tools and the seal of a step are sent
+back to the worker that made its model call, on a queue that worker polls on its own, so they write
+one tree through one filesystem and can run at once; a pin nobody answers falls back to the shared
+queue after a schedule-to-start bound. Where two hosts could still run one step's tools, they run one
+at a time (`OPENCODE_TEMPORAL_SERIAL_TOOLS`), or the second to ship would publish a tree without the
+first's work.
 
 What the split costs is the overlap between the model's stream and its own tools: a whole-step
 activity starts each tool the moment the model asks for it, while here the attempt returns first.

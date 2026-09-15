@@ -32,9 +32,15 @@ export interface Interface {
   /** Run a step's tool calls one at a time instead of together. Tools of one step write the same
    * tree and each ships from the host that ran it, so two on two hosts each publish a tree without
    * the other's work: the second is refused rather than reverting the first, which leaves its work
-   * stranded there. `OPENCODE_TEMPORAL_SERIAL_TOOLS=1` forces it on; it is on by default only where
-   * the store is shared and no affinity keeps a session's tools on one worker. */
+   * stranded there. `OPENCODE_TEMPORAL_SERIAL_TOOLS=1` forces it on; it is not needed while a step
+   * is pinned to one worker, which is the default. */
   readonly serialTools?: boolean
+  /** Send the tools and the seal of a step back to the worker that made its model call, on a queue
+   * that worker polls on its own. That worker is standing in the tree the tools are about to write,
+   * so the step's tools see each other's writes through the filesystem and can run at once. On by
+   * default: a pin nobody answers falls back to the shared queue after a schedule-to-start bound,
+   * so the worst it costs is that wait. `OPENCODE_TEMPORAL_STEP_AFFINITY=0` turns it off. */
+  readonly stepAffinity?: boolean
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/temporal/Config") {}
@@ -43,6 +49,7 @@ const given = (name: string) => process.env[name] !== undefined && process.env[n
 const onOff = (name: string, fallback: boolean) => (given(name) ? process.env[name] === "1" : fallback)
 
 export const fromEnv = (): Interface => {
+  const stepAffinity = process.env.OPENCODE_TEMPORAL_STEP_AFFINITY !== "0"
   const worktreeAffinity = process.env.OPENCODE_TEMPORAL_WORKTREE_AFFINITY === "1"
   const sharedStore = !!process.env.OPENCODE_DB_URL
   return {
@@ -54,8 +61,9 @@ export const fromEnv = (): Interface => {
     stepped: onOff("OPENCODE_TEMPORAL_STEPPED", false),
     worktreeAffinity,
     worktree: process.env.OPENCODE_TEMPORAL_WORKTREE,
-    // Serial by default only where two hosts can end up writing one step's tree: a shared store,
-    // with nothing keeping the step's tools on one worker.
-    serialTools: onOff("OPENCODE_TEMPORAL_SERIAL_TOOLS", !worktreeAffinity && sharedStore),
+    stepAffinity,
+    // Serial by default only where two hosts can end up writing one step's tree: a shared store with
+    // neither kind of affinity keeping the step's tools on one worker.
+    serialTools: onOff("OPENCODE_TEMPORAL_SERIAL_TOOLS", !stepAffinity && !worktreeAffinity && sharedStore),
   }
 }

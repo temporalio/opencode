@@ -46,6 +46,27 @@ const { runModelCall, runToolCall } = proxyActivities<SteppedTurnActivities>(act
 const sealOptions = { ...activityOptions, startToCloseTimeout: "10 minutes" } as const
 const { sealStep } = proxyActivities<SteppedTurnActivities>(sealOptions)
 
+// A private queue can stop polling or run out of slots. Bound the wait before unstarted work moves.
+const PINNED_SCHEDULE_TO_START = "30 seconds"
+
+/** The same two activities, addressed to one worker's own queue. Built per queue rather than once,
+ * because the queue is not known until the model call reports it; that report comes out of history,
+ * so this is deterministic on replay. */
+const pinnedTo = (taskQueue: string) => ({
+  runToolCall: proxyActivities<SteppedTurnActivities>({
+    ...activityOptions,
+    retry: { maximumAttempts: 1 },
+    taskQueue,
+    scheduleToStartTimeout: PINNED_SCHEDULE_TO_START,
+  }).runToolCall,
+  sealStep: proxyActivities<SteppedTurnActivities>({
+    ...sealOptions,
+    retry: { maximumAttempts: 1 },
+    taskQueue,
+    scheduleToStartTimeout: PINNED_SCHEDULE_TO_START,
+  }).sealStep,
+})
+
 export const wake = defineSignal(SIGNALS.wake)
 export const interrupt = defineSignal(SIGNALS.interrupt)
 export const resume = defineUpdate<void>(RESUME_UPDATE)
@@ -110,6 +131,7 @@ const steppedRuntime = (serial: boolean): SupervisorRuntime => ({
     activities: { runModelCall, runToolCall, sealStep },
     isCancellation,
     isHalt: isHaltFailure,
+    pinnedTo,
     serial,
     nonCancellable: (fn) => CancellationScope.nonCancellable(fn),
     // The SDK's logger, so a line carries its workflow and run id and is suppressed on replay.

@@ -197,6 +197,249 @@ describe("stepped turn", () => {
   })
 })
 
+// Pinning a step to the worker that made its model call, and what happens when that worker is gone.
+// The pin is what lets a step's tools run at once: they write one tree through one filesystem
+// instead of shipping it to each other. The fallback is what keeps that from being a worse kind of
+// stuck than the shared queue was.
+describe("stepped turn, pinned to a worker", () => {
+  const unclaimed = () =>
+    new ActivityFailure(
+      "activity failed",
+      "runToolCall",
+      "1",
+      1 as never,
+      undefined,
+      new TimeoutFailure("schedule to start timed out", undefined, "SCHEDULE_TO_START" as never),
+    )
+  const called = (model: ModelCallDrainResult) => {
+    const shared = fakes(model)
+    const pinnedTools: ToolCallDrainInput[] = []
+    const pinnedSeals: SealDrainInput[] = []
+    let refuse = false
+    let refused = 0
+    const pinned = {
+      runToolCall: async (input: ToolCallDrainInput): Promise<ToolCallDrainResult> => {
+        if (refuse) {
+          refused++
+          throw unclaimed()
+        }
+        pinnedTools.push(input)
+        return { outcome: "settled" }
+      },
+      sealStep: async (input: SealDrainInput): Promise<StepDrainResult> => {
+        if (refuse) {
+          refused++
+          throw unclaimed()
+        }
+        pinnedSeals.push(input)
+        return SEALED
+      },
+    }
+    return {
+      ...shared,
+      pinnedTools,
+      pinnedSeals,
+      refusals: () => refused,
+      goneAfterModelCall: () => {
+        refuse = true
+      },
+      run: () =>
+        makeSteppedTurn({
+          activities: shared.activities,
+          isCancellation,
+          isHalt,
+          pinnedTo: (queue) => {
+            expect(queue).toBe("queue-of-the-worker")
+            return pinned
+          },
+        })(INPUT),
+    }
+  }
+
+  const withQueue: ModelCallDrainResult = {
+    kind: "called",
+    step: 2,
+    calls: [call("call_a"), call("call_b")],
+    owner: "run:1:1",
+    queue: "queue-of-the-worker",
+  }
+
+  it("sends the tools and the seal back to the worker that made the model call", async () => {
+    const { run, pinnedTools, pinnedSeals, tools, seals } = called(withQueue)
+
+    await run()
+
+    expect(pinnedTools.map((t) => t.call.id)).toEqual(["call_a", "call_b"])
+    expect(pinnedSeals).toHaveLength(1)
+    // Nothing reached the shared queue, which is the point: the tree the tools wrote is on that
+    // worker and nowhere else until the step ships it.
+    expect(tools).toHaveLength(0)
+    expect(seals).toHaveLength(0)
+  })
+
+  it("moves the step to the shared queue when nobody takes the pinned work", async () => {
+    const { run, goneAfterModelCall, pinnedTools, tools, seals } = called(withQueue)
+    goneAfterModelCall()
+
+    const result = await run()
+
+    // Schedule-to-start is the one failure that says the activity never started, so moving the work
+    // cannot run a tool twice. Both calls end up on the shared queue, and the step still closes.
+    expect(pinnedTools).toHaveLength(0)
+    expect(tools.map((t) => t.call.id).sort()).toEqual(["call_a", "call_b"])
+    expect(seals).toHaveLength(1)
+    expect(result).toEqual(SEALED)
+  })
+
+  it("does not offer the pin again once the worker has failed to answer", async () => {
+    const { run, goneAfterModelCall, tools, seals, refusals } = called({
+      ...withQueue,
+      calls: [call("call_a")],
+    })
+    goneAfterModelCall()
+
+    await run()
+
+    // One refusal, from the tool. The seal that follows goes straight to the shared queue rather
+    // than spending another schedule-to-start bound on a worker already known to be gone. Counting
+    // the refusals is the assertion: the work reaches the shared queue either way, so where it
+    // ended up says nothing about how long the step spent finding out. Calls dispatched together
+    // do each pay it once, because none of them has learned anything yet when they start.
+    expect(refusals()).toBe(1)
+    expect(tools).toHaveLength(1)
+    expect(seals).toHaveLength(1)
+  })
+
+  it("waits for a started pinned sibling before moving another call to the shared queue", async () => {
+    const release = Promise.withResolvers<ToolCallDrainResult>()
+    const started = Promise.withResolvers<void>()
+    const refused = Promise.withResolvers<void>()
+    let completed = false
+    let overlap = false
+    const shared = fakes(withQueue, async () => {
+      overlap ||= !completed
+      return { outcome: "settled" }
+    })
+    const run = makeSteppedTurn({
+      activities: shared.activities,
+      isCancellation,
+      isHalt,
+      pinnedTo: () => ({
+        runToolCall: async (input) => {
+          if (input.call.id === "call_a") {
+            started.resolve()
+            const result = await release.promise
+            completed = true
+            return result
+          }
+          await started.promise
+          refused.resolve()
+          throw unclaimed()
+        },
+        sealStep: async () => SEALED,
+      }),
+    })(INPUT)
+    await refused.promise
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const sharedBeforeRelease = shared.tools.length
+    release.resolve({ outcome: "settled" })
+    await run
+
+    expect(sharedBeforeRelease).toBe(0)
+    expect(overlap).toBe(false)
+    expect(shared.tools.map((input) => input.call.id)).toEqual(["call_b"])
+    expect(shared.seals).toHaveLength(1)
+  })
+
+  it("stops an unclaimed sibling after a pinned permission refusal", async () => {
+    const release = Promise.withResolvers<ToolCallDrainResult>()
+    const refused = Promise.withResolvers<void>()
+    const shared = fakes(withQueue)
+    const declined = new FakeHalt("declined")
+    const run = makeSteppedTurn({
+      activities: shared.activities,
+      isCancellation,
+      isHalt,
+      pinnedTo: () => ({
+        runToolCall: async (input) => {
+          if (input.call.id === "call_a") return release.promise
+          refused.resolve()
+          throw unclaimed()
+        },
+        sealStep: async () => SEALED,
+      }),
+    })(INPUT)
+    await refused.promise
+    release.reject(declined)
+    await expect(run).rejects.toBe(declined)
+    expect(shared.tools).toHaveLength(0)
+    expect(shared.seals).toHaveLength(1)
+    expect(shared.seals[0]?.needsContinuation).toBe(false)
+  })
+
+  it("stops later serial calls after a pinned permission refusal", async () => {
+    const shared = fakes(withQueue)
+    const declined = new FakeHalt("declined")
+    const pinned: string[] = []
+    const seals: SealDrainInput[] = []
+    const run = makeSteppedTurn({
+      activities: shared.activities,
+      isCancellation,
+      isHalt,
+      serial: true,
+      pinnedTo: () => ({
+        runToolCall: async (input) => {
+          pinned.push(input.call.id)
+          throw declined
+        },
+        sealStep: async (input) => {
+          seals.push(input)
+          return SEALED
+        },
+      }),
+    })(INPUT)
+    await expect(run).rejects.toBe(declined)
+    expect(pinned).toEqual(["call_a"])
+    expect(shared.tools).toHaveLength(0)
+    expect(seals).toHaveLength(1)
+    expect(seals[0]?.needsContinuation).toBe(false)
+  })
+
+  it("stops later serial calls when the shared queue returns a refusal", async () => {
+    for (const queue of [undefined, "worker-queue"]) {
+      const declined = new FakeHalt("declined")
+      const shared = fakes({ ...withQueue, queue }, async () => {
+        throw declined
+      })
+      const run = makeSteppedTurn({
+        activities: shared.activities,
+        isCancellation,
+        isHalt,
+        serial: true,
+        pinnedTo: () => ({
+          runToolCall: async () => {
+            throw unclaimed()
+          },
+          sealStep: async () => SEALED,
+        }),
+      })(INPUT)
+      await expect(run).rejects.toBe(declined)
+      expect(shared.tools.map((input) => input.call.id)).toEqual(["call_a"])
+      expect(shared.seals).toHaveLength(1)
+      expect(shared.seals[0]?.needsContinuation).toBe(false)
+    }
+  })
+
+  it("uses the shared queue when the model call reported no queue of its own", async () => {
+    const { run, tools, pinnedTools } = called({ ...withQueue, queue: undefined })
+
+    await run()
+
+    expect(tools).toHaveLength(2)
+    expect(pinnedTools).toHaveLength(0)
+  })
+})
+
 // The bug this predicate exists for was a mismatch between what `boundary.ts` throws and what the
 // dispatcher recognises. Injecting a fake predicate cannot catch that, so match against the real
 // failure shapes. The negative cases are the point: a predicate that answered true for everything
