@@ -12,7 +12,8 @@ export * as WorktreeMaterializer from "./worktree"
 // hosts still cannot see each other's writes, because those are not captured until the step is
 // sealed. One worker per worktree is what makes a step's tools share a tree.
 
-import { readdir, rm, writeFile } from "node:fs/promises"
+import { access, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises"
+import { constants } from "node:fs"
 import path from "path"
 import { Cause, Context, Effect, Layer, Schema } from "effect"
 import { ChildProcess } from "effect/unstable/process"
@@ -27,7 +28,14 @@ import { AppProcess } from "../../process"
 import { AbsolutePath } from "../../schema"
 import { SnapshotPackTable } from "../../snapshot/sql"
 import { chainHead, isBehind, orderChain } from "../../snapshot/chain"
-import { readWorktreeTip, writeWorktreeTip } from "../../snapshot/tip"
+import {
+  forgetWorktreeTip,
+  markWorktreeBuilt,
+  readWorktreeTip,
+  worktreeWasBuilt,
+  writeWorktreeTip,
+} from "../../snapshot/tip"
+import * as Writers from "../../snapshot/writers"
 
 export interface Interface {
   /**
@@ -45,7 +53,22 @@ export interface Interface {
    * can hold a caller there, and what the check asserts is the real outcome, whether a failed
    * rebuild removes a directory this call did not create.
    */
-  readonly ensure: (directory: string, options?: { readonly pauseBeforeLock?: number }) => Effect.Effect<void>
+  readonly ensure: (
+    directory: string,
+    options?: {
+      readonly pauseBeforeLock?: number
+      /**
+       * The step asking for the directory. A call of another step that never came back keeps it,
+       * because a settled workflow promise does not stop the process behind it. Omitted by callers
+       * that are not a step, and then any stranded call refuses them.
+       */
+      readonly current?: Writers.Writer
+    },
+  ) => Effect.Effect<void>
+
+  /** Say a call is about to write the directory, and that its body came back. */
+  readonly beginWrite: (directory: string, writer: Writers.Writer) => Effect.Effect<void>
+  readonly endWrite: (directory: string, callID: string) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/WorktreeMaterializer") {}
@@ -53,6 +76,16 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 // HEAD of a rebuilt tree, so the rebuilt repo reads as a clean checkout rather than an unborn
 // branch over a full untracked tree.
 const RESTORED = "refs/heads/opencode-restore"
+
+/**
+ * The directory holds a call from another step that never came back, so this step may not have it.
+ * Tagged separately from a rebuild failure because it is not a transient one: it stands until that
+ * call returns or an operator clears it.
+ */
+export class WorktreeQuarantinedError extends Schema.TaggedErrorClass<WorktreeQuarantinedError>()(
+  "WorktreeMaterializer.QuarantinedError",
+  { message: Schema.String },
+) {}
 
 /** A rebuild that did not finish. Tagged so the boundary can tell it from a refusal and retry it. */
 export class WorktreeMaterializeError extends Schema.TaggedErrorClass<WorktreeMaterializeError>()(
@@ -79,7 +112,7 @@ const layer = Layer.effect(
     const { db } = yield* Database.Service
     const locks = KeyedMutex.makeUnsafe<string>()
 
-    const materialize = Effect.fnUntraced(function* (tip: typeof SnapshotPackTable.$inferSelect) {
+    const materialize = Effect.fnUntraced(function* (tip: typeof SnapshotPackTable.$inferSelect, fromEmpty = false) {
       const worktree = AbsolutePath.make(tip.worktree)
       const repository = yield* git.repo
         .create({ worktree, gitDirectory: AbsolutePath.make(path.join(worktree, ".git")) })
@@ -130,6 +163,21 @@ const layer = Layer.effect(
         )
         .pipe(Effect.ignore)
       yield* writeWorktreeTip(global.data, tip.worktree, tip.tree)
+      // Which directories this host made rather than adopted, for the one decision that turns on
+      // it: whether this host may move the directory out of the way when a call that never came
+      // back makes it unusable.
+      if (fromEmpty) {
+        yield* markWorktreeBuilt(global.data, tip.worktree)
+        // Said while nothing is wrong, because the alternative is saying it when a tool call never
+        // comes back and this host has to be taken out of service for this directory by hand.
+        const stuck = yield* cannotMoveAside(tip.worktree)
+        if (stuck)
+          yield* Effect.logWarning("this worktree cannot be set aside if a call never comes back", {
+            worktree: tip.worktree,
+            because: stuck,
+            remedy: "mount the volume above the project rather than at it",
+          })
+      }
       yield* Effect.logInfo("materialized worktree from snapshot packs", {
         worktree: tip.worktree,
         packs: rows.length,
@@ -153,9 +201,93 @@ const layer = Layer.effect(
       return isBehind(rows, held)
     })
 
+    /**
+     * Why this directory could not be moved out of the way if a call never came back in it, or
+     * nothing when it could. A mount point cannot be renamed, and neither can a directory whose
+     * parent this process may not write, and a host with either has only the refusal.
+     *
+     * A prediction, for a warning while nothing is wrong. What decides is the rename below, which
+     * attempts it and falls back: this one moves nothing to find out.
+     */
+    const cannotMoveAside = Effect.fnUntraced(function* (worktree: string) {
+      return yield* Effect.promise(async () => {
+        try {
+          const [here, up] = await Promise.all([stat(worktree), stat(path.dirname(worktree))])
+          // A mount point is a different device from the directory it hangs under.
+          if (here.dev !== up.dev) return "it is a mount point, and a mount point cannot be renamed"
+          await access(path.dirname(worktree), constants.W_OK)
+          return undefined
+        } catch (err) {
+          return `it could not be read: ${String((err as Error)?.message ?? err)}`
+        }
+      })
+    })
+
+    /**
+     * Move a directory a call never came back from out of the way, so this host can have a fresh
+     * one. What this is for is the writer nothing can account for: it keeps writing the directory
+     * it already has open, which is now somewhere else, and nothing it does reaches what is built
+     * next. That is a closure where the readings that narrow it are not conclusive.
+     *
+     * Refused itself in three cases. A directory this host did not build out of an empty one is
+     * somebody's checkout. A directory holding a call of the step now asking for it has one of this
+     * host's own tools inside. And a mount point cannot be renamed at all, which is what a project
+     * directory mounted as a volume is: there the refusal stands.
+     */
+    const moveAside = Effect.fnUntraced(function* (worktree: string, current?: Writers.Writer) {
+      if (!(yield* worktreeWasBuilt(global.data, worktree))) return undefined
+      if (current) {
+        const all = yield* Writers.strandedWriters(global.data, worktree)
+        if (all.some((w) => w.sessionID === current.sessionID && w.step === current.step)) return undefined
+      }
+      const moved = `${worktree}.stranded.${new Date().toISOString().replace(/[:.]/g, "-")}`
+      const renamed = yield* Effect.promise(() =>
+        rename(worktree, moved).then(
+          () => true,
+          () => false,
+        ),
+      )
+      if (!renamed) return undefined
+      yield* Effect.promise(() => mkdir(worktree, { recursive: true }).catch(() => {}))
+      // Both are about the directory that just moved: the note says what it held, and the markers
+      // say who was inside it. The one here now is empty and nobody is in it.
+      yield* forgetWorktreeTip(global.data, worktree)
+      yield* Writers.clearWriters(global.data, worktree)
+      return moved
+    })
+
+    const refuseWhenStranded = Effect.fn("WorktreeMaterializer.refuseWhenStranded")(function* (
+      worktree: string,
+      current?: Writers.Writer,
+    ) {
+      const stranded = yield* Writers.strandedWriters(global.data, worktree, current)
+      if (stranded.length === 0) return
+      const moved = yield* moveAside(worktree, current)
+      if (moved !== undefined) {
+        yield* Effect.logWarning("moved a worktree a call never came back from", {
+          worktree,
+          moved,
+          calls: stranded.length,
+        })
+        return
+      }
+      const one = stranded[0]
+      // Dies, like a rebuild that could not finish: the activity boundary turns it into a failure
+      // Temporal schedules again, and the next attempt can be taken by a host that is not refused.
+      return yield* Effect.die(
+        new WorktreeQuarantinedError({
+          message:
+            `not using ${worktree}: ${stranded.length} tool call(s) from an earlier step never ` +
+            `returned (${one.callID} of session ${one.sessionID} step ${one.step}, pid ${one.pid}, ` +
+            `started ${one.started}). Still refused because ${one.because}, and this host may not ` +
+            `move the directory out of the way. Stop it before this directory is used again.`,
+        }),
+      )
+    })
+
     const ensure = Effect.fn("WorktreeMaterializer.ensure")(function* (
       directory: string,
-      options?: { readonly pauseBeforeLock?: number },
+      options?: { readonly pauseBeforeLock?: number; readonly current?: Writers.Writer },
     ) {
       // The newest capture whose session ran in this directory decides which worktree to rebuild,
       // and which state a tree that is already here has to be brought to.
@@ -168,6 +300,9 @@ const layer = Layer.effect(
           .pipe(Effect.orDie),
       )
       if (!tip) return
+      // Before anything is rebuilt. A restore is what brings this host to the newest tree, and
+      // doing that under a call nobody can account for is what makes its later capture look current.
+      yield* refuseWhenStranded(tip.worktree, options?.current)
       // An empty directory is not somebody's working copy, so the rule that protects one does not
       // apply to it. Treating it as present is what stops a fresh host from ever building the tree:
       // it has no tip note, so `behind` says no, and the tools then run against nothing. A mounted
@@ -189,7 +324,7 @@ const layer = Layer.effect(
           // outer check just decided to build never gets built.
           const here = (yield* fs.existsSafe(tip.worktree)) && !(yield* isEmptyDir(tip.worktree))
           if (here && !(yield* behind(tip))) return
-          yield* materialize(tip).pipe(
+          yield* materialize(tip, !here).pipe(
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterrupts(cause),
               (cause) =>
@@ -221,7 +356,11 @@ const layer = Layer.effect(
       )
     })
 
-    return Service.of({ ensure })
+    return Service.of({
+      ensure,
+      beginWrite: (directory, writer) => Writers.beginWrite(global.data, directory, writer),
+      endWrite: (directory, callID) => Writers.endWrite(global.data, directory, callID),
+    })
   }),
 )
 

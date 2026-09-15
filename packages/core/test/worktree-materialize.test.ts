@@ -4,8 +4,12 @@
 // simulate a fresh host, "host B" materializes it back from the store alone.
 import { describe, expect } from "bun:test"
 import { $ } from "bun"
+import { execFile, spawn } from "node:child_process"
+import { randomBytes } from "node:crypto"
+import { promisify } from "node:util"
 import { realpathSync } from "node:fs"
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises"
+import os from "node:os"
 import path from "path"
 import { asc } from "drizzle-orm"
 import { Effect, Fiber, Layer } from "effect"
@@ -22,6 +26,7 @@ import { SnapshotSync } from "@opencode-ai/core/snapshot-sync"
 import { SnapshotPackTable } from "@opencode-ai/core/snapshot/sql"
 import { writeWorktreeTip } from "@opencode-ai/core/snapshot/tip"
 import { WorktreeMaterializer } from "@opencode-ai/core/session/execution/worktree"
+import * as Writers from "@opencode-ai/core/snapshot/writers"
 import { testEffect } from "./lib/effect"
 import { tmpdir } from "./fixture/tmpdir"
 
@@ -450,6 +455,204 @@ describe("WorktreeMaterializer", () => {
   )
 })
 
+// A process in a group of its own, which is what a worker somebody's supervisor started has, and
+// what a tool that daemonizes gives itself. It carries a worker name of this test's choosing, so
+// what each case turns on is the one thing that case is about. Without one it gets this process's
+// environment, which is the case that says the name is exported rather than only written down.
+const run = promisify(execFile)
+
+// Per run, because a name is what the host looks for and an assertion that fails before its child
+// is killed leaves that child running. A fixed name would then answer for every later run.
+const runToken = randomBytes(4).toString("hex")
+const named = (worker: string) => `${worker}-${runToken}`
+
+const spawned = (worker?: string) => {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: "ignore",
+    env: worker === undefined ? process.env : { ...process.env, OPENCODE_WORKTREE_WRITER: named(worker) },
+  })
+  return { child, pid: child.pid! }
+}
+
+const ended = async (started: ReturnType<typeof spawned>) => {
+  const exited = new Promise((resolve) => started.child.once("exit", resolve))
+  started.child.kill("SIGKILL")
+  await exited
+  return { pid: started.pid, pgid: started.pid }
+}
+
+/** Say the one marker on this host was written by another process, or before a restart. */
+const editMarker = async (data: string, worktree: string, patch: Record<string, unknown>) => {
+  const root = path.join(data, "worktree-writers")
+  const [dir] = await readdir(root)
+  const [name] = await readdir(path.join(root, dir))
+  const file = path.join(root, dir, name)
+  const note = JSON.parse(await readFile(file, "utf8"))
+  await writeFile(file, JSON.stringify({ ...note, ...patch }))
+}
+
+describe("WorktreeMaterializer quarantine", () => {
+  // Refusing to move a step off a host protects that step and nothing after it: the turn ends, the
+  // next prompt lands wherever there is room, and the tool from before can still be writing. A
+  // marker says which calls are inside their own execution, and the directory belongs to that
+  // call's step until it returns.
+  it.live("refuses a directory to another step while an earlier call has not returned", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const root = realpathSync(tmp.path)
+      const worktree = path.join(root, "project")
+      const file = path.join(root, "shared.db")
+      const data = path.join(root, "host-data")
+      yield* Effect.promise(async () => {
+        await mkdir(worktree, { recursive: true })
+        await $`git init -q ${worktree}`.quiet()
+        await $`git -C ${worktree} config user.email t@t`.quiet()
+        await $`git -C ${worktree} config user.name t`.quiet()
+        await writeFile(path.join(worktree, "tracked.txt"), "v1\n")
+        await $`git -C ${worktree} add .`.quiet()
+        await $`git -C ${worktree} commit -qm seed`.quiet()
+      })
+
+      const A = yield* Layer.build(captureStack(file, worktree, data))
+      const captured = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
+      if (!captured) throw new Error("expected a capture")
+      yield* SnapshotSync.Service.use((s) => s.push(captured)).pipe(Effect.provide(A))
+
+      const B = yield* Layer.build(materializeStack(file, data))
+      const worktrees = yield* WorktreeMaterializer.Service.pipe(Effect.provide(B))
+
+      // A call of an earlier step that never came back.
+      const stranded = { sessionID: "ses_one", step: 1, callID: "call_stranded" }
+      yield* worktrees.beginWrite(worktree, stranded)
+
+      // Another step wants the directory. It is not this call's step, so it is refused, and the
+      // refusal is a defect the activity boundary turns into a failure Temporal schedules again.
+      const later = { sessionID: "ses_one", step: 2, callID: "call_later" }
+      const refused = yield* Effect.exit(worktrees.ensure(worktree, { current: later }))
+      expect(refused._tag).toBe("Failure")
+
+      // A sibling of the same step is not stranded: two tools of one step share this directory by
+      // design, and refusing them would be refusing the feature.
+      const sibling = { sessionID: "ses_one", step: 1, callID: "call_sibling" }
+      const allowed = yield* Effect.exit(worktrees.ensure(worktree, { current: sibling }))
+      expect(allowed._tag).toBe("Success")
+
+      // When the call comes back, whatever it did to the directory, it is not still doing it.
+      yield* worktrees.endWrite(worktree, stranded.callID)
+      const afterReturn = yield* Effect.exit(worktrees.ensure(worktree, { current: later }))
+      expect(afterReturn._tag).toBe("Success")
+
+      // A worker that died mid-tool leaves its marker behind. Most of that is answerable without a
+      // person: the writer's process is gone, nothing it started is left in its group, and the
+      // machine has not restarted underneath the pids that say so.
+      const usable = () =>
+        Effect.exit(worktrees.ensure(worktree, { current: later })).pipe(Effect.map((exit) => exit._tag === "Success"))
+
+      // Written by this process, which is running. Nothing to conclude, so the refusal stands.
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      expect(yield* usable()).toBe(false)
+
+      // The worker died and left nothing behind: no process of its own, nothing carrying its name,
+      // and an empty group. That is the whole of the proof that its tools are over.
+      const gone = yield* Effect.promise(() => ended(spawned("gone")))
+      const stale = { pid: gone.pid, pgid: gone.pgid, worker: named("gone") }
+      yield* Effect.promise(() => editMarker(data, worktree, stale))
+      expect(yield* usable()).toBe(true)
+
+      // The worker died and something it started did not. That is what the refusal is for.
+      const orphan = spawned("orphaned")
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() => editMarker(data, worktree, { ...stale, pgid: orphan.pid, worker: named("orphaned") }))
+      expect(yield* usable()).toBe(false)
+      yield* Effect.promise(() => ended(orphan))
+      expect(yield* usable()).toBe(true)
+
+      // A tool that asks for a group of its own is out of the group check's reach. What it cannot
+      // put down is the name its worker left in the environment it inherited.
+      const escaped = spawned("escaped")
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() => editMarker(data, worktree, { ...stale, worker: named("escaped") }))
+      expect(yield* usable()).toBe(false)
+      yield* Effect.promise(() => ended(escaped))
+      expect(yield* usable()).toBe(true)
+
+      // A tool that leaves the group and is handed an environment of somebody else's choosing has
+      // put down everything the worker gave it. What it cannot put down and go on writing is the
+      // directory it writes, so that is the last reading, and the one that depends on nothing the
+      // tool kept.
+      const standing = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        detached: true,
+        stdio: "ignore",
+        cwd: worktree,
+        env: { PATH: process.env.PATH ?? "" },
+      })
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() => editMarker(data, worktree, { ...stale, worker: named("nothing-carries-this") }))
+      expect(yield* usable()).toBe(false)
+      yield* Effect.promise(() => ended({ child: standing, pid: standing.pid! }))
+      expect(yield* usable()).toBe(true)
+
+      // The control group is Linux's, and a tool keeps it through `setsid` and through `sudo`,
+      // which empties the environment it passes on. A Mac has no such thing to read, so the rule is
+      // asked on its own, with the reading a Linux host would have made handed to it.
+      const readings = {
+        groups: new Set<number>(),
+        workers: new Set<string>(),
+        holding: [],
+        ourCgroup: "/the-one-this-process-is-in",
+      }
+      const dead = {
+        sessionID: "ses_one",
+        step: 3,
+        callID: "call_dead",
+        host: os.hostname(),
+        pid: gone.pid,
+        // The stamp the module compares against, not the wall clock: a marker dated now would read
+        // as one from before a restart and never reach the rule this is about.
+        bootAt: Math.round(Date.now() - os.uptime() * 1000),
+        started: new Date().toISOString(),
+      }
+      const inCgroup = (cgroup: string, live: string[]) =>
+        Writers.insideBecause({ ...dead, cgroup }, { ...readings, cgroups: new Set(live) })
+      expect(inCgroup("/system.slice/opencode-1.service", ["/system.slice/opencode-1.service"])).toContain(
+        "still in /system.slice/opencode-1.service",
+      )
+      expect(inCgroup("/system.slice/opencode-1.service", ["/system.slice/opencode-2.service"])).toBeUndefined()
+      // And the one this process is in says nothing either way, which is every process in a
+      // container.
+      expect(inCgroup(readings.ourCgroup, [readings.ourCgroup])).toBeUndefined()
+
+      // And the name has to reach the tool, not only the marker. This child is given no environment
+      // of its own, so the only way it carries the name is that the worker exported it.
+      const inheriting = spawned()
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() =>
+        editMarker(data, worktree, { ...stale, worker: process.env.OPENCODE_WORKTREE_WRITER }),
+      )
+      expect(yield* usable()).toBe(false)
+      yield* Effect.promise(() => ended(inheriting))
+      expect(yield* usable()).toBe(true)
+
+      // A worker restarted from the same shell is in the group its predecessor was in, so the group
+      // answers for this process rather than for the marker. What the dead worker started is what
+      // decides, and it started nothing.
+      const ourGroup = yield* Effect.promise(async () => {
+        const { stdout } = await run("ps", ["-o", "pgid=", "-p", String(process.pid)])
+        return Number.parseInt(stdout.trim(), 10)
+      })
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() => editMarker(data, worktree, { ...stale, pgid: ourGroup }))
+      expect(yield* usable()).toBe(true)
+
+      // A pid means nothing across a restart, so a marker from before one is not read as live.
+      yield* worktrees.beginWrite(worktree, { sessionID: "ses_one", step: 3, callID: "call_dead" })
+      yield* Effect.promise(() => editMarker(data, worktree, { bootAt: 0 }))
+      expect(yield* usable()).toBe(true)
+    }),
+  )
+})
+
 // A dispatch the session stopped waiting for keeps running, and the files it ships afterwards would
 // be the newest state the store holds: the tip check cannot refuse them, because the host is still
 // standing exactly where it was told to stand. The event log already fences a superseded attempt
@@ -501,6 +704,76 @@ describe("SnapshotSync owner fence", () => {
       const current = yield* shipped("run:1:2")
       expect(current._tag).toBe("Success")
       expect(yield* onDatabase((db) => db.select().from(SnapshotPackTable).all())).toHaveLength(1)
+    }),
+  )
+})
+
+// Four readings narrow what a tool can put down to be found by, and none of them closes it. Moving
+// the directory does: the writer nobody can account for goes on writing the one it has open, under
+// its new name, and the host builds a fresh one here.
+describe("WorktreeMaterializer set-aside", () => {
+  it.live("moves a directory it built rather than refusing it, and never one it adopted", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.promise(() => tmpdir())
+      const root = realpathSync(tmp.path)
+      const worktree = path.join(root, "project")
+      const file = path.join(root, "shared.db")
+      const data = path.join(root, "host-a-data")
+      yield* Effect.promise(async () => {
+        await mkdir(worktree, { recursive: true })
+        await $`git init -q ${worktree}`.quiet()
+        await $`git -C ${worktree} config user.email t@t`.quiet()
+        await $`git -C ${worktree} config user.name t`.quiet()
+        await writeFile(path.join(worktree, "tracked.txt"), "v1\n")
+        await $`git -C ${worktree} add .`.quiet()
+        await $`git -C ${worktree} commit -qm seed`.quiet()
+      })
+
+      const A = yield* Layer.build(captureStack(file, worktree, data))
+      const captured = yield* Snapshot.Service.use((s) => s.capture()).pipe(Effect.provide(A))
+      if (!captured) throw new Error("expected a capture")
+      yield* SnapshotSync.Service.use((s) => s.push(captured)).pipe(Effect.provide(A))
+
+      // Host B, which has never seen this directory: it builds the tree here out of nothing, and
+      // that is what makes the directory its own to move.
+      const dataB = path.join(root, "host-b-data")
+      const onB = path.join(root, "project")
+      const B = yield* Layer.build(materializeStack(file, dataB))
+      const worktrees = yield* WorktreeMaterializer.Service.pipe(Effect.provide(B))
+      yield* Effect.promise(() => rm(onB, { recursive: true, force: true }))
+      yield* worktrees.ensure(onB)
+      expect(yield* Effect.promise(() => readdir(onB))).toContain("tracked.txt")
+
+      // A call that never came back, and a file it is still writing.
+      yield* worktrees.beginWrite(onB, { sessionID: "ses_one", step: 1, callID: "call_stranded" })
+      yield* Effect.promise(() => writeFile(path.join(onB, "still-writing.txt"), "from the tool\n"))
+
+      const later = { sessionID: "ses_one", step: 2, callID: "call_later" }
+      const moved = yield* Effect.exit(worktrees.ensure(onB, { current: later }))
+      expect(moved._tag).toBe("Success")
+      const asideNames = (yield* Effect.promise(() => readdir(root))).filter((n) => n.startsWith("project.stranded."))
+      expect(asideNames).toHaveLength(1)
+      // What the tool wrote went with the directory it was writing, and what the session shipped is
+      // in the fresh one.
+      expect(yield* Effect.promise(() => readdir(path.join(root, asideNames[0]!)))).toContain("still-writing.txt")
+      const now = yield* Effect.promise(() => readdir(onB))
+      expect(now).toContain("tracked.txt")
+      expect(now).not.toContain("still-writing.txt")
+
+      // And a directory this host did not build is never moved: what it holds is somebody's, and
+      // includes files no pack carries.
+      const adopted = path.join(root, "adopted")
+      yield* Effect.promise(async () => {
+        await mkdir(adopted, { recursive: true })
+        await writeFile(path.join(adopted, "theirs.txt"), "not ours\n")
+      })
+      yield* worktrees.beginWrite(adopted, { sessionID: "ses_one", step: 1, callID: "call_theirs" })
+      const refused = yield* Effect.exit(worktrees.ensure(adopted, { current: later }))
+      // Nothing is stored for that directory, so `ensure` returns before the refusal can apply; what
+      // is asserted is that it is still there, whole.
+      expect(refused._tag).toBe("Success")
+      expect(yield* Effect.promise(() => readdir(root))).toContain("adopted")
+      expect(yield* Effect.promise(() => readdir(adopted))).toContain("theirs.txt")
     }),
   )
 })

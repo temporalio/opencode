@@ -260,10 +260,14 @@ tool-output files under the data directory. The runner never reads these to rebu
 only affect the diff, restore and full-output features. Point the data directory at shared storage
 to make them portable.
 
-One rule bounds what the rebuild may touch, because checking a stored tree out over the wrong one
-destroys work: a tree is moved only when a host-local note (`snapshot/tip.ts`) says this host is
-behind the store, so a host holding a capture that never shipped is left alone. Packs are ordered
-by their chain, not by `time_created`, because hosts do not agree on the time.
+Two rules bound what the rebuild may touch, because checking a stored tree out over the wrong one
+destroys work. A tree is moved only when a host-local note (`snapshot/tip.ts`) says this host is
+behind the store, so a host holding a capture that never shipped is left alone. And a tree is moved
+only when this host built it from packs, so a developer's own checkout is logged and never
+rewritten. Packs are ordered by their chain, not by `time_created`, because hosts do not agree on
+the time. While a tool call runs, the host records it beside the directory, and a later step is
+refused that directory until the call is over; a directory whose writer cannot be accounted for is
+moved aside and rebuilt fresh.
 
 ## A session that outlives its client
 
@@ -339,6 +343,7 @@ TEMPORAL_ADDRESS=temporal.internal:7233 \
 | Restart during an approval or question | The pending row is kept; execution has to be restarted | A retried ask adopts the row and can be answered from another process |
 | A behind host publishes files | Not reachable | Refused: the pack store checks the chain and the owner token |
 | A fresh worker receives a project | Needs the directory | Packs rebuild the tracked files at the recorded path; ignored files do not travel |
+| A later turn reuses a directory an abandoned tool may still write | Not reachable | The directory is refused until the call can be shown to be over, then moved aside and rebuilt |
 | A turn never stops stepping | The coordinator's own loop | The supervisor stops after 200 steps and says so |
 
 An unknown tool outcome is a loss of evidence, not proof that the tool stopped or failed. The model

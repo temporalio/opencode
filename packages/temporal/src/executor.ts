@@ -115,7 +115,7 @@ const layer = Layer.effect(
     const drains = makeDrains({ store, locations, ctx, events, worktrees })
     // The stepped mode's three drains. Registered unconditionally: which mode a session runs is a
     // property of its workflow input, so a worker has to be able to serve either.
-    const stepped = makeSteppedDrains({ inSession: drains.inSession, stepQueue: STEP_QUEUE })
+    const stepped = makeSteppedDrains({ inSession: drains.inSession, worktrees, stepQueue: STEP_QUEUE })
     // What a schedule fires into: admitting a prompt is a row in the store, and a workflow cannot
     // write one. Registered on every worker, because a firing lands wherever one is polling.
     const schedules = makeScheduleDrains({ db, events })
